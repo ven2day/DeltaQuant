@@ -1,0 +1,91 @@
+# Environment
+.env
+.env.local
+.env.*.local
+
+# DhanHQ auto-generated access token cache (contains a live secret)
+.dhan_token_cache.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+/lib/
+/lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+.venv/
+venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Type checking
+.mypy_cache/
+
+# Logs
+*.log
+logs/
+run/
+*.lock
+
+# Database
+*.db
+*.sqlite3
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project specific
+data/
+*.csv
+*.json
+!.env.example
+
+#context Docs
+AgentContext/
+
+# Logs
+logs/
+*.log
+
+# Web UI (Next.js)
+web/node_modules/
+web/.next/
+web/.env.local
+web/tsconfig.tsbuildinfo
+# Re-include config files the blanket *.json rule above would otherwise hide
+!web/package.json
+!web/package-lock.json
+!web/tsconfig.json

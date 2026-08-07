@@ -1,0 +1,197 @@
+import pytest
+
+from src.dashboard.stats import TradingDashboard, TradingStats
+
+# --- TradingStats Tests ---
+
+
+@pytest.fixture
+def stats():
+    return TradingStats()
+
+
+def test_trading_stats_init(stats):
+    assert stats.starting_balance == 1000000.0
+    assert stats.total_trades == 0
+    assert stats.win_rate == 0.0
+
+
+def test_trading_stats_pnl(stats):
+    stats.realized_pnl = 100
+    stats.unrealized_pnl = 50
+    assert stats.total_pnl == 150
+    assert stats.pnl_percent == 0.015
+
+
+def test_trading_stats_log_activity(stats):
+    stats.log_activity("Test message", "INFO")
+    assert len(stats.activity_log) == 1
+    assert stats.activity_log[0]["message"] == "Test message"
+
+    # Test capping
+    for i in range(250):
+        stats.log_activity(f"Msg {i}")
+    assert len(stats.activity_log) == 200  # Cap size
+    assert stats.activity_log[-1]["message"] == "Msg 249"
+
+
+# --- TradingDashboard Tests ---
+
+
+@pytest.fixture
+def dashboard():
+    return TradingDashboard()
+
+
+def test_dashboard_start(dashboard):
+    dashboard.start(balance=500000.0, mode="live", data_source="dhan")
+    assert dashboard.stats.starting_balance == 500000.0
+    assert dashboard.stats.trading_mode == "live"
+    assert dashboard.running is True
+    assert len(dashboard.stats.activity_log) == 3
+
+
+def test_dashboard_update_regime(dashboard):
+    dashboard.update_regime("bull", 0.9, ["strat1"])
+    assert dashboard.stats.current_regime == "bull"
+    assert dashboard.stats.regime_confidence == 0.9
+    assert dashboard.stats.active_strategies == ["strat1"]
+
+
+def test_dashboard_update_market_data(dashboard):
+    quotes = {"A": 100}
+    dashboard.update_market_data(quotes)
+    assert dashboard.stats.market_quotes == quotes
+
+
+def test_dashboard_set_current_signal(dashboard):
+    dashboard.set_current_signal("BUY", "AAPL", "strat1", 0.8)
+    assert dashboard.stats.current_signal["symbol"] == "AAPL"
+
+
+def test_dashboard_set_decision_reason(dashboard):
+    dashboard.set_decision_reason("Reason")
+    assert dashboard.stats.last_decision_reason == "Reason"
+
+
+def test_dashboard_log_signal(dashboard):
+    dashboard.log_signal("AAPL", "BUY", "strat1", True)
+    assert dashboard.stats.signals_generated == 1
+    assert dashboard.stats.signals_validated == 1
+
+    dashboard.log_signal("AAPL", "BUY", "strat1", False)
+    assert dashboard.stats.signals_generated == 2
+    assert dashboard.stats.signals_rejected == 1
+
+
+def test_dashboard_log_trade(dashboard):
+    dashboard.log_trade("AAPL", "BUY", 10, 100, True)
+    assert dashboard.stats.trades_approved == 1
+
+    dashboard.log_trade("AAPL", "BUY", 10, 100, False)
+    assert dashboard.stats.trades_risk_rejected == 1
+
+
+def test_dashboard_add_position(dashboard):
+    dashboard.add_position("AAPL", "BUY", 10, 100)
+    assert len(dashboard.stats.open_positions) == 1
+    assert dashboard.stats.open_positions[0]["symbol"] == "AAPL"
+
+
+def test_dashboard_remove_position(dashboard):
+    dashboard.add_position("AAPL", "BUY", 10, 100)
+    dashboard.add_position("MSFT", "BUY", 5, 200)
+    dashboard.remove_position("AAPL")
+    assert len(dashboard.stats.open_positions) == 1
+    assert dashboard.stats.open_positions[0]["symbol"] == "MSFT"
+
+
+def test_dashboard_remove_position_only_removes_one_match(dashboard):
+    # Pyramided same-symbol positions: closing one shouldn't wipe both.
+    dashboard.add_position("AAPL", "BUY", 10, 100)
+    dashboard.add_position("AAPL", "BUY", 5, 110)
+    dashboard.remove_position("AAPL")
+    assert len(dashboard.stats.open_positions) == 1
+
+
+def test_dashboard_remove_position_missing_symbol_is_noop(dashboard):
+    dashboard.add_position("AAPL", "BUY", 10, 100)
+    dashboard.remove_position("MSFT")
+    assert len(dashboard.stats.open_positions) == 1
+
+
+class _FakePosition:
+    def __init__(self, symbol, side, quantity, entry_price, unrealized_pnl=0.0):
+        self.symbol = symbol
+        self.side = side
+        self.quantity = quantity
+        self.entry_price = entry_price
+        self.unrealized_pnl = unrealized_pnl
+
+
+def test_dashboard_sync_positions_mirrors_engine_state(dashboard):
+    # Simulates positions restored from a persisted wallet on startup — never
+    # seeded via add_position(), so only sync_positions() can surface them.
+    dashboard.add_position("STALE", "BUY", 1, 1.0)
+    positions = [
+        _FakePosition("TCS", "BUY", 10, 4000.0, unrealized_pnl=500.0),
+        _FakePosition("INFY", "SELL", 5, 1800.0, unrealized_pnl=-50.0),
+    ]
+    dashboard.sync_positions(positions)
+
+    assert len(dashboard.stats.open_positions) == 2
+    assert dashboard.stats.open_positions[0] == {
+        "symbol": "TCS",
+        "side": "BUY",
+        "qty": 10,
+        "entry": 4000.0,
+        "pnl": 500.0,
+    }
+    # The stale entry from add_position() is gone — sync_positions replaces
+    # the list wholesale rather than merging with it.
+    assert all(p["symbol"] != "STALE" for p in dashboard.stats.open_positions)
+
+
+def test_dashboard_sync_positions_empty_clears_display(dashboard):
+    dashboard.add_position("AAPL", "BUY", 10, 100)
+    dashboard.sync_positions([])
+    assert dashboard.stats.open_positions == []
+
+
+def test_dashboard_sync_paper_account_mirrors_durable_wallet(dashboard):
+    dashboard.start(balance=1_000_000.0)
+    dashboard.sync_paper_account(
+        {
+            "initial_balance": 1_000_000.0,
+            "balance": 999_145.89,
+            "realized_pnl": -854.11,
+            "unrealized_pnl": 0.0,
+            "total_trades": 6,
+            "winning_trades": 0,
+            "losing_trades": 6,
+        }
+    )
+
+    assert dashboard.stats.current_balance == 999_145.89
+    assert dashboard.stats.realized_pnl == -854.11
+    assert dashboard.stats.total_trades == 6
+    assert dashboard.stats.winning_trades == 0
+    assert dashboard.stats.losing_trades == 6
+
+
+def test_dashboard_close_trade(dashboard):
+    dashboard.start()
+    dashboard.close_trade(100.0)
+    assert dashboard.stats.total_trades == 1
+    assert dashboard.stats.winning_trades == 1
+    assert dashboard.stats.realized_pnl == 100.0
+    assert dashboard.stats.current_balance == 1000100.0
+
+    dashboard.close_trade(-50.0)
+    assert dashboard.stats.losing_trades == 1
+    assert dashboard.stats.realized_pnl == 50.0
+
+
+def test_dashboard_increment_cycle(dashboard):
+    dashboard.increment_cycle()
+    assert dashboard.stats.cycles_run == 1
