@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+import pytest
 
+from src.config.settings import Settings
 from src.execution.averaging import CappedAveragingPolicy
 from src.execution.costs import CostModel
 from src.execution.lifecycle import MOCK_NAMESPACE, PaperTradeLifecycleStore
@@ -12,6 +14,20 @@ from src.market.candidate_policy import CandidateAction, evaluate_long_candidate
 from src.market.indicators import Timeframe
 from src.market.simulated_data import SimulatedMarketData
 from src.risk.pretrade import FinalPaperOrder, PaperRiskReservations
+
+
+@pytest.fixture(autouse=True)
+def _fake_settings(monkeypatch):
+    """LocalPaperEngine/ExecutionService both call the cached get_settings(), which
+    requires GROQ_API_KEY (a required field with no default) — this worktree has no
+    .env, so without this the test below only passes when some *other* test file happens
+    to run first and warm the lru_cache (order-dependent flakiness). Same fix as
+    tests/test_config_failclosed.py's ``_base_kwargs``/``_env_file=None`` pattern, applied
+    at the get_settings() call sites instead of at direct Settings() construction.
+    """
+    settings = Settings(groq_api_key="test-key", _env_file=None)
+    monkeypatch.setattr("src.execution.paper_engine.get_settings", lambda: settings)
+    monkeypatch.setattr("src.execution.service.get_settings", lambda: settings)
 
 
 def _trend_frame(periods: int, frequency: str, volume_spike: bool = False) -> pd.DataFrame:
