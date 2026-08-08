@@ -182,7 +182,20 @@ def _run_risk_checks(
     daily_stats: dict[str, Any],
     limits: RiskLimits,
 ) -> list[RiskCheckResult]:
-    """Run all risk checks on a signal."""
+    """Run all risk checks on a signal.
+
+    Hard/soft severity matrix (H-3, DeltaQuant-Quant-Risk-Review.md): every check that
+    represents a stated portfolio/risk *limit* is a hard "block" -- daily_trade_limit,
+    daily_loss_limit, position_size, risk_reward, stop_loss_pct, max_positions,
+    total_exposure, trading_hours, drawdown, duplicate_position, sector_exposure,
+    correlated_positions, and pairwise_correlation. A failed block cannot be
+    approved-with-a-warning; the system should refuse rather than silently pyramid the
+    same symbol, sector, or correlated bet, or exceed the stop-distance/reward-risk
+    economics that sizing assumed. Only "confidence" (rule=confidence) stays a soft
+    "warning": it is the LLM's own self-reported combined confidence, a quality signal to
+    surface for review rather than a portfolio limit, and is deliberately not part of this
+    matrix.
+    """
 
     checks = []
     capital = float(portfolio.get("capital", 100000) or 0.0)
@@ -220,18 +233,20 @@ def _run_risk_checks(
         )
     )
 
-    # 4. Risk-reward ratio
+    # 4. Risk-reward ratio (H-3: hardened from warning to block -- a sub-minimum R:R signal
+    # is a real edge/economics problem, not a soft advisory; see DeltaQuant-Quant-Risk-Review.md)
     rr_ratio = signal.get("risk_reward_ratio", 0)
     checks.append(
         RiskCheckResult(
             passed=rr_ratio >= limits.min_risk_reward,
             rule="risk_reward",
             message=f"Risk-reward {rr_ratio:.2f} below minimum {limits.min_risk_reward}",
-            severity="warning",
+            severity="block",
         )
     )
 
-    # 5. Stop loss percentage
+    # 5. Stop loss percentage (H-3: hardened from warning to block -- an over-wide stop
+    # directly inflates loss-at-stop beyond what sizing/risk assumed it was approving)
     entry = signal.get("entry_price", 0)
     stop = signal.get("stop_loss", 0)
     if entry > 0:
@@ -241,7 +256,7 @@ def _run_risk_checks(
                 passed=stop_pct <= limits.max_stop_loss_pct,
                 rule="stop_loss_pct",
                 message=f"Stop loss {stop_pct:.1f}% exceeds limit of {limits.max_stop_loss_pct}%",
-                severity="warning",
+                severity="block",
             )
         )
 
@@ -342,7 +357,9 @@ def _run_risk_checks(
         )
     )
 
-    # 11. Sector exposure check (NEW)
+    # 11. Sector exposure check (H-3: hardened from warning to block -- this is a stated
+    # portfolio diversification limit, not advisory; a warning let the system pyramid the
+    # same macro bet across a sector while still reporting "risk approved")
     new_symbol = signal.get("symbol", "")
     new_sector = get_stock_sector(new_symbol)
     sector_exposure = _calculate_sector_exposure(portfolio, new_sector, capital)
@@ -351,28 +368,32 @@ def _run_risk_checks(
             passed=sector_exposure <= limits.max_sector_exposure_pct,
             rule="sector_exposure",
             message=f"Sector exposure ({new_sector}: {sector_exposure:.1f}%) exceeds limit of {limits.max_sector_exposure_pct}%",
-            severity="warning",
+            severity="block",
         )
     )
 
-    # 12. Correlated positions check (NEW)
+    # 12. Correlated positions check (H-3: hardened from warning to block, same rationale
+    # as sector_exposure above -- a correlated-cluster cap that can't actually block is not
+    # a limit)
     sector_positions = _count_sector_positions(portfolio, new_sector)
     checks.append(
         RiskCheckResult(
             passed=sector_positions < limits.max_correlated_positions,
             rule="correlated_positions",
             message=f"Too many positions in {new_sector} sector: {sector_positions}/{limits.max_correlated_positions}",
-            severity="warning",
+            severity="block",
         )
     )
 
-    # 13. Pairwise return-correlation check (NEW)
-    # Sector exposure/count above are a coarse proxy for diversification — two
-    # names in different sectors can still move together (or two "same sector"
-    # names can be weakly correlated). This uses actual daily-return correlation,
-    # computed upstream by the caller (see compute_return_correlations) and
-    # threaded through portfolio["return_correlations"] since this function stays
-    # pure/synchronous and never fetches data itself.
+    # 13. Pairwise return-correlation check (H-3: hardened from warning to block). Sector
+    # exposure/count above are a coarse proxy for diversification — two names in different
+    # sectors can still move together (or two "same sector" names can be weakly
+    # correlated). This uses actual daily-return correlation, computed upstream by the
+    # caller (see compute_return_correlations) and threaded through
+    # portfolio["return_correlations"] since this function stays pure/synchronous and
+    # never fetches data itself. Insufficient history yields max_corr=0.0 (an unfilled
+    # `default=`, not a fabricated correlation), which safely passes rather than blocking
+    # on absence of evidence.
     return_correlations = portfolio.get("return_correlations", {})
     existing_symbols = [
         p.get("symbol") for p in portfolio.get("positions", []) if p.get("symbol") != symbol
@@ -390,7 +411,7 @@ def _run_risk_checks(
                 f"Return correlation {max_corr:.2f} with an existing position exceeds "
                 f"limit of {limits.max_pairwise_correlation:.2f}"
             ),
-            severity="warning",
+            severity="block",
         )
     )
 

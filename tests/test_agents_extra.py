@@ -184,10 +184,12 @@ def test_compute_return_correlations():
     assert "SHORT" not in correlations
 
 
-def test_risk_compliance_pairwise_correlation_warns():
-    # A already holds RELIANCE; a new candidate that is 0.95-correlated with it
-    # should surface a pairwise_correlation warning even though they're in
-    # different sectors (sector caps alone would miss this).
+def test_risk_compliance_pairwise_correlation_blocks():
+    # A already holds RELIANCE; a new candidate that is 0.95-correlated with it must be
+    # REJECTED even though they're in different sectors (sector caps alone would miss
+    # this). H-3 (DeltaQuant-Quant-Risk-Review.md): pairwise_correlation was hardened
+    # from a warning to a block -- a correlated-cluster cap that can't actually block
+    # let the system pyramid the same macro bet under a formally "risk approved" trade.
     state = create_initial_state()
     state["validated_signals"] = [{"symbol": "CANDIDATE", "confidence": 0.8, "risk_reward_ratio": 2.0}]
     state["portfolio"] = {
@@ -202,9 +204,10 @@ def test_risk_compliance_pairwise_correlation_warns():
             mock_limits.return_value = RiskLimits(max_pairwise_correlation=0.80)
             result = risk_compliance_node(state)
 
-    assert len(result["approved_trades"]) == 1  # warning, not a block
-    warning_rules = {w["rule"] for w in result["approved_trades"][0]["risk_result"]["warnings"]}
-    assert "pairwise_correlation" in warning_rules
+    assert len(result["approved_trades"]) == 0
+    assert len(result["risk_rejected"]) == 1
+    rejected_rules = {f["rule"] for f in result["risk_rejected"][0]["risk_result"]["failures"]}
+    assert "pairwise_correlation" in rejected_rules
 
 
 def test_check_kill_switch():
