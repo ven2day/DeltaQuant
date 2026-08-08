@@ -225,10 +225,11 @@ async def run_live_trading():
         idempotency=IdempotencyStore(),
     )
     effective = execution_service.effective_mode.value
+    real_orders_label = "YES" if execution_service.real_orders_active else "NO"
     dashboard.stats.log_activity(
-        f"Execution mode: {effective}"
+        f"Execution mode: {effective} | REAL ORDERS: {real_orders_label}"
         + (" (SHADOW — mirrors live, sends no real orders)" if effective == "shadow" else ""),
-        "WARNING" if effective not in ("local_paper", "shadow") else "INFO",
+        "WARNING" if execution_service.real_orders_active else "INFO",
     )
 
     # Live modes only: attach the broker executor and reconcile against the broker at

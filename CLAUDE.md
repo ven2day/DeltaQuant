@@ -90,12 +90,20 @@ consumer, read with `isinstance`/`.get(...)` guards so a stray type never crashe
 All config is centralized in [src/config/settings.py](src/config/settings.py): a
 pydantic-settings `Settings` model loaded from `.env`. Access it **only** through the cached
 `get_settings()`; use `reload_settings()` to clear the cache. Secrets are `SecretStr` —
-read them with `.get_secret_value()`. The `@model_validator` performs cross-field checks
-(e.g. live mode requires Dhan creds, risk-param sanity) but **logs warnings rather than
-raising**, so invalid config degrades instead of failing startup.
+read them with `.get_secret_value()`. The `@model_validator` (`validate_configuration`) is
+two-tier: benign cross-field inconsistencies (risk-param sanity, market-hours ordering,
+Telegram config) are collected as warnings and logged, same as before; but the narrow,
+explicit hazardous-combination matrix (trading_mode/execution_mode/allow_live_orders/Dhan
+creds that could reach a real broker order, plus `MAX_QUOTE_STALENESS_SECONDS=0` on a
+live-quote profile) **raises `ValueError` and fails startup** instead of degrading — see
+C-2/M-5/H-10 in `DeltaQuant-Quant-Risk-Review.md`. `resolve_effective_execution_mode()`
+(same module) is the single source of truth for which execution mode is actually in effect;
+`scripts/check_config.py` and `ExecutionService._resolve_mode()` both call it rather than
+re-deriving the conjunction.
 
 Key switches: `market_data_source` (`dhan` only — YFinance was removed), `execution_mode`
-(`local_paper`|`dhan_paper`|`live`), `trading_mode` (`paper`|`live`), `enable_news_analysis`.
+(`local_paper`|`shadow`|`dhan_paper`|`live` — `dhan_paper` is simulate-only and can **never**
+reach a live route, see below), `trading_mode` (`paper`|`live`), `enable_news_analysis`.
 
 ### Pluggable data & execution layers
 
@@ -128,13 +136,18 @@ Key switches: `market_data_source` (`dhan` only — YFinance was removed), `exec
   - **Execution safety (do not regress):** every `submit(...)` carries an `idempotency_key`;
     a repeat returns a `DUPLICATE` instead of placing again (an `IdempotencyStore` persists
     keys so a restart can't replay orders). `execution_mode` adds **`shadow`** (mirror the
-    live decision/sizing, simulate the fill, send nothing). A `live`/`dhan_paper` request
-    **never silently downgrades**: without `allow_live_orders=True` (default-off master gate)
-    or without Dhan creds it resolves to SHADOW with a loud warning. Live submission goes
+    live decision/sizing, simulate the fill, send nothing). `dhan_paper` is simulate-only and
+    **always** resolves to SHADOW — there is no verified Dhan sandbox endpoint, so it can
+    never reach a live route regardless of `allow_live_orders` or credentials (C-2 fix; see
+    `resolve_effective_execution_mode` in [settings.py](src/config/settings.py)). A `live`
+    request **never silently downgrades**: without `trading_mode=live` **and**
+    `allow_live_orders=True` (default-off master gate) **and** valid Dhan creds, it resolves to
+    SHADOW with a loud warning/error naming which condition failed. Live submission goes
     through `submit_async` → `LiveBrokerExecutor` ([live_executor.py](src/execution/live_executor.py)),
     which submits then **polls `get_order_status` to a terminal fill** (never assumes PLACED ==
     filled); `reconcile_positions` checks local vs broker positions at startup (broker = source
-    of truth). All live paths stay gated behind `allow_live_orders` (default off → shadow).
+    of truth). `ExecutionService.real_orders_active` is the one place to check whether a given
+    instance can actually place a real order (effective mode LIVE + broker_executor attached).
   - **Paper engine realism (do not regress):** `LocalPaperEngine` fills through a
     [`CostModel`](src/execution/costs.py) (slippage + NSE-style brokerage/STT/GST, all
     configurable via `paper_*` settings; pass `CostModel.zero()` for ideal fills in unit

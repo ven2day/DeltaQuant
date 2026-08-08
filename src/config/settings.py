@@ -12,6 +12,42 @@ from pydantic import Field, PrivateAttr, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+def resolve_effective_execution_mode(
+    requested_mode: str,
+    *,
+    allow_live_orders: bool,
+    trading_mode: str,
+    has_dhan_credentials: bool,
+) -> str:
+    """Pure resolution of the execution mode actually in effect (C-2 fix).
+
+    A single source of truth for "can this configuration ever reach a real broker
+    order", reused by ``ExecutionService._resolve_mode`` (the stateful runtime
+    wrapper) and ``scripts/check_config.py`` (a static preview with no engine to
+    construct). Kept dependency-free (plain strings, no ``ExecutionMode`` import)
+    to avoid a settings <-> execution circular import.
+
+    Invariants:
+    - ``dhan_paper`` NEVER reaches a live route. There is no verified Dhan sandbox
+      endpoint (``dhan_base_url`` defaults to Dhan's live API host), so it is
+      redefined to mean "simulate against Dhan-shaped data/mechanics only" — not
+      "live route gated by a flag". This is the exact hazard C-2 described:
+      TRADING_MODE=paper + EXECUTION_MODE=dhan_paper + ALLOW_LIVE_ORDERS=true with
+      valid credentials used to reach a genuine broker order.
+    - ``live`` reaches a real broker route only under the full, explicit
+      conjunction: ``trading_mode == "live"`` AND ``allow_live_orders`` AND Dhan
+      credentials present. Missing any one of those resolves to ``shadow``
+      (mirrors the decision/sizing, simulates the fill, sends nothing) rather
+      than silently downgrading to local paper.
+    """
+    if requested_mode == "dhan_paper":
+        return "shadow"
+    if requested_mode == "live":
+        if not (allow_live_orders and trading_mode == "live" and has_dhan_credentials):
+            return "shadow"
+    return requested_mode
+
+
 class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
 
@@ -264,12 +300,19 @@ class Settings(BaseSettings):
     execution_mode: Literal["local_paper", "shadow", "dhan_paper", "live"] = Field(
         default="local_paper",
         description="Execution mode: local_paper (free), shadow (mirror live, send nothing), "
-        "dhan_paper (sandbox), or live",
+        "dhan_paper (simulate against Dhan-shaped data/mechanics only — there is no verified "
+        "Dhan sandbox endpoint, so this NEVER reaches a real broker route regardless of "
+        "allow_live_orders or credentials; see resolve_effective_execution_mode / C-2 in "
+        "DeltaQuant-Quant-Risk-Review.md), or live (the only mode that can ever place a real "
+        "order, and only when trading_mode=live AND allow_live_orders=true AND Dhan "
+        "credentials are present).",
     )
     allow_live_orders: bool = Field(
         default=False,
         description="Master safety gate: real broker orders are only ever sent when this is "
-        "True. With live/dhan_paper but this False, execution runs in SHADOW (no orders sent).",
+        "True AND execution_mode=live AND trading_mode=live. With execution_mode=live but this "
+        "False, execution runs in SHADOW (no orders sent). dhan_paper never sends real orders "
+        "regardless of this flag.",
     )
     long_only: bool = Field(
         default=True,
@@ -617,9 +660,11 @@ class Settings(BaseSettings):
         "current-day bar) to avoid intra-bar repainting / look-ahead",
     )
     max_quote_staleness_seconds: int = Field(
-        default=0,
+        default=60,
         description="Skip NEW entries when the freshest quote is older than this many seconds "
-        "(0 = disabled). Exits still run on the last known price.",
+        "(0 = disabled). Exits still run on the last known price. 0 is only permitted when "
+        "enable_dhan_quotes=False (a declared simulation profile with no live quote feed at "
+        "all) — a live-data profile with 0 fails startup, see validate_configuration/H-10.",
     )
     signal_timeframes: str = Field(
         default="15m,30m,1h,4h",
@@ -723,24 +768,87 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_configuration(self) -> "Settings":
-        """Validate configuration consistency."""
-        errors = []
+        """Validate configuration consistency.
 
-        # Live trading requires broker credentials
-        if self.trading_mode == "live":
-            if not self.dhan_client_id or not self.dhan_access_token:
-                errors.append(
-                    "Live trading requires Dhan credentials (DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN)"
-                )
+        Two tiers, deliberately kept separate (see DeltaQuant-Quant-Risk-Review.md C-2/M-5):
+
+        - ``warnings`` — benign cross-field inconsistencies (risk-param sanity, market-hours
+          ordering, Telegram config) that degrade gracefully. These are collected but never
+          raise, so local/dev iteration stays unobstructed.
+        - ``fatal`` — the narrow, explicit set of hazardous combinations that could let a
+          paper-labeled config reach a real broker order, or silently disable the live-data
+          freshness gate. These raise ``ValueError`` (fail-closed at startup) instead of
+          logging, because a typo here changes the safety posture of the whole process.
+        """
+        warnings: list[str] = []
+        fatal: list[str] = []
+
+        # ---------------------------------------------------------------
+        # Fatal: hazardous trading_mode x execution_mode x allow_live_orders
+        # x Dhan-credential combinations (C-2). The only combination that may
+        # ever reach a real broker order is the unambiguous conjunction
+        # trading_mode=live AND execution_mode=live AND allow_live_orders=true
+        # AND valid Dhan credentials. Anything that half-declares live intent
+        # (the master gate armed, or execution_mode=live, without the rest of
+        # the conjunction agreeing) fails startup instead of quietly resolving
+        # to shadow at runtime, so a mismatched .env is caught immediately
+        # rather than discovered by reading multiple settings together.
+        # (execution_mode=dhan_paper is intentionally NOT part of this matrix:
+        # it is redefined to simulate Dhan-shaped data only and can never reach
+        # a live route at all — see resolve_effective_execution_mode below.)
+        # ---------------------------------------------------------------
+        has_dhan_credentials = bool(self.dhan_client_id and self.dhan_access_token)
+
+        if self.execution_mode == "live" and self.trading_mode != "live":
+            fatal.append(
+                f"EXECUTION_MODE=live requires TRADING_MODE=live (got "
+                f"TRADING_MODE={self.trading_mode!r}). A paper-labeled process must never "
+                "declare a live execution mode. Set TRADING_MODE=live only if you genuinely "
+                "intend to place real broker orders, otherwise change EXECUTION_MODE to "
+                "local_paper, shadow, or dhan_paper."
+            )
+
+        if self.allow_live_orders and self.trading_mode != "live":
+            fatal.append(
+                f"ALLOW_LIVE_ORDERS=true requires TRADING_MODE=live (got "
+                f"TRADING_MODE={self.trading_mode!r}) — this is the exact C-2 hazard: the "
+                "master live-order gate armed on a config every label says is paper. Set "
+                "TRADING_MODE=live to confirm real intent, or ALLOW_LIVE_ORDERS=false."
+            )
+
+        if self.trading_mode == "live" and not has_dhan_credentials:
+            fatal.append(
+                "TRADING_MODE=live requires Dhan credentials (DHAN_CLIENT_ID + "
+                "DHAN_ACCESS_TOKEN, or DHAN_CLIENT_ID + DHAN_PIN + DHAN_TOTP_SECRET for "
+                "auto-login) — refusing to start with live trading declared but no way to "
+                "authenticate to the broker."
+            )
+
+        # ---------------------------------------------------------------
+        # Fatal: MAX_QUOTE_STALENESS_SECONDS=0 disables the new-entry freshness
+        # gate entirely (H-10). Zero is only safe when enable_dhan_quotes=False
+        # — i.e. there is no live quote feed at all, so "staleness" is
+        # meaningless. Any profile that pulls real Dhan quotes must declare a
+        # conservative positive threshold instead of inheriting a simulation
+        # profile's value unnoticed.
+        # ---------------------------------------------------------------
+        if self.max_quote_staleness_seconds <= 0 and self.enable_dhan_quotes:
+            fatal.append(
+                "MAX_QUOTE_STALENESS_SECONDS=0 disables the new-entry data-freshness gate "
+                "and is only permitted when ENABLE_DHAN_QUOTES=false (a declared simulation "
+                "profile with no live quote feed). This profile has ENABLE_DHAN_QUOTES=true, "
+                "so set MAX_QUOTE_STALENESS_SECONDS to a conservative positive value (e.g. "
+                "60) or explicitly disable live quotes."
+            )
 
         # Validate risk parameters
         if self.risk_per_trade > self.max_position_pct:
-            errors.append(
+            warnings.append(
                 f"risk_per_trade ({self.risk_per_trade}) should not exceed max_position_pct ({self.max_position_pct})"
             )
 
         if self.max_total_risk < self.risk_per_trade:
-            errors.append(
+            warnings.append(
                 f"max_total_risk ({self.max_total_risk}) should not be less than risk_per_trade ({self.risk_per_trade})"
             )
 
@@ -751,9 +859,9 @@ class Settings(BaseSettings):
             open_time = datetime.strptime(self.market_open_time, "%H:%M")
             close_time = datetime.strptime(self.market_close_time, "%H:%M")
             if open_time >= close_time:
-                errors.append("market_open_time must be before market_close_time")
+                warnings.append("market_open_time must be before market_close_time")
         except ValueError as e:
-            errors.append(f"Invalid market hours format: {e}")
+            warnings.append(f"Invalid market hours format: {e}")
 
         # Validate trading window
         try:
@@ -762,26 +870,49 @@ class Settings(BaseSettings):
             no_before = datetime.strptime(self.no_trading_before, "%H:%M")
             no_after = datetime.strptime(self.no_trading_after, "%H:%M")
             if no_before >= no_after:
-                errors.append("no_trading_before must be before no_trading_after")
+                warnings.append("no_trading_before must be before no_trading_after")
         except ValueError as e:
-            errors.append(f"Invalid trading window format: {e}")
+            warnings.append(f"Invalid trading window format: {e}")
 
         # Telegram requires both token and chat_id
         if self.telegram_enabled:
             if self.telegram_bot_token and not self.telegram_chat_id:
-                errors.append("telegram_chat_id required when telegram_bot_token is set")
+                warnings.append("telegram_chat_id required when telegram_bot_token is set")
             if self.telegram_chat_id and not self.telegram_bot_token:
-                errors.append("telegram_bot_token required when telegram_chat_id is set")
+                warnings.append("telegram_bot_token required when telegram_chat_id is set")
 
         # Store warnings on the instance so tooling can surface them, and log them.
-        self._config_warnings = errors
-        if errors:
-            # Log warnings instead of raising for non-critical issues
-            import logging
+        self._config_warnings = warnings
+        import logging
 
-            logger = logging.getLogger(__name__)
-            for error in errors:
-                logger.warning(f"Configuration warning: {error}")
+        logger = logging.getLogger(__name__)
+        for warning in warnings:
+            logger.warning(f"Configuration warning: {warning}")
+
+        if fatal:
+            for error in fatal:
+                logger.error(f"Configuration FAILED (fail-closed): {error}")
+            raise ValueError(
+                "Refusing to start: hazardous configuration detected "
+                f"({len(fatal)} issue(s)):\n" + "\n".join(f"  - {e}" for e in fatal)
+            )
+
+        effective_execution_mode = resolve_effective_execution_mode(
+            self.execution_mode,
+            allow_live_orders=self.allow_live_orders,
+            trading_mode=self.trading_mode,
+            has_dhan_credentials=has_dhan_credentials,
+        )
+        real_orders = effective_execution_mode == "live"
+        logger.info(
+            "Configuration OK | trading_mode=%s requested_execution_mode=%s "
+            "effective_execution_mode=%s allow_live_orders=%s REAL_ORDERS=%s",
+            self.trading_mode,
+            self.execution_mode,
+            effective_execution_mode,
+            self.allow_live_orders,
+            "YES" if real_orders else "NO",
+        )
 
         return self
 

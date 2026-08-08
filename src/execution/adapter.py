@@ -13,6 +13,7 @@ from enum import Enum
 from typing import Any
 
 from src.config import get_settings
+from src.config.settings import resolve_effective_execution_mode
 from src.execution.paper_engine import LocalPaperEngine
 from src.market.dhan_auth import get_dhan_client, get_valid_access_token
 
@@ -321,17 +322,32 @@ async def execute_trades(
     """
     settings = get_settings()
 
-    # Select adapter based on execution mode
+    # Select adapter based on execution mode. Broker-capable (ExecutionAdapter) is
+    # constructed ONLY when the full C-2 conjunction resolves to "live" — see
+    # resolve_effective_execution_mode (src/config/settings.py). This previously
+    # constructed a real DhanHQ-backed ExecutionAdapter for execution_mode in
+    # ("dhan_paper", "live") whenever credentials were present, without checking
+    # allow_live_orders or trading_mode at all — exactly the C-2 hazard
+    # (DeltaQuant-Quant-Risk-Review.md), independent of ExecutionService's own gate.
     if adapter is None:
-        if settings.execution_mode == "local_paper":
-            adapter = LocalExecutionAdapter()
-        elif settings.execution_mode in ["dhan_paper", "live"]:
-            if DHANHQ_AVAILABLE and settings.dhan_client_id:
-                adapter = ExecutionAdapter()
-            else:
-                logger.warning("DhanHQ not available, falling back to local paper")
-                adapter = LocalExecutionAdapter()
+        has_dhan_credentials = bool(settings.dhan_client_id and DHANHQ_AVAILABLE)
+        effective_mode = resolve_effective_execution_mode(
+            settings.execution_mode,
+            allow_live_orders=bool(getattr(settings, "allow_live_orders", False)),
+            trading_mode=getattr(settings, "trading_mode", "paper"),
+            has_dhan_credentials=has_dhan_credentials,
+        )
+        if effective_mode == "live":
+            adapter = ExecutionAdapter()
         else:
+            if settings.execution_mode in ("dhan_paper", "live"):
+                logger.warning(
+                    "execution_mode=%s requested but the live-order conjunction "
+                    "(TRADING_MODE=live AND ALLOW_LIVE_ORDERS=true AND Dhan credentials) "
+                    "is not satisfied — falling back to local paper (no broker-capable "
+                    "adapter constructed).",
+                    settings.execution_mode,
+                )
             adapter = LocalExecutionAdapter()
 
     results = []

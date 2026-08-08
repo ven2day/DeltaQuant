@@ -3,8 +3,9 @@ Tests for the unified ExecutionService: mode resolution (incl. shadow + no silen
 downgrade), order idempotency, the kill-switch gate, and the IdempotencyStore.
 """
 
+import asyncio
 import uuid
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -65,6 +66,89 @@ def test_dhan_paper_without_opt_in_runs_shadow(engine, tmp_path):
     assert svc.effective_mode == ExecutionMode.SHADOW
 
 
+def test_c2_hazardous_combination_cannot_reach_real_broker_submission(engine, tmp_path):
+    """Regression test for C-2 (DeltaQuant-Quant-Risk-Review.md).
+
+    The audited hazard: TRADING_MODE=paper, EXECUTION_MODE=dhan_paper,
+    ALLOW_LIVE_ORDERS=true, with valid Dhan credentials, used to resolve to a
+    broker-capable mode (ExecutionService._resolve_mode only checked execution_mode +
+    allow_live_orders + credentials, never trading_mode). dhan_paper is now redefined
+    to simulate Dhan-shaped data only and can NEVER reach a live route, so this exact
+    combination must resolve to SHADOW even with a real (attached-but-unused) broker
+    executor -- and submitting through it must never touch that broker executor.
+    """
+    fake_settings = MagicMock(
+        trading_mode="paper",  # every label says paper...
+        dhan_client_id="real-client-id",
+        dhan_access_token="real-access-token",  # ...and credentials are genuinely valid
+    )
+    broker_executor = MagicMock()
+    broker_executor.place_and_confirm = AsyncMock()
+
+    with patch("src.execution.service.get_settings", return_value=fake_settings):
+        svc = ExecutionService(
+            engine=engine,
+            mode=ExecutionMode.DHAN_PAPER,
+            allow_live_orders=True,  # ...and the master live-order gate is armed
+            broker_executor=broker_executor,
+            idempotency=IdempotencyStore(database_url=_unique_sqlite_url(tmp_path)),
+        )
+        assert svc.effective_mode == ExecutionMode.SHADOW
+        assert svc.real_orders_active is False
+
+        result = asyncio.run(
+            svc.submit_async(
+                symbol="RELIANCE",
+                side="BUY",
+                quantity=10,
+                price=2500.0,
+                idempotency_key="c2-hazard",
+            )
+        )
+
+    assert result.is_shadow is True
+    assert "SHADOW" in result.message
+    broker_executor.place_and_confirm.assert_not_called()
+
+
+def test_live_mode_requires_trading_mode_live_independent_of_allow_live_orders(engine, tmp_path):
+    """_resolve_mode must independently require trading_mode=='live', not just
+    execution_mode + allow_live_orders + credentials -- the missing check C-2 identified."""
+    fake_settings = MagicMock(
+        trading_mode="paper",
+        dhan_client_id="real-client-id",
+        dhan_access_token="real-access-token",
+    )
+    with patch("src.execution.service.get_settings", return_value=fake_settings):
+        svc = ExecutionService(
+            engine=engine,
+            mode=ExecutionMode.LIVE,
+            allow_live_orders=True,
+            idempotency=IdempotencyStore(database_url=_unique_sqlite_url(tmp_path)),
+        )
+        assert svc.effective_mode == ExecutionMode.SHADOW
+        assert svc.real_orders_active is False
+
+
+def test_real_orders_active_true_only_for_full_conjunction(engine, tmp_path):
+    fake_settings = MagicMock(
+        trading_mode="live",
+        dhan_client_id="real-client-id",
+        dhan_access_token="real-access-token",
+    )
+    broker_executor = MagicMock()
+    with patch("src.execution.service.get_settings", return_value=fake_settings):
+        svc = ExecutionService(
+            engine=engine,
+            mode=ExecutionMode.LIVE,
+            allow_live_orders=True,
+            broker_executor=broker_executor,
+            idempotency=IdempotencyStore(database_url=_unique_sqlite_url(tmp_path)),
+        )
+        assert svc.effective_mode == ExecutionMode.LIVE
+        assert svc.real_orders_active is True
+
+
 def test_live_with_opt_in_but_no_creds_runs_shadow_not_local(engine, tmp_path):
     # allow_live_orders=True but no Dhan creds -> SHADOW (NOT a silent local-paper downgrade).
     svc = _service(engine, tmp_path, mode=ExecutionMode.LIVE, allow_live_orders=True)
@@ -74,7 +158,7 @@ def test_live_with_opt_in_but_no_creds_runs_shadow_not_local(engine, tmp_path):
 def test_live_via_sync_submit_rejects_directs_to_async(engine, tmp_path):
     # Live orders are async (broker lifecycle); the sync submit() must refuse, never silently
     # fill the paper wallet. Real live submission goes through submit_async (see live tests).
-    fake_settings = MagicMock(dhan_client_id="id", dhan_access_token="tok")
+    fake_settings = MagicMock(dhan_client_id="id", dhan_access_token="tok", trading_mode="live")
     with patch("src.execution.service.get_settings", return_value=fake_settings):
         svc = ExecutionService(
             engine=engine,

@@ -140,7 +140,10 @@ def _unique_sqlite_url(tmp_path) -> str:
 
 
 def _live_service(engine, tmp_path, broker_executor):
-    fake_settings = MagicMock(dhan_client_id="id", dhan_access_token="tok")
+    # trading_mode="live" is required alongside allow_live_orders + credentials for the
+    # full C-2 conjunction (see resolve_effective_execution_mode) -- without it, this
+    # legitimately-configured live path would now (correctly) resolve to SHADOW.
+    fake_settings = MagicMock(dhan_client_id="id", dhan_access_token="tok", trading_mode="live")
     with patch("src.execution.service.get_settings", return_value=fake_settings):
         return ExecutionService(
             engine=engine,
