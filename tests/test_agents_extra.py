@@ -30,6 +30,24 @@ with patch("src.config.get_settings") as mock_get_settings:
     mock_settings.groq_model_primary = "llama"
     mock_get_settings.return_value = mock_settings
 
+
+def _register_validated_strategy(directory, strategy_name: str) -> None:
+    """Seed a current VALIDATED H-8 registry artifact for ``strategy_name`` in
+    ``directory`` -- test helper for strategy_selection_node's admission gate."""
+    from src.backtesting.strategy_registry import StrategyRegistry, build_strategy_version
+
+    version = build_strategy_version(
+        strategy_name,
+        owner="test",
+        dataset_id="test-dataset",
+        oos_trades=100,
+        oos_expectancy=2.0,
+        oos_return_pct=10.0,
+        fold_consistency=0.8,
+    )
+    StrategyRegistry(directory).register(version)
+
+
 # --- Market Regime Tests ---
 
 
@@ -331,8 +349,12 @@ def test_parse_strategy_response():
 
 @patch("src.agents.strategy_selection.ChatGroq")
 @patch("src.agents.strategy_selection.get_settings")
-def test_strategy_selection_node(mock_settings, mock_llm_cls):
+def test_strategy_selection_node(mock_settings, mock_llm_cls, tmp_path):
+    # H-8: strategy_selection_node now gates its output through the strategy admission
+    # registry (fail closed) -- seed a current VALIDATED "breakout" version so it survives.
+    _register_validated_strategy(tmp_path, "breakout")
     mock_settings.return_value.groq_api_key.get_secret_value.return_value = "token"
+    mock_settings.return_value.strategy_registry_dir = str(tmp_path)
     mock_llm = MagicMock()
     mock_llm.invoke.return_value.content = '{"active_strategies": ["breakout"], "reasoning": "vol"}'
     mock_llm_cls.return_value = mock_llm
@@ -345,8 +367,11 @@ def test_strategy_selection_node(mock_settings, mock_llm_cls):
 
 @patch("src.agents.strategy_selection.ChatGroq")
 @patch("src.agents.strategy_selection.get_settings")
-def test_strategy_selection_node_skips_llm_when_disabled(mock_settings, mock_llm_cls):
+def test_strategy_selection_node_skips_llm_when_disabled(mock_settings, mock_llm_cls, tmp_path):
+    _register_validated_strategy(tmp_path, "momentum")
+    _register_validated_strategy(tmp_path, "trend_following")
     mock_settings.return_value.enable_llm_agents = False
+    mock_settings.return_value.strategy_registry_dir = str(tmp_path)
     state = create_initial_state()
     state["regime"] = "trending_up"
 
@@ -354,3 +379,18 @@ def test_strategy_selection_node_skips_llm_when_disabled(mock_settings, mock_llm
 
     mock_llm_cls.assert_not_called()
     assert result["active_strategies"] == ["momentum", "trend_following"]
+
+
+def test_strategy_selection_node_strips_strategies_with_no_registry_entry(tmp_path):
+    # H-8 fail-closed: with an empty (freshly created) registry directory, nothing is
+    # admitted -- no strategy trades without a current VALIDATED artifact, not even the
+    # regime-default fallback.
+    with patch("src.agents.strategy_selection.get_settings") as mock_settings:
+        mock_settings.return_value.enable_llm_agents = False
+        mock_settings.return_value.strategy_registry_dir = str(tmp_path)
+        state = create_initial_state()
+        state["regime"] = "trending_up"
+
+        result = strategy_selection_node(state)
+
+    assert result["active_strategies"] == []

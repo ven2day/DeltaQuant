@@ -731,6 +731,29 @@ class Settings(BaseSettings):
     signal_discovery_max_probability_tilt: float = Field(default=0.08, ge=0.0, le=0.20)
 
     # ===========================================
+    # Strategy admission registry (H-8, DeltaQuant-Quant-Risk-Review.md)
+    # ===========================================
+    strategy_registry_dir: str = Field(
+        default="data/strategy_registry",
+        description="Directory of immutable StrategyVersion validation artifacts, sourced "
+        "from walk_forward.edge_verdict(). strategy_selection_node and risk_compliance's "
+        "strategy-admission check both read from here; a named strategy "
+        "(momentum/mean_reversion/breakout/trend_following) with no current, non-expired "
+        "VALIDATED artifact here is stripped from the active-strategy list and blocked at "
+        "the risk gate -- fail closed, not a warning. Populate by running "
+        "`uv run python scripts/validate_strategy.py`, which registers a version per "
+        "named strategy in addition to printing the universe-level report.",
+    )
+    strategy_registry_validity_days: int = Field(
+        default=30,
+        ge=1,
+        le=365,
+        description="Days a freshly-registered StrategyVersion stays VALIDATED before it "
+        "expires and must be re-earned by re-running validate_strategy.py -- an edge can "
+        "decay, so a stale walk-forward run should not authorize live-paper trading forever.",
+    )
+
+    # ===========================================
     # Profit-target goal engine
     # ===========================================
     monthly_profit_target_pct: float = Field(

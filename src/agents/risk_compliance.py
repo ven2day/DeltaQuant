@@ -15,13 +15,22 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
+from src.backtesting.strategy_registry import StrategyRegistry
 from src.config import get_settings
 from src.market.sectors import get_stock_sector
+from src.market.signals import StrategyType
 from src.utils.market_time import is_trading_window, now_ist
 
 from .state import TradingState
 
 logger = logging.getLogger(__name__)
+
+# The four governed strategy names (src.market.signals.StrategyType) that the H-8
+# admission registry knows how to validate. A signal tagged with one of these must have
+# a current VALIDATED registry artifact to be approved here -- fail closed. Signals that
+# don't carry one of these names (e.g. hand-built fixtures, other non-governed entry
+# paths) are left to the existing checks and are not affected by this gate.
+_GOVERNED_STRATEGY_NAMES = {member.value for member in StrategyType}
 
 
 @dataclass
@@ -129,6 +138,7 @@ def risk_compliance_node(state: TradingState) -> dict[str, Any]:
     # Get current state
     portfolio = state.get("portfolio", {})
     daily_stats = state.get("daily_stats", {})
+    regime = state.get("regime", "unknown")
 
     # Get risk limits
     limits = RiskLimits.from_settings()
@@ -138,7 +148,7 @@ def risk_compliance_node(state: TradingState) -> dict[str, Any]:
     warnings = []
 
     for signal in validated_signals:
-        checks = _run_risk_checks(signal, portfolio, daily_stats, limits)
+        checks = _run_risk_checks(signal, portfolio, daily_stats, limits, regime=regime)
 
         # Collect results
         blocking_failures = [c for c in checks if not c.passed and c.severity == "block"]
@@ -181,6 +191,7 @@ def _run_risk_checks(
     portfolio: dict[str, Any],
     daily_stats: dict[str, Any],
     limits: RiskLimits,
+    regime: str = "unknown",
 ) -> list[RiskCheckResult]:
     """Run all risk checks on a signal.
 
@@ -414,6 +425,31 @@ def _run_risk_checks(
             severity="block",
         )
     )
+
+    # 14. Strategy admission gate (H-8, DeltaQuant-Quant-Risk-Review.md). Final-gate
+    # backstop for the same check strategy_selection_node already applies upstream: a
+    # governed strategy name with no current, non-expired VALIDATED registry artifact
+    # must not produce an approved trade, regardless of how it got this far (LLM
+    # validation approving a strategy outside the active list, a direct graph
+    # invocation that skipped strategy_selection, etc). Signals that don't carry one of
+    # the four governed strategy names are unaffected -- this is not a general "is this
+    # a known strategy" check, only the H-8 admission gate.
+    strategy_name = signal.get("strategy")
+    if strategy_name in _GOVERNED_STRATEGY_NAMES:
+        settings = get_settings()
+        registry_dir = getattr(settings, "strategy_registry_dir", "data/strategy_registry")
+        admitted = StrategyRegistry(str(registry_dir)).is_admitted(strategy_name, regime=regime)
+        checks.append(
+            RiskCheckResult(
+                passed=admitted,
+                rule="strategy_admission",
+                message=(
+                    f"Strategy '{strategy_name}' has no current VALIDATED registry artifact "
+                    f"for regime '{regime}' (H-8 strategy admission gate)"
+                ),
+                severity="block",
+            )
+        )
 
     return checks
 

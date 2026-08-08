@@ -67,7 +67,10 @@ def infer_signal_regime(signal: TradingSignal) -> str:
 
 
 def _ml_probability(signal: TradingSignal, prediction: PredictionSignal | None) -> float | None:
-    if prediction is None:
+    # An abstained prediction (H-7: insufficient OOS sample or collapsed ensemble
+    # weights) carries no usable direction -- treat it exactly like "no prediction",
+    # never as a confidence-floor vote.
+    if prediction is None or prediction.abstained:
         return None
     agrees = (signal.signal_type == SignalType.BUY and prediction.direction == "up") or (
         signal.signal_type == SignalType.SELL and prediction.direction == "down"

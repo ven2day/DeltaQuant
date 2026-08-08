@@ -100,13 +100,24 @@ def test_create_features(prediction_agent):
 
 
 def test_predict_sklearn(prediction_agent):
+    # Needs >= MIN_LABELED_SAMPLES (40) labeled rows to clear walk-forward validation
+    # and avoid an abstain -- 150 rows of noisy uptrend leaves comfortably enough after
+    # indicator warm-up is dropped.
+    import numpy as np
+
+    rng = np.random.default_rng(42)
+    n = 150
+    prices = [100.0]
+    for _ in range(n - 1):
+        prices.append(prices[-1] * (1 + rng.normal(0.001, 0.01)))
+
     df = pd.DataFrame(
         {
-            "Open": [100] * 30,
-            "High": [101] * 30,
-            "Low": [99] * 30,
-            "Close": [100 + i for i in range(30)],  # Uptrend
-            "Volume": [1000] * 30,
+            "Open": [p * 0.999 for p in prices],
+            "High": [p * 1.01 for p in prices],
+            "Low": [p * 0.99 for p in prices],
+            "Close": prices,
+            "Volume": rng.integers(100000, 1000000, n),
         }
     )
 
@@ -115,9 +126,35 @@ def test_predict_sklearn(prediction_agent):
         try:
             signal = prediction_agent.predict(df, "AAPL")
             assert signal.symbol == "AAPL"
-            assert signal.confidence >= 0.3
+            assert not signal.abstained
+            assert 0.0 <= signal.confidence <= 1.0
+            assert signal.direction in ("up", "down")
+            assert signal.feature_version
+            assert signal.model_version
+            assert signal.oos_samples > 0
         except ImportError:
             pass  # Skip if sklearn not installed in test env (it is installed in dev env)
+
+
+def test_predict_abstains_with_insufficient_labeled_samples(prediction_agent):
+    """H-7: with too little labeled history for walk-forward validation, the agent must
+    report an explicit no-signal abstain rather than a confidence-floor direction."""
+    df = pd.DataFrame(
+        {
+            "Open": [100] * 30,
+            "High": [101] * 30,
+            "Low": [99] * 30,
+            "Close": [100 + i for i in range(30)],  # Uptrend, but only ~10 labeled rows
+            "Volume": [1000] * 30,
+        }
+    )
+
+    with patch("src.agents.prediction.SKLEARN_AVAILABLE", True):
+        signal = prediction_agent.predict(df, "AAPL")
+
+    assert signal.abstained is True
+    assert signal.direction == "flat"
+    assert signal.confidence == 0.0
 
 
 def test_predict_fallback(prediction_agent):

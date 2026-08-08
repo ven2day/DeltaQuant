@@ -286,7 +286,9 @@ def _build_validation_context_enriched(
         relevant_preds = [
             p
             for p in prediction_signals
-            if isinstance(p, dict) and p.get("symbol") in signal_symbols
+            # An abstained prediction (H-7) has no usable direction; excluded rather
+            # than surfaced as a "confirm/contradict" vote the LLM can't trust.
+            if isinstance(p, dict) and p.get("symbol") in signal_symbols and not p.get("abstained")
         ]
         if relevant_preds:
             enrichment.append("\n## ML Prediction Consensus (use to confirm/contradict signals)\n")
