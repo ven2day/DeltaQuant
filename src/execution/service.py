@@ -10,15 +10,19 @@ missing:
 - **Shadow mode** — mirrors exactly what a live run would do (sizing + the order it *would*
   send), simulating the fill against the paper engine, but never contacts a broker. This is
   the safe bridge to live trading.
-- **No silent downgrade** — a `live`/`dhan_paper` request without `allow_live_orders` (or
-  without broker credentials) resolves to SHADOW with a loud warning, rather than quietly
-  trading on the local paper wallet as if it were real.
+- **No silent downgrade** — a `live` request without `allow_live_orders`, without
+  `trading_mode=live`, or without broker credentials resolves to SHADOW with a loud warning,
+  rather than quietly trading on the local paper wallet as if it were real. `dhan_paper` is
+  simulate-only: it NEVER reaches a live route, for any combination of flags (see C-2 in
+  DeltaQuant-Quant-Risk-Review.md and `resolve_effective_execution_mode` in
+  src/config/settings.py) — there is no verified Dhan sandbox endpoint, so "paper" in its name
+  cannot be backed by an actual sandbox, and pretending otherwise was exactly the hazard.
 
 Real broker order submission IS wired here: when a `broker_executor` (`LiveBrokerExecutor`)
 is attached, `submit_async` calls `_submit_live`, which places and confirms a genuine DhanHQ
 order. The safety boundary is entirely in mode resolution above, not in this file being a
-stub — with `allow_live_orders=true` and valid Dhan credentials, `live`/`dhan_paper` really
-do send real orders.
+stub — only `live`, with `trading_mode=live` AND `allow_live_orders=true` AND valid Dhan
+credentials, ever sends a real order.
 """
 
 from __future__ import annotations
@@ -36,6 +40,7 @@ from sqlalchemy import Column, DateTime, String, Text
 from sqlalchemy.orm import Session
 
 from src.config import get_settings
+from src.config.settings import resolve_effective_execution_mode
 from src.db.base import Base, get_session
 from src.execution.adapter import OrderRequest, OrderSide, OrderStatus, OrderType
 from src.execution.live_executor import LiveBrokerExecutor
@@ -182,10 +187,12 @@ class ExecutionService:
     def __post_init__(self) -> None:
         self._effective_mode = self._resolve_mode()
         logger.info(
-            "ExecutionService ready (requested=%s, effective=%s, allow_live_orders=%s)",
+            "ExecutionService ready | requested_mode=%s effective_mode=%s "
+            "allow_live_orders=%s REAL_ORDERS=%s",
             self.mode.value,
             self._effective_mode.value,
             self.allow_live_orders,
+            "YES" if self.real_orders_active else "NO",
         )
 
     @classmethod
@@ -211,28 +218,66 @@ class ExecutionService:
     def effective_mode(self) -> ExecutionMode:
         return self._effective_mode
 
+    @property
+    def real_orders_active(self) -> bool:
+        """True only when this service can actually reach a real broker order.
+
+        Requires the effective mode to be LIVE (which, via ``_resolve_mode``, already
+        implies trading_mode=live AND allow_live_orders AND valid Dhan credentials —
+        see ``resolve_effective_execution_mode``) *and* a broker executor attached.
+        ``local_paper``, ``shadow``, and ``dhan_paper`` (which always resolves to
+        shadow) can never make this True.
+        """
+        return self._effective_mode == ExecutionMode.LIVE and self.broker_executor is not None
+
     def _resolve_mode(self) -> ExecutionMode:
-        """Resolve the mode actually used, never silently downgrading a live request."""
-        if self.mode in (ExecutionMode.LIVE, ExecutionMode.DHAN_PAPER):
-            if not self.allow_live_orders:
+        """Resolve the mode actually used, never silently downgrading a live request.
+
+        Delegates to ``resolve_effective_execution_mode`` (src/config/settings.py) for
+        the actual conjunction so the invariant lives in exactly one place; this method
+        only adds the specific, actionable log message for *why* a downgrade happened.
+        """
+        settings = get_settings()
+        trading_mode = getattr(settings, "trading_mode", "paper")
+        has_dhan_credentials = bool(
+            getattr(settings, "dhan_client_id", None)
+            and getattr(settings, "dhan_access_token", None)
+        )
+        resolved_value = resolve_effective_execution_mode(
+            self.mode.value,
+            allow_live_orders=self.allow_live_orders,
+            trading_mode=trading_mode,
+            has_dhan_credentials=has_dhan_credentials,
+        )
+        resolved = ExecutionMode(resolved_value)
+
+        if resolved is not self.mode:
+            if self.mode is ExecutionMode.DHAN_PAPER:
+                logger.warning(
+                    "execution_mode=dhan_paper never reaches a live broker route (it "
+                    "simulates against Dhan-shaped data only — see C-2) — running in SHADOW."
+                )
+            elif not self.allow_live_orders:
                 logger.warning(
                     "execution_mode=%s but allow_live_orders is False — running in SHADOW "
                     "(no real orders sent).",
                     self.mode.value,
                 )
-                return ExecutionMode.SHADOW
-            settings = get_settings()
-            if not (
-                getattr(settings, "dhan_client_id", None)
-                and getattr(settings, "dhan_access_token", None)
-            ):
+            elif trading_mode != "live":
+                logger.error(
+                    "execution_mode=%s but trading_mode=%r (not 'live') — running in SHADOW. "
+                    "This is the exact C-2 hazard: a paper-labeled trading_mode with the "
+                    "live-order gate armed. Set TRADING_MODE=live to confirm real intent.",
+                    self.mode.value,
+                    trading_mode,
+                )
+            elif not has_dhan_credentials:
                 logger.error(
                     "execution_mode=%s requested but Dhan credentials are missing — running "
                     "in SHADOW, NOT downgrading silently to local paper.",
                     self.mode.value,
                 )
-                return ExecutionMode.SHADOW
-        return self.mode
+        return resolved
 
     @staticmethod
     def _client_order_id(idempotency_key: str) -> str:
