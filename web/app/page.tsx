@@ -1,6 +1,14 @@
 "use client";
 
-import { History, LayoutDashboard, PieChart, ShieldCheck, TrendingUp, Zap } from "lucide-react";
+import {
+  CandlestickChart,
+  History,
+  LayoutDashboard,
+  PieChart,
+  ShieldCheck,
+  TrendingUp,
+  Zap,
+} from "lucide-react";
 import { useState } from "react";
 import { AccountPanel } from "@/components/AccountPanel";
 import { ActivityLogPanel } from "@/components/ActivityLogPanel";
@@ -16,6 +24,7 @@ import { SectorMoversPanel } from "@/components/SectorMoversPanel";
 import { SessionCostPanel } from "@/components/SessionCostPanel";
 import { SignalHistoryPanel } from "@/components/SignalHistoryPanel";
 import { SystemStatusPanel } from "@/components/SystemStatusPanel";
+import { TradeChartsPanel } from "@/components/TradeChartsPanel";
 import { TradeHistoryPanel } from "@/components/TradeHistoryPanel";
 import { Tabs } from "@/components/ui/Tabs";
 import { useAuthGuard } from "@/lib/useAuthGuard";
@@ -23,6 +32,7 @@ import { useTradingState } from "@/lib/useTradingState";
 
 const TABS = [
   { id: "overview", label: "Overview", icon: LayoutDashboard },
+  { id: "charts", label: "Charts", icon: CandlestickChart },
   { id: "sectors", label: "Sector Movers", icon: PieChart },
   { id: "scalping", label: "Scalping Candidates", icon: Zap },
   { id: "signals", label: "Signal History", icon: History },
@@ -74,6 +84,8 @@ export default function Home() {
               </div>
             </div>
           )}
+
+          {activeTab === "charts" && <TradeChartsPanel stats={state} />}
 
           {activeTab === "sectors" && <SectorMoversPanel stats={state} expanded />}
 
