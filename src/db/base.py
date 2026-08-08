@@ -32,6 +32,10 @@ _COLUMN_MIGRATIONS = (
         "namespace",
         "namespace VARCHAR(40) DEFAULT 'paper_market_data'",
     ),
+    ("strategy_performance_records", "trade_id", "trade_id VARCHAR(60) DEFAULT ''"),
+    ("paper_trade_lifecycles", "finalized_at", "finalized_at TIMESTAMP WITH TIME ZONE"),
+    ("paper_trade_lifecycles", "mae", "mae DOUBLE PRECISION DEFAULT 0"),
+    ("paper_trade_lifecycles", "mfe", "mfe DOUBLE PRECISION DEFAULT 0"),
 )
 
 

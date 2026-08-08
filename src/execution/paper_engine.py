@@ -723,6 +723,48 @@ class LocalPaperEngine:
             "open_positions": len(self.positions),
         }
 
+    def get_orders_for_trade(self, trade_id: str) -> list[Order]:
+        """All durable orders tagged with this trade_id (entry + adds + exits), oldest first.
+
+        Ground truth for lifecycle-ledger reconciliation after a crash: this table is
+        written synchronously inside ``place_order``'s own transaction, so it can never be
+        behind the separate lifecycle ledger the way the ledger can be behind it after a
+        crash between "order filled here" and "ledger updated there". Charge fields are not
+        persisted per-order (see ``get_closed_trade_history``'s note on the same tradeoff),
+        so callers needing charge granularity should treat 0.0 as "unknown, not zero" —
+        ``realized_pnl`` is already net-of-charges and unaffected.
+        """
+        if not trade_id:
+            return []
+        session = self._session()
+        try:
+            rows = (
+                session.query(PaperOrderRecord)
+                .filter_by(trade_id=trade_id)
+                .order_by(PaperOrderRecord.timestamp)
+                .all()
+            )
+        finally:
+            session.close()
+        return [
+            Order(
+                order_id=str(row.order_id),
+                symbol=str(row.symbol),
+                side=str(row.side),
+                quantity=int(row.quantity),
+                order_type=str(row.order_type),
+                price=float(row.price),
+                status=str(row.status),
+                timestamp=str(row.timestamp),
+                reason=str(row.reason or ""),
+                trade_id=str(row.trade_id or ""),
+                position_id=str(row.position_id or ""),
+                idempotency_key=str(row.idempotency_key or ""),
+                realized_pnl=float(row.realized_pnl or 0.0),
+            )
+            for row in rows
+        ]
+
     def get_closed_trade_history(self, limit: int = 250) -> list[dict[str, Any]]:
         """Reconstruct closed paper fills from the durable order ledger.
 

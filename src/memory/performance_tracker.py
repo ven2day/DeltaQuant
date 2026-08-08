@@ -58,6 +58,12 @@ class PerformanceRecord(Base):
     symbol = Column(String(20), default="", nullable=False)
     is_winner = Column(Boolean, nullable=False)
     timestamp = Column(DateTime, nullable=False, index=True)
+    # Canonical lifecycle trade_id (see src/execution/lifecycle.py), when known. Empty for
+    # records predating this column. Lets record_trade be idempotent per trade_id so a
+    # crash-recovery replay of a lifecycle's finalize step can never double-count a trade
+    # into win-rate/expectancy stats (the exact C-5 "partial exits inflate trade count" and
+    # "double-credit on restart" failure mode).
+    trade_id = Column(String(60), default="", nullable=False, index=True)
 
 
 class PerformanceTracker:
@@ -111,6 +117,7 @@ class PerformanceTracker:
         self._database_url = database_url
         self.namespace = namespace
         self._records: list[dict[str, Any]] = []
+        self._recorded_trade_ids: set[str] = set()
         self._performance_cache: dict[tuple[str, str], StrategyPerformance] = {}
         self._load()
 
@@ -128,6 +135,7 @@ class PerformanceTracker:
                 .all()
             )
             for row in rows:
+                trade_id = str(row.trade_id or "")
                 self._records.append(
                     {
                         "strategy": row.strategy,
@@ -137,8 +145,11 @@ class PerformanceTracker:
                         "symbol": row.symbol,
                         "is_winner": row.is_winner,
                         "timestamp": row.timestamp,
+                        "trade_id": trade_id,
                     }
                 )
+                if trade_id:
+                    self._recorded_trade_ids.add(trade_id)
             logger.info("Loaded %d performance records from Postgres", len(self._records))
         except Exception:
             logger.exception("Could not load performance history from Postgres; starting empty.")
@@ -153,8 +164,20 @@ class PerformanceTracker:
         pnl_pct: float,
         symbol: str = "",
         timestamp: datetime | None = None,
+        trade_id: str = "",
     ):
-        """Record a completed trade outcome."""
+        """Record a completed trade outcome.
+
+        ``trade_id``, when given, makes this call idempotent: a repeat call for a trade_id
+        already recorded (in memory or, on a fresh process, already in Postgres) is a
+        silent no-op instead of a second row. This is what keeps a crash-recovery replay of
+        a lifecycle's finalize step from double-counting a trade into win-rate/expectancy —
+        the exact defect the audit's C-5 finding described for partial exits, generalized to
+        cover a replayed finalize as well.
+        """
+        if trade_id and trade_id in self._recorded_trade_ids:
+            logger.debug("record_trade: trade_id=%s already recorded, skipping duplicate", trade_id)
+            return
         timestamp = timestamp or datetime.now()
         self._records.append(
             {
@@ -165,13 +188,26 @@ class PerformanceTracker:
                 "symbol": symbol,
                 "is_winner": pnl > 0,
                 "timestamp": timestamp,
+                "trade_id": trade_id,
             }
         )
+        if trade_id:
+            self._recorded_trade_ids.add(trade_id)
         # Invalidate cache for this pair
         self._performance_cache.pop((strategy, regime), None)
 
         session = self._session()
         try:
+            if trade_id:
+                # Second layer of defense against Postgres already holding this trade_id
+                # (e.g. two processes racing, or an in-memory cache that missed a restart).
+                existing = (
+                    session.query(PerformanceRecord)
+                    .filter_by(namespace=self.namespace, trade_id=trade_id)
+                    .first()
+                )
+                if existing is not None:
+                    return
             session.add(
                 PerformanceRecord(
                     namespace=self.namespace,
@@ -182,6 +218,7 @@ class PerformanceTracker:
                     symbol=symbol,
                     is_winner=pnl > 0,
                     timestamp=timestamp,
+                    trade_id=trade_id,
                 )
             )
             session.commit()

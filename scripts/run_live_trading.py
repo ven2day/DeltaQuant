@@ -35,6 +35,7 @@ from src.config import get_settings
 from src.dashboard.stats import TradingDashboard
 from src.execution.averaging import CappedAveragingPolicy
 from src.execution.exit_manager import ExitManager
+from src.execution.finalize import TradeFinalizer
 from src.execution.journal import TradeJournal
 from src.execution.lifecycle import (
     MOCK_NAMESPACE,
@@ -218,6 +219,23 @@ async def run_live_trading():
         "INFO" if journal.is_persistent else "WARNING",
     )
 
+    # Durable-outbox finalize step (journal close + performance record + lesson crediting)
+    # for a fully-closed canonical trade — one reason-agnostic path shared by every close
+    # (target/stop/trailing/time/stale/regime-change/kill-switch) and by the startup replay
+    # of any trade a crash left CLOSED-but-unfinalized. See src/execution/finalize.py.
+    trade_finalizer = TradeFinalizer(
+        lifecycle_store=lifecycle_store,
+        perf_tracker=perf_tracker,
+        journal=journal,
+        enable_learning=settings.enable_learning,
+        mistake_classifier=mistake_classifier,
+        memory_injector=memory_injector,
+        memory_db=memory_db,
+        on_lesson=lambda mistake: dashboard.stats.log_activity(
+            f"Lesson learned: [{mistake.severity}] {mistake.category}", "INFO"
+        ),
+    )
+
     # Unified execution service: one mode-switched path for order submission with
     # idempotency (no double-submit on retry/restart) and shadow-mode safety.
     execution_service = ExecutionService.from_settings(
@@ -244,11 +262,41 @@ async def run_live_trading():
         partial_exit_pct=0.5,
         state_file=Path("exit_manager_state.json"),
     )
-    reconciliation = lifecycle_store.reconcile(paper_engine.get_positions(), exit_manager)
+    reconciliation = lifecycle_store.reconcile(
+        paper_engine.get_positions(), exit_manager, order_lookup=paper_engine.get_orders_for_trade
+    )
     dashboard.stats.log_activity(
         f"Paper lifecycle reconciliation: {reconciliation.summary()}",
         "INFO" if reconciliation.in_sync else "WARNING",
     )
+    if reconciliation.ambiguous > 0:
+        # The ledger owns making itself reconcilable; it could not here (see
+        # PaperTradeLifecycleStore.reconcile docstring) — this must be surfaced loudly, not
+        # silently traded through, since exit-manager/wallet state may be wrong for these
+        # trade_ids until a human resolves them.
+        await get_alert_manager().alert(
+            "lifecycle_reconciliation_ambiguous",
+            f"{reconciliation.ambiguous} trade(s) could not be reconciled at startup "
+            f"({reconciliation.summary()}) — investigate before trusting exit-manager/wallet "
+            "state for them.",
+            level="CRITICAL",
+        )
+
+    # Durable-outbox drain: any trade the ledger already marked CLOSED but whose journal/
+    # performance/lesson fan-out never completed (a crash between the two) — replay it now
+    # rather than leaving it silently uncredited forever.
+    replayed = trade_finalizer.replay_unfinalized(data_namespace)
+    for stale in replayed:
+        dashboard.stats.log_activity(
+            f"Startup replay: finalized crash-interrupted close for {stale['symbol']} "
+            f"(trade_id={stale['trade_id']})",
+            "WARNING",
+        )
+    if replayed:
+        dashboard.stats.log_activity(
+            f"Startup replay: finalized {len(replayed)} crash-interrupted close(s).",
+            "WARNING",
+        )
 
     # Profit-target goal engine: derive a risk-bounded plan from the configured target.
     # Advisory only — it never changes position sizing or relaxes risk limits.
@@ -690,6 +738,8 @@ async def run_live_trading():
             realized_pnl=result.realized_pnl,
             exit_charges=result.exit_charges,
             reason=reason,
+            mae=pos.mae,
+            mfe=pos.mfe,
         )
         daily_risk_store.record_exit_pnl(result.realized_pnl)
         exit_manager.apply_exit_fill(pos.position_id, quantity)
@@ -701,58 +751,13 @@ async def run_live_trading():
         if not fully_closed:
             return True
 
-        lifecycle = lifecycle_store.get(pos.position_id) or {}
-        cumulative_pnl = float(lifecycle.get("cumulative_pnl", result.realized_pnl))
-        original_quantity = int(lifecycle.get("original_quantity", quantity))
-        weighted_entry = float(lifecycle.get("weighted_entry_price", pos.entry_price))
-        notional = weighted_entry * original_quantity
-        pnl_pct = cumulative_pnl / notional * 100 if notional else 0.0
-        perf_tracker.record_trade(
-            strategy=pos.strategy,
-            regime=pos.regime_at_entry,
-            pnl=cumulative_pnl,
-            pnl_pct=pnl_pct,
-            symbol=pos.symbol,
-        )
-        try:
-            journal.close_trade(
-                pos.position_id,
-                result.fill_price,
-                reason,
-                mae=pos.mae,
-                mfe=pos.mfe,
-                pnl=cumulative_pnl,
-                exit_quantity=original_quantity,
-            )
-        except Exception as exc:
-            logger.warning("Journal close_trade failed for %s: %s", pos.position_id, exc)
-        if settings.enable_learning and mistake_classifier and memory_injector:
-            outcome = feedback.build_outcome(
-                trade_id=pos.position_id,
-                symbol=pos.symbol,
-                strategy=pos.strategy,
-                regime=pos.regime_at_entry,
-                side=pos.side,
-                entry_price=weighted_entry,
-                exit_price=result.fill_price,
-                stop_loss=pos.stop_loss,
-                target_price=pos.target_price,
-                pnl=cumulative_pnl,
-                pnl_pct=pnl_pct,
-                mae=pos.mae,
-                mfe=pos.mfe,
-                hold_minutes=max(0, int((datetime.now() - pos.entry_time).total_seconds() / 60)),
-            )
-            mistake = feedback.learn_from_outcome(memory_injector, mistake_classifier, outcome)
-            if mistake:
-                dashboard.stats.log_activity(
-                    f"Lesson learned: [{mistake.severity}] {mistake.category}", "INFO"
-                )
-            feedback.mark_lessons_outcome(
-                memory_db,
-                lifecycle.get("active_lessons", []),
-                was_successful=cumulative_pnl > 0,
-            )
+        # Aggregate partial fills + this final leg into exactly one lifecycle outcome for
+        # performance/learning (cumulative net P&L at the lifecycle level) — the durable
+        # ledger, not this in-memory ManagedPosition, is the source of truth for that
+        # aggregation. Routed through the same finalize step used by startup crash-recovery
+        # replay, so a kill-switch flatten (which also calls this function) produces the
+        # same complete outcome records as a normal close.
+        trade_finalizer.finalize(pos.position_id, exit_price=result.fill_price, exit_reason=reason)
         return True
 
     last_review_fingerprint: tuple[str, ...] | None = None
