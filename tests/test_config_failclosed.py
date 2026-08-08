@@ -86,7 +86,12 @@ def test_local_paper_and_shadow_pass_through_unchanged():
 
 
 def _base_kwargs(**overrides):
-    kwargs = dict(groq_api_key="x")
+    # _env_file=None: these tests assert behavior of explicit kwargs / class defaults.
+    # Without this, Settings' real env_file=".env" source (see model_config) silently
+    # merges in whatever the repo's actual .env currently contains (e.g. the current
+    # weekend/simulation profile's ENABLE_DHAN_QUOTES=false), making "default" tests
+    # pass or fail based on an unrelated file's contents instead of the code under test.
+    kwargs = dict(groq_api_key="x", _env_file=None)
     kwargs.update(overrides)
     return kwargs
 
