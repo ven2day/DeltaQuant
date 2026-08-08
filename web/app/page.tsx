@@ -18,6 +18,7 @@ import { SignalHistoryPanel } from "@/components/SignalHistoryPanel";
 import { SystemStatusPanel } from "@/components/SystemStatusPanel";
 import { TradeHistoryPanel } from "@/components/TradeHistoryPanel";
 import { Tabs } from "@/components/ui/Tabs";
+import { useAuthGuard } from "@/lib/useAuthGuard";
 import { useTradingState } from "@/lib/useTradingState";
 
 const TABS = [
@@ -30,8 +31,17 @@ const TABS = [
 ];
 
 export default function Home() {
+  const { checking } = useAuthGuard();
   const { state, connected, history } = useTradingState();
   const [activeTab, setActiveTab] = useState("overview");
+
+  if (checking) {
+    return (
+      <main className="mx-auto flex max-w-7xl flex-col gap-4 p-4 sm:p-6">
+        <div className="py-24 text-center italic text-ink-muted">Checking session…</div>
+      </main>
+    );
+  }
 
   return (
     <main className="mx-auto flex max-w-7xl flex-col gap-4 p-4 sm:p-6">

@@ -59,9 +59,17 @@ export function useTradingState(): {
         }
       };
 
-      const scheduleReconnect = () => {
+      const scheduleReconnect = (event: CloseEvent) => {
         if (cancelled) return;
         setConnected(false);
+        // 1008 = policy violation: the backend's /ws handler sends this specifically
+        // for a missing/expired/invalid session cookie (src/webui/server.py). Retrying
+        // with the same stale cookie would just loop forever — send the user to log in
+        // again instead.
+        if (event.code === 1008) {
+          window.location.assign("/login");
+          return;
+        }
         const delay =
           RECONNECT_DELAYS_MS[Math.min(attemptRef.current, RECONNECT_DELAYS_MS.length - 1)];
         attemptRef.current += 1;

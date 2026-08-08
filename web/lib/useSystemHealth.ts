@@ -1,16 +1,10 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
+import { apiFetch } from "./api";
 import type { SystemHealth } from "./types";
 
 const POLL_INTERVAL_MS = 60_000;
-
-// Shares a host/port with the WebSocket (both served by the same FastAPI app) —
-// derive the base URL from NEXT_PUBLIC_WS_URL rather than adding a second env var.
-function apiBaseUrl(): string {
-  const wsUrl = process.env.NEXT_PUBLIC_WS_URL ?? "ws://127.0.0.1:8000/ws";
-  return wsUrl.replace(/^ws/, "http").replace(/\/ws$/, "");
-}
 
 export function useSystemHealth(): {
   health: SystemHealth | null;
@@ -24,7 +18,7 @@ export function useSystemHealth(): {
 
   const fetchHealth = useCallback((full: boolean) => {
     setLoading(true);
-    fetch(`${apiBaseUrl()}/api/health?full=${full}`)
+    apiFetch(`/api/health?full=${full}`)
       .then((res) => {
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         return res.json() as Promise<SystemHealth>;

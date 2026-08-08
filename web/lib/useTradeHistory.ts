@@ -1,14 +1,10 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
+import { apiFetch } from "./api";
 import type { ClosedPaperTrade } from "./types";
 
 const POLL_INTERVAL_MS = 30_000;
-
-function apiBaseUrl(): string {
-  const wsUrl = process.env.NEXT_PUBLIC_WS_URL ?? "ws://127.0.0.1:8000/ws";
-  return wsUrl.replace(/^ws/, "http").replace(/\/ws$/, "");
-}
 
 export function useTradeHistory(): {
   trades: ClosedPaperTrade[];
@@ -21,7 +17,7 @@ export function useTradeHistory(): {
   const [error, setError] = useState<string | null>(null);
 
   const fetchTrades = useCallback(() => {
-    fetch(`${apiBaseUrl()}/api/trades?limit=250`)
+    apiFetch("/api/trades?limit=250")
       .then((res) => {
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         return res.json() as Promise<ClosedPaperTrade[]>;

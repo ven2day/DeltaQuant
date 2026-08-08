@@ -1,7 +1,9 @@
 "use client";
 
-import { ShieldCheck } from "lucide-react";
+import { LogOut, ShieldCheck } from "lucide-react";
+import { useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
+import { logout } from "@/lib/api";
 import type { TradingStats } from "@/lib/types";
 import { Badge } from "./ui/Badge";
 
@@ -32,6 +34,12 @@ export function Header({
   connected: boolean;
 }) {
   const clock = useISTClock();
+  const router = useRouter();
+
+  async function handleLogout() {
+    await logout();
+    router.replace("/login");
+  }
 
   const mode = stats?.trading_mode ?? "paper";
   const dataSource = stats?.data_source ?? "simulated";
@@ -65,6 +73,15 @@ export function Header({
           pulse={connected}
         />
         <span className="tabular text-xs text-ink-muted">{clock}</span>
+        <button
+          type="button"
+          onClick={handleLogout}
+          title="Sign out"
+          className="flex items-center gap-1 rounded-md border border-border px-2 py-1 text-xs text-ink-muted transition-colors hover:border-status-critical hover:text-status-critical"
+        >
+          <LogOut size={12} strokeWidth={2} />
+          Sign out
+        </button>
       </div>
     </div>
   );
