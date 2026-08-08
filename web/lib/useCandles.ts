@@ -16,6 +16,7 @@ export function useCandles(
   symbol: string | null,
   timeframe: string,
   limit: number = 300,
+  previewSimulated: boolean = false,
 ): { candles: Candle[]; loading: boolean } {
   const [candles, setCandles] = useState<Candle[]>([]);
   const [loading, setLoading] = useState(false);
@@ -28,7 +29,7 @@ export function useCandles(
     let cancelled = false;
     setLoading(true);
     apiFetch(
-      `/api/candles?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(timeframe)}&limit=${limit}`,
+      `/api/candles?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(timeframe)}&limit=${limit}&preview_simulated=${previewSimulated}`,
     )
       .then((res) => (res.ok ? (res.json() as Promise<Candle[]>) : Promise.resolve([])))
       .then((data) => {
@@ -43,7 +44,7 @@ export function useCandles(
     return () => {
       cancelled = true;
     };
-  }, [symbol, timeframe, limit]);
+  }, [symbol, timeframe, limit, previewSimulated]);
 
   return { candles, loading };
 }

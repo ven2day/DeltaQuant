@@ -1,7 +1,7 @@
 """Tests for HistoryManager's multi-timeframe intraday history support."""
 
 from datetime import datetime, timedelta
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pandas as pd
 import pytest
@@ -97,6 +97,69 @@ def test_intraday_fetch_failure_falls_back_to_cache(hm):
         second = hm.get_multi_timeframe_history("TEST", Timeframe.H1)
         assert second is not None
         assert len(second) == len(fetched)
+
+
+# --- Dynamic real/simulated switching (closed-market pipeline testing) ---
+
+
+@pytest.fixture
+def hm_with_sim():
+    sim = MagicMock()
+    sim.get_history.return_value = _ohlcv(50, "15min")
+    manager = HistoryManager(symbols=["TEST"], simulated_stream=sim)
+    return manager, sim
+
+
+def test_uses_simulated_stream_when_market_closed(hm_with_sim):
+    hm, sim = hm_with_sim
+    with (
+        patch("src.market.history_manager.is_market_hours", return_value=False),
+        patch.object(hm._feed, "get_historical") as mock_real_fetch,
+    ):
+        result = hm.get_multi_timeframe_history("TEST", Timeframe.M15, bars=10)
+
+    assert result is not None
+    sim.get_history.assert_called_once_with("TEST", "15m", 10)
+    mock_real_fetch.assert_not_called()
+
+
+def test_uses_real_feed_when_market_open_even_with_simulated_stream_configured(hm_with_sim):
+    hm, sim = hm_with_sim
+    fetched = _ohlcv(50, "15min")
+    with (
+        patch("src.market.history_manager.is_market_hours", return_value=True),
+        patch.object(hm._feed, "get_historical", return_value=fetched) as mock_real_fetch,
+    ):
+        result = hm.get_multi_timeframe_history("TEST", Timeframe.M15, bars=10)
+
+    assert result is not None
+    mock_real_fetch.assert_called_once()
+    sim.get_history.assert_not_called()
+
+
+def test_daily_timeframe_also_switches_to_simulated_when_closed(hm_with_sim):
+    hm, sim = hm_with_sim
+    sim.get_history.return_value = _ohlcv(30, "D")
+    with patch("src.market.history_manager.is_market_hours", return_value=False):
+        result = hm.get_multi_timeframe_history("TEST", Timeframe.D1, bars=5)
+
+    assert result is not None
+    sim.get_history.assert_called_once_with("TEST", "1d", 5)
+
+
+def test_none_simulated_stream_is_unaffected_by_market_hours(hm):
+    """A HistoryManager with no simulated_stream configured at all (the default,
+    e.g. every existing test in this file) must behave identically regardless of
+    real market hours -- confirms this feature is purely additive."""
+    fetched = _ohlcv(50, "15min")
+    with (
+        patch("src.market.history_manager.is_market_hours", return_value=False),
+        patch.object(hm._feed, "get_historical", return_value=fetched) as mock_real_fetch,
+    ):
+        result = hm.get_multi_timeframe_history("TEST", Timeframe.M15)
+
+    assert result is not None
+    mock_real_fetch.assert_called_once()
 
 
 def test_h4_resamples_from_h1(hm):

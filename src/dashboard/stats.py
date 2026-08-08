@@ -305,6 +305,7 @@ class TradingDashboard:
                         "entry_time": p.entry_time,
                         "strategy": p.strategy,
                         "timeframe": timeframe_by_id.get(str(p.position_id), ""),
+                        "entry_data_source": getattr(p, "entry_data_source", "real"),
                     }
                 )
             synced.append(item)

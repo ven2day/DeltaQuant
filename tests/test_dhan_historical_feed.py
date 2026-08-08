@@ -72,8 +72,11 @@ def test_period_to_days_known_values():
     assert _period_to_days("3mo") == 90
 
 
-def test_period_to_days_clamps_to_max_request_days():
-    assert _period_to_days("730d") == 90
+def test_period_to_days_long_periods_are_not_clamped():
+    # get_historical() paginates across multiple ≤MAX_REQUEST_DAYS windows for
+    # periods this long -- the day count itself must stay true, not clamped.
+    assert _period_to_days("730d") == 730
+    assert _period_to_days("2y") == 730
 
 
 def test_period_to_days_unknown_period_defaults_to_max():
@@ -116,6 +119,18 @@ def test_get_historical_daily_resamples_real_hourly_data():
     assert len(df) == 1
     _, kwargs = feed._client.intraday_minute_data.call_args
     assert kwargs["interval"] == 60
+
+
+def test_get_historical_5m_uses_intraday_native_interval():
+    feed = _feed()
+    feed._client.intraday_minute_data.return_value = _sample_response(n=5)
+
+    df = feed.get_historical("RELIANCE", period="60d", interval="5m")
+
+    assert df is not None
+    assert len(df) == 5
+    _, kwargs = feed._client.intraday_minute_data.call_args
+    assert kwargs["interval"] == 5
 
 
 def test_get_historical_15m_uses_intraday_native_interval():
@@ -162,7 +177,7 @@ def test_get_historical_returns_none_on_unresolved_symbol():
 def test_get_historical_returns_none_on_unsupported_interval():
     feed = _feed()
 
-    assert feed.get_historical("RELIANCE", period="60d", interval="5m") is None
+    assert feed.get_historical("RELIANCE", period="60d", interval="45m") is None
 
 
 def test_get_historical_returns_none_on_client_exception():
@@ -170,3 +185,78 @@ def test_get_historical_returns_none_on_client_exception():
     feed._client.intraday_minute_data.side_effect = Exception("network error")
 
     assert feed.get_historical("RELIANCE", period="60d", interval="15m") is None
+
+
+# --- pagination for periods longer than MAX_REQUEST_DAYS ---
+
+
+def test_get_historical_2y_paginates_across_multiple_windows():
+    feed = _feed()
+    # Distinct timestamps per call so the concatenated frame is verifiably longer
+    # than any single window's response, not just the last call's data reused.
+    call_count = 0
+
+    def _paged_response(**kwargs):
+        nonlocal call_count
+        call_count += 1
+        return _sample_response(n=2, start_epoch=_EPOCH_2026_01_01_UTC + call_count * 10_000)
+
+    feed._client.intraday_minute_data.side_effect = _paged_response
+
+    df = feed.get_historical("RELIANCE", period="2y", interval="15m")
+
+    assert df is not None
+    # 730 days / 90-day windows = 9 calls; each contributes 2 distinct bars.
+    assert call_count == 9
+    assert len(df) == 18
+
+
+def test_get_historical_short_period_makes_a_single_call():
+    feed = _feed()
+    feed._client.intraday_minute_data.return_value = _sample_response(n=5)
+
+    feed.get_historical("RELIANCE", period="60d", interval="15m")
+
+    assert feed._client.intraday_minute_data.call_count == 1
+
+
+def test_get_historical_paginated_daily_resamples_after_concatenation():
+    feed = _feed()
+    call_count = 0
+
+    def _paged_response(**kwargs):
+        nonlocal call_count
+        call_count += 1
+        # One bar per window, each on a distinct day, so daily resampling
+        # after concatenation still yields one row per window.
+        return _sample_response(n=1, start_epoch=_EPOCH_2026_01_01_UTC + call_count * 86_400)
+
+    feed._client.intraday_minute_data.side_effect = _paged_response
+
+    df = feed.get_historical("RELIANCE", period="2y", interval="1d")
+
+    assert df is not None
+    assert call_count == 9
+    assert len(df) == 9
+    for _, kwargs in feed._client.intraday_minute_data.call_args_list:
+        assert kwargs["interval"] == 60
+
+
+def test_get_historical_skips_failed_window_but_keeps_others():
+    feed = _feed()
+    call_count = 0
+
+    def _one_failure(**kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 3:
+            return {"status": "failure", "remarks": "DH-901 invalid token"}
+        return _sample_response(n=2, start_epoch=_EPOCH_2026_01_01_UTC + call_count * 10_000)
+
+    feed._client.intraday_minute_data.side_effect = _one_failure
+
+    df = feed.get_historical("RELIANCE", period="2y", interval="15m")
+
+    assert df is not None
+    assert call_count == 9
+    assert len(df) == 16  # 8 successful windows * 2 bars each

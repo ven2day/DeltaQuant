@@ -15,6 +15,10 @@ export interface Position {
   entry_time?: string;
   strategy?: string;
   timeframe?: string;
+  /** "simulated" if opened while NSE was closed (weekend/off-hours pipeline test
+   * data), "real" if opened on genuine DhanHQ quotes. Sticks to how the position
+   * was first opened even after the live pipeline switches back to real data. */
+  entry_data_source?: string;
 }
 
 export interface Quote {

@@ -54,6 +54,11 @@ class Position:
     stop_loss: float = 0.0
     target_price: float = 0.0
     strategy: str = ""
+    # "real" (genuine DhanHQ quotes) or "simulated" (market closed, weekend/off-hours
+    # pipeline test) -- set once at entry from market_manager.data_source and never
+    # touched again, so a position opened on fake data stays honestly labeled even
+    # after real trading resumes and data_source flips back.
+    entry_data_source: str = "real"
 
     def __post_init__(self):
         if self.highest_price == 0.0:
@@ -146,6 +151,7 @@ class PaperPositionRecord(Base):
     stop_loss = Column(Float, default=0.0, nullable=False)
     target_price = Column(Float, default=0.0, nullable=False)
     strategy = Column(String(50), default="", nullable=False)
+    entry_data_source = Column(String(20), default="real", nullable=False)
 
 
 class PaperOrderRecord(Base):
@@ -244,6 +250,7 @@ class LocalPaperEngine:
                     stop_loss=row.stop_loss,
                     target_price=row.target_price,
                     strategy=row.strategy,
+                    entry_data_source=row.entry_data_source or "real",
                 )
 
             recent_orders = (
@@ -311,6 +318,7 @@ class LocalPaperEngine:
                         stop_loss=pos.stop_loss,
                         target_price=pos.target_price,
                         strategy=pos.strategy,
+                        entry_data_source=pos.entry_data_source,
                     )
                 )
 
@@ -356,6 +364,7 @@ class LocalPaperEngine:
         stop_loss: float = 0.0,
         target_price: float = 0.0,
         strategy: str = "",
+        entry_data_source: str = "real",
     ) -> Order:
         """
         Place an order (immediately filled for market orders).
@@ -571,6 +580,7 @@ class LocalPaperEngine:
                     stop_loss=stop_loss,
                     target_price=target_price,
                     strategy=strategy,
+                    entry_data_source=entry_data_source,
                 )
                 affected_position_id = opened.position_id
                 order_entry_charges += open_charges
@@ -627,6 +637,7 @@ class LocalPaperEngine:
         stop_loss: float = 0.0,
         target_price: float = 0.0,
         strategy: str = "",
+        entry_data_source: str = "real",
     ) -> Position:
         """Create and register a new open position (long or short)."""
         resolved_id = position_id or f"POS-{uuid4().hex[:8]}"
@@ -658,6 +669,7 @@ class LocalPaperEngine:
             stop_loss=stop_loss,
             target_price=target_price,
             strategy=strategy,
+            entry_data_source=entry_data_source,
         )
         self.positions[position.position_id] = position
         return position

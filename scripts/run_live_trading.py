@@ -431,7 +431,13 @@ async def run_live_trading():
         symbols=trading_symbols,
         lookback_period="3mo",
         allow_synthetic=synthetic_history_allowed,
-        simulated_stream=(market_manager.simulated_data if synthetic_history_allowed else None),
+        # Always wired, not gated by synthetic_history_allowed (that flag only governs
+        # the old all-Dhan-disabled startup-seed path above). HistoryManager itself now
+        # re-checks market hours on every call and only falls back to this stream while
+        # the market is genuinely closed -- see get_multi_timeframe_history's docstring.
+        # Real DhanHQ history still powers the startup prefetch below and every call
+        # made during real market hours.
+        simulated_stream=market_manager.simulated_data,
     )
     fetch_results = history_manager.prefetch_all()
     loaded = sum(1 for v in fetch_results.values() if v)
@@ -525,11 +531,36 @@ async def run_live_trading():
         async def _get_health_dict(full: bool) -> dict[str, Any]:
             return (await health_check(include_slow_checks=full)).to_dict()
 
-        def _get_candles(symbol: str, timeframe: str, limit: int) -> list[dict[str, Any]]:
+        def _get_candles(
+            symbol: str, timeframe: str, limit: int, preview_simulated: bool = False
+        ) -> list[dict[str, Any]]:
             """Historical OHLCV for the dashboard's Charts tab. Reuses the same
             HistoryManager the trading loop itself computes indicators/signals from —
             never a second, independently-fetched price series (see the
-            simulator-coherence work: one instrument state, one price process)."""
+            simulator-coherence work: one instrument state, one price process) —
+            UNLESS the symbol has an open position that was itself opened on
+            simulated data (Position.entry_data_source == "simulated"), in which
+            case its chart must show the same simulated candles actually driving
+            that position's price/exits, not real history it was never priced
+            against. Same lineage-separation principle as manager.py's
+            get_real_quotes()/get_simulated_quotes() for position P&L; the
+            frontend badges this via the position's own entry_data_source field,
+            not anything in this response shape.
+
+            ``preview_simulated`` is a separate, explicit opt-in: lets the Charts
+            tab preview the simulated pipeline is genuinely alive for any symbol
+            (e.g. while no position has opened yet to prove it via the branch
+            above), without ever making simulated data the default for a symbol
+            nothing has actually traded on.
+            """
+            has_simulated_position = any(
+                p.symbol == symbol and p.entry_data_source == "simulated"
+                for p in paper_engine.get_positions()
+            )
+            if has_simulated_position or preview_simulated:
+                frame = market_manager.simulated_data.get_history(symbol, timeframe, bars=limit)
+                return dataframe_to_candles(frame)
+
             if timeframe == Timeframe.D1.value:
                 frame = history_manager.get_history(symbol, bars=limit)
             else:
@@ -804,8 +835,39 @@ async def run_live_trading():
                 history_manager.sync_simulated_stream()
 
         # ── Step 0: Check exits on existing positions ───────────
+        # Resolve each open position's price from the pipeline it was actually opened
+        # on (Position.entry_data_source), not whichever pipeline happens to be active
+        # this cycle -- a real position's exits/stop/target/P&L must never be evaluated
+        # against simulated (closed-market pipeline-test) prices, or vice versa, just
+        # because the market opened/closed mid-session (see manager.py's
+        # get_real_quotes()/get_simulated_quotes()). Non-position scan symbols (ATR
+        # below, ranking elsewhere) still use the blended active-pipeline feed, which
+        # is correct for them -- they're not committed to a lineage.
         quotes = market_manager.get_all_quotes()
         market_prices = {s: q.last_price for s, q in quotes.items()}
+        open_positions_now = paper_engine.get_positions()
+        real_position_symbols = {
+            p.symbol for p in open_positions_now if p.entry_data_source != "simulated"
+        }
+        sim_position_symbols = {
+            p.symbol for p in open_positions_now if p.entry_data_source == "simulated"
+        }
+        if real_position_symbols:
+            real_prices = market_manager.get_real_quotes(real_position_symbols)
+            for symbol in real_position_symbols:
+                if symbol in real_prices:
+                    market_prices[symbol] = real_prices[symbol].last_price
+                else:
+                    # No real quote fetched yet this session -- never substitute the
+                    # blended (possibly simulated) feed; leave it out so the position
+                    # simply holds at its last known price instead of going stale on
+                    # some other pipeline's number, until this actually resolves.
+                    market_prices.pop(symbol, None)
+        if sim_position_symbols:
+            sim_prices = market_manager.get_simulated_quotes(sim_position_symbols)
+            for symbol in sim_position_symbols:
+                if symbol in sim_prices:
+                    market_prices[symbol] = sim_prices[symbol].last_price
 
         # Calculate ATR for exit manager
         atr_values = {}
@@ -1076,22 +1138,50 @@ async def run_live_trading():
             perf_tracker,
             discovered_signal_tilts=discovered_tilts,
         )
+
+        # Evaluating every ranked candidate below (a 5-timeframe history fetch each,
+        # including M5 -- nothing else this cycle caches that one) doesn't scale: with
+        # a real multi-timeframe signal_timeframes config, `ranked` can run into the
+        # hundreds, all sequentially rate-limited to Dhan's 5 req/sec account-wide cap.
+        # Confirmed live: a cycle stalled 50+ minutes mid-loop here with ~490 raw
+        # signals. rank_signals() already sorts best-first, and
+        # select_diversified_signals() only needs symbol/sector (not the expensive
+        # evaluation) to build a bounded, diverse shortlist -- so shortlist FIRST on
+        # the cheap ranking, and only run the expensive per-candidate evaluation on
+        # that shortlist. 2x max_active_stocks leaves room for candidates that fail
+        # the evaluation gates without silently under-filling the final target.
+        candidate_pool = select_diversified_signals(
+            ranked,
+            max_symbols=settings.max_active_stocks * 2,
+            max_per_sector=settings.universe_max_per_sector,
+            max_signals_per_symbol=settings.max_signals_per_symbol,
+        )
+
         candidate_decisions = {}
         qualifying_ranked = []
-        for item in ranked:
+        for item in candidate_pool:
             signal = item.signal
-            histories = {
-                timeframe: history_manager.get_multi_timeframe_history(
-                    signal.symbol, timeframe, 240
-                )
-                for timeframe in (
-                    Timeframe.M5,
-                    Timeframe.M15,
-                    Timeframe.M30,
-                    Timeframe.H1,
-                    Timeframe.H4,
-                )
-            }
+            symbol = signal.symbol
+
+            # Offloaded like the prediction loop above (asyncio.to_thread) --
+            # each call is a rate-limited, blocking Dhan fetch, and this runs
+            # once per ranked candidate. Left synchronous on the event loop
+            # thread, it stalls the dashboard's HTTP/WebSocket server for the
+            # whole scan (confirmed via a live stack dump against a 272-symbol
+            # universe: MainThread parked in acquire_sync/_intraday_response).
+            def _fetch_histories() -> dict[Timeframe, Any]:
+                return {
+                    timeframe: history_manager.get_multi_timeframe_history(symbol, timeframe, 240)
+                    for timeframe in (
+                        Timeframe.M5,
+                        Timeframe.M15,
+                        Timeframe.M30,
+                        Timeframe.H1,
+                        Timeframe.H4,
+                    )
+                }
+
+            histories = await asyncio.to_thread(_fetch_histories)
             decision = evaluate_long_candidate(
                 signal.to_dict(),
                 histories,
@@ -1115,7 +1205,7 @@ async def run_live_trading():
                 qualifying_ranked.append(item)
 
         dashboard.stats.candidate_decisions = [
-            candidate_decisions[item.signal.signal_id].to_dict() for item in ranked[:25]
+            candidate_decisions[item.signal.signal_id].to_dict() for item in candidate_pool[:25]
         ]
         if settings.llm_review_all_signals:
             survivors = qualifying_ranked
@@ -1136,7 +1226,11 @@ async def run_live_trading():
         reviewed_ranked = [item for item in survivors if item.signal.symbol in reviewed_symbol_set]
         signals = [item.signal for item in reviewed_ranked]
 
-        display_item = reviewed_ranked[0] if reviewed_ranked else (ranked[0] if ranked else None)
+        # Falls back within candidate_pool (every item here has a computed decision),
+        # never the raw `ranked` list -- candidate_decisions only covers candidate_pool.
+        display_item = (
+            reviewed_ranked[0] if reviewed_ranked else (candidate_pool[0] if candidate_pool else None)
+        )
         if display_item is not None:
             display_signal = display_item.signal
             display_decision = candidate_decisions[display_signal.signal_id]
@@ -1311,7 +1405,18 @@ async def run_live_trading():
         # in-memory dashboard counters — those reset on every restart, which would silently
         # reset the daily trade limit and daily loss limit along with them.
         daily_stats = daily_risk_store.get_today()
-        daily_stats["simulation_mode"] = simulated_session
+        # `simulated_session` is a startup-only, all-or-nothing flag from before
+        # MarketDataManager/HistoryManager learned to switch real vs simulated
+        # dynamically per cycle (is_market_hours(), re-checked every call) -- with
+        # real Dhan data enabled at all, simulated_session is permanently False, so
+        # risk_compliance's FORCE_TRADING_WINDOW bypass (which requires this exact
+        # marker -- see force_window_requires_simulation_marker in
+        # RiskLimits.from_settings()) never actually applied. Confirmed live: every
+        # weekend entry attempt was blocked at "Outside trading hours" regardless of
+        # FORCE_TRADING_WINDOW, even candidates that cleared every earlier gate.
+        # OR in the live per-cycle pipeline state so the bypass tracks which data
+        # actually drove THIS cycle's decision, not a stale startup snapshot.
+        daily_stats["simulation_mode"] = simulated_session or market_manager.data_source == "simulated"
         portfolio = {
             "capital": paper_engine.get_balance(),
             "positions": [p.to_dict() for p in paper_engine.get_positions()],
@@ -1432,7 +1537,14 @@ async def run_live_trading():
         outcome_records = []
         for sig in risk_rejected:
             failures = sig.get("risk_result", {}).get("failures", [])
-            reason = failures[0].get("message") if failures else "risk rules"
+            # Same H-8-first priority as SignalRecord.from_signal (signal_log.py) --
+            # "not an admitted strategy" is the reason worth surfacing over whichever
+            # check merely ran earlier, since no other condition can ever fix it.
+            admission_failure = next(
+                (f for f in failures if f.get("rule") == "strategy_admission"), None
+            )
+            chosen_failure = admission_failure or (failures[0] if failures else None)
+            reason = chosen_failure.get("message") if chosen_failure else "risk rules"
             dashboard.stats.log_activity(
                 f"RISK BLOCKED: {sig.get('signal_type')} {sig.get('symbol')} "
                 f"[{sig.get('timeframe', 'N/A')}] — {reason}",
@@ -1670,6 +1782,9 @@ async def run_live_trading():
                 target_price=target_price,
                 strategy=strategy,
                 reason="entry",
+                entry_data_source=(
+                    "simulated" if market_manager.data_source == "simulated" else "real"
+                ),
             )
             reservations.release(final_order)
 

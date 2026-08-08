@@ -230,6 +230,7 @@ class NewsAnalyst:
 
             # Parse JSON response
             import json
+            import re
 
             # Handle markdown code blocks
             if "```json" in content:
@@ -240,6 +241,16 @@ class NewsAnalyst:
                 start = content.find("```") + 3
                 end = content.find("```", start)
                 content = content[start:end].strip()
+
+            # Groq models (the fallback llama-3.1-8b-instant especially) sometimes
+            # write a positive sentiment as "+1.0" / "+0.5" -- valid in everyday
+            # notation but not valid JSON (leading '+' on a number is a hard parse
+            # error). Confirmed live: this was silently defaulting EVERY sentiment
+            # call to 0.0/neutral via the except-Exception fallback below, for every
+            # headline batch, the whole time news analysis has been "working."
+            # Restricted to right after a JSON key-value colon so it can't touch a
+            # legitimate '+' inside the quoted reasoning string.
+            content = re.sub(r":(\s*)\+(\d)", r":\1\2", content)
 
             result = json.loads(content)
             sentiment = float(result.get("sentiment", 0.0))

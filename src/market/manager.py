@@ -7,7 +7,7 @@ based on market hours and connection availability.
 
 import asyncio
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -124,6 +124,16 @@ class MarketDataManager:
         self.quotes: dict[str, MarketQuote] = {}
         self.running = False
 
+        # Real quotes, kept separately from `self.quotes` (which reflects whichever
+        # pipeline is CURRENTLY active and gets overwritten wholesale by
+        # _load_simulated_quotes()). This is the one place real prices survive a
+        # switch to simulated data when the market closes -- so a position opened on
+        # real data keeps pricing against its last known real quote (frozen, not
+        # faked) instead of silently inheriting simulated movement. Never cleared by
+        # simulated mode; only real polls (_poll_dhan_rest_quotes, the WebSocket
+        # callback) write to it.
+        self._last_real_quotes: dict[str, MarketQuote] = {}
+
     def _on_websocket_quote(self, quote: QuoteData):
         """Handle incoming WebSocket quote."""
         market_quote = MarketQuote(
@@ -140,6 +150,7 @@ class MarketDataManager:
         )
 
         self.quotes[quote.symbol] = market_quote
+        self._last_real_quotes[quote.symbol] = market_quote
 
         if self.on_quote:
             self.on_quote(market_quote)
@@ -173,6 +184,7 @@ class MarketDataManager:
                 is_live=True,
             )
             self.quotes[market_quote.symbol] = market_quote
+            self._last_real_quotes[market_quote.symbol] = market_quote
             if self.on_quote:
                 self.on_quote(market_quote)
         return True
@@ -229,17 +241,26 @@ class MarketDataManager:
             else:
                 logger.info("DhanHQ WebSocket credentials unavailable; falling back to REST quotes")
 
-        if data_source == "dhan" and self.settings.enable_dhan_quotes:
+        if data_source == "dhan" and self.settings.enable_dhan_quotes and is_market_open():
             logger.info("Using DhanHQ REST quote polling for %d stocks", len(self.symbols))
             if self._poll_dhan_rest_quotes():
                 self.data_source = "dhan_rest"
-                return True
+                # False (not True): REST is poll-based, not push -- the caller must
+                # keep calling refresh() every cycle to get anything past this first
+                # fetch (see refresh()'s own docstring for the bug this fixes).
+                return False
             logger.warning("DhanHQ quote API cooling down after historical backfill; retrying in 60s")
             await asyncio.sleep(60)
             if self._poll_dhan_rest_quotes():
                 self.data_source = "dhan_rest"
-                return True
+                return False
             raise RuntimeError("DhanHQ REST quote polling failed after cooldown")
+        elif data_source == "dhan" and self.settings.enable_dhan_quotes:
+            logger.info(
+                "Market is CLOSED - starting on simulated data for the live-quote pipeline; "
+                "refresh() switches to real DhanHQ REST quotes automatically once NSE opens "
+                "(historical charts/backtests are a separate pipeline and stay real always)"
+            )
         else:
             logger.info("Market data source not configured - using simulated data")
 
@@ -279,15 +300,40 @@ class MarketDataManager:
 
     def refresh(self) -> None:
         """
-        Pull the latest quotes for the active source — call once per trading cycle.
+        Pull the latest quotes for the active source — call once per trading cycle
+        (the caller skips this only for a genuine WebSocket push connection, which
+        updates via callback instead -- see run_live_trading.py's `is_live` guard).
 
-        - simulated: advance the random walk (new movement each cycle).
-        - dhan websocket: pushes via callback, so this is a no-op.
+        Re-checks market hours every call, not just once at start() -- so a
+        long-running process transitions between real DhanHQ REST quotes (market
+        open) and simulated data (market closed) on its own as the day rolls on,
+        without needing a restart. This is also the fix for a real bug: start()
+        used to report REST-polling mode as "live" the same way a WebSocket push
+        connection is, which made the caller skip calling refresh() at all --
+        quotes silently froze at whatever was fetched at startup for the rest of
+        the session, staleness clock included. Historical charts/backtests are a
+        separate pipeline (HistoryManager/DhanHistoricalFeed) and are unaffected
+        either way -- they stay real always, market open or not.
         """
-        if self.data_source == "dhan_rest":
-            self._poll_dhan_rest_quotes()
-        elif self.data_source == "simulated":
-            self.refresh_simulated()
+        want_dhan_rest = (
+            self.settings.market_data_source == "dhan"
+            and self.settings.enable_dhan_quotes
+            and is_market_open()
+        )
+        if want_dhan_rest:
+            if self._poll_dhan_rest_quotes():
+                if self.data_source != "dhan_rest":
+                    logger.info("Market is OPEN - switching to real DhanHQ REST quotes")
+                self.data_source = "dhan_rest"
+                return
+            logger.warning("DhanHQ REST quote poll failed this cycle; keeping last known quotes")
+            return
+
+        if self.data_source != "simulated":
+            logger.info("Market is CLOSED - switching to simulated data for the live-quote pipeline")
+        self.data_source = "simulated"
+        self.simulated_data.tick()
+        self._load_simulated_quotes()
 
     async def listen(self):
         """Listen for market data updates."""
@@ -308,6 +354,48 @@ class MarketDataManager:
     def get_all_quotes(self) -> dict[str, MarketQuote]:
         """Get all current quotes."""
         return self.quotes.copy()
+
+    def get_real_quotes(self, symbols: Iterable[str] | None = None) -> dict[str, MarketQuote]:
+        """Real DhanHQ quotes only, independent of which pipeline is currently active.
+
+        Frozen at whatever was last actually polled -- never populated with
+        simulated data. A real position's exits/P&L must resolve prices through
+        this (not get_all_quotes()), so switching to simulated data when the
+        market closes can't touch it; it just stops updating until real polling
+        resumes, same as the existing staleness-gate behavior for a stalled feed.
+        """
+        if symbols is None:
+            return dict(self._last_real_quotes)
+        wanted = set(symbols)
+        return {s: q for s, q in self._last_real_quotes.items() if s in wanted}
+
+    def get_simulated_quotes(self, symbols: Iterable[str] | None = None) -> dict[str, MarketQuote]:
+        """Simulated quotes only, independent of which pipeline is currently active
+        (available on demand even while real trading is live) -- so a position
+        opened during a closed-market pipeline test keeps pricing against the
+        simulated feed for its whole life, not whatever pipeline is active this
+        cycle. Does not advance the random walk -- call refresh_simulated() (or
+        refresh(), while in simulated mode) for that; this only reads the current
+        simulated state.
+        """
+        wanted = list(symbols) if symbols is not None else self.symbols
+        sim_quotes = self.simulated_data.get_quotes(wanted)
+        return {
+            symbol: MarketQuote(
+                symbol=sq.symbol,
+                last_price=float(sq.last_price),
+                open=float(sq.open),
+                high=float(sq.high),
+                low=float(sq.low),
+                close=float(sq.close),
+                change=float(sq.change),
+                change_percent=float(sq.change_percent),
+                volume=int(sq.volume),
+                is_live=False,
+                timestamp=sq.timestamp,
+            )
+            for symbol, sq in sim_quotes.items()
+        }
 
     def get_trading_candidates(self, min_change: float = 0.5) -> list[MarketQuote]:
         """Get stocks with significant movement."""

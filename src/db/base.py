@@ -36,6 +36,11 @@ _COLUMN_MIGRATIONS = (
     ("paper_trade_lifecycles", "finalized_at", "finalized_at TIMESTAMP WITH TIME ZONE"),
     ("paper_trade_lifecycles", "mae", "mae DOUBLE PRECISION DEFAULT 0"),
     ("paper_trade_lifecycles", "mfe", "mfe DOUBLE PRECISION DEFAULT 0"),
+    (
+        "paper_positions",
+        "entry_data_source",
+        "entry_data_source VARCHAR(20) DEFAULT 'real'",
+    ),
 )
 
 

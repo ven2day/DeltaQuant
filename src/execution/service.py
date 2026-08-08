@@ -335,6 +335,7 @@ class ExecutionService:
         target_price: float,
         strategy: str,
         reason: str,
+        entry_data_source: str,
     ) -> ExecutionResult:
         """Simulate a fill against the paper engine (local_paper and shadow)."""
         is_shadow = self._effective_mode == ExecutionMode.SHADOW
@@ -351,6 +352,7 @@ class ExecutionService:
             target_price=target_price,
             strategy=strategy,
             reason=reason,
+            entry_data_source=entry_data_source,
         )
         message = "SHADOW: simulated, not sent to broker" if is_shadow else "local paper fill"
         return ExecutionResult(
@@ -394,6 +396,7 @@ class ExecutionService:
         target_price: float = 0.0,
         strategy: str = "",
         reason: str = "",
+        entry_data_source: str = "real",
     ) -> ExecutionResult:
         """
         Submit synchronously. Handles local_paper and shadow; a live mode returns a reject
@@ -420,6 +423,7 @@ class ExecutionService:
                 target_price,
                 strategy,
                 reason,
+                entry_data_source,
             )
         else:
             result = ExecutionResult(
@@ -450,6 +454,7 @@ class ExecutionService:
         target_price: float = 0.0,
         strategy: str = "",
         reason: str = "",
+        entry_data_source: str = "real",
     ) -> ExecutionResult:
         """Submit through the effective mode, awaiting the broker for live modes."""
         side = side.upper()
@@ -473,6 +478,7 @@ class ExecutionService:
                 target_price,
                 strategy,
                 reason,
+                entry_data_source,
             )
         elif self.broker_executor is None:
             result = ExecutionResult(

@@ -14,11 +14,14 @@ Two real API constraints (verified against DhanHQ's docs and the installed
   native 15m interval, the same technique already used elsewhere in this
   codebase for H4-from-H1.
 - Each ``/charts/intraday`` or ``/charts/historical`` call is capped at 90
-  days of data per DhanHQ's docs. Every period this codebase actually
-  requests (60d/730d/3mo) gets trimmed to a much shorter lookback downstream
-  anyway (see scalping_screener.py's ``lookback_days``), so this clamps to 90
-  days rather than paginating across multiple calls for a case that doesn't
-  occur in practice.
+  days of data per DhanHQ's docs. Most periods this codebase requests
+  (60d/3mo) are trimmed to a much shorter lookback downstream anyway (see
+  scalping_screener.py's ``lookback_days``) and fit in one call, but the
+  strategy walk-forward validator (scripts/validate_strategy.py) genuinely
+  needs "2y" of daily bars, so ``get_historical`` fetches periods longer than
+  ``MAX_REQUEST_DAYS`` as several sequential ≤90-day windows and concatenates
+  them, oldest first, instead of silently truncating to the most recent 90
+  days.
 
 Timestamps: DhanHQ returns Unix epoch seconds (UTC); this codebase's OHLCV
 convention is tz-aware Asia/Kolkata timestamps. Converting explicitly to
@@ -59,8 +62,9 @@ EXCHANGE_SEGMENT = "NSE_EQ"
 INSTRUMENT_TYPE = "EQUITY"
 IST = "Asia/Kolkata"
 
-# Period strings this codebase actually passes, mapped to a lookback
-# in calendar days (clamped to MAX_REQUEST_DAYS below — see module docstring).
+# Period strings this codebase actually passes, mapped to a lookback in
+# calendar days. Not clamped to MAX_REQUEST_DAYS here -- get_historical()
+# paginates across multiple ≤MAX_REQUEST_DAYS calls for anything longer.
 _PERIOD_DAYS: dict[str, int] = {
     "5d": 5,
     "10d": 10,
@@ -69,10 +73,12 @@ _PERIOD_DAYS: dict[str, int] = {
     "3mo": 90,
     "6mo": 180,
     "730d": 730,
+    "2y": 730,
 }
 
 # Interval string -> (Dhan minute interval, resample rule if not native).
 _INTRADAY_INTERVAL_MAP: dict[str, tuple[int, str | None]] = {
+    "5m": (5, None),
     "15m": (15, None),
     "30m": (15, "30min"),
     "60m": (60, None),
@@ -80,7 +86,9 @@ _INTRADAY_INTERVAL_MAP: dict[str, tuple[int, str | None]] = {
 
 
 def _period_to_days(period: str) -> int:
-    return min(_PERIOD_DAYS.get(period, MAX_REQUEST_DAYS), MAX_REQUEST_DAYS)
+    # An unrecognized period string falls back to a single safe MAX_REQUEST_DAYS
+    # window rather than guessing a longer lookback it was never asked for.
+    return _PERIOD_DAYS.get(period, MAX_REQUEST_DAYS)
 
 
 def _parse_ohlcv_response(data: dict[str, Any] | None) -> pd.DataFrame | None:
@@ -139,54 +147,101 @@ class DhanHistoricalFeed:
                 interval=interval,
             )
             remarks = response.get("remarks") or {}
-            if response.get("status") == "success" or remarks.get("error_code") != "DH-904":
+            # Dhan's "remarks" field is a dict for structured errors (DH-904 rate
+            # limit) but a plain string for others (e.g. "DH-901 invalid token") --
+            # only a dict can carry an error_code to check against.
+            error_code = remarks.get("error_code") if isinstance(remarks, dict) else None
+            if response.get("status") == "success" or error_code != "DH-904":
                 return response
             if attempt < 2:
                 time.sleep(5 * (attempt + 1))
         return response
 
+    def _fetch_window(
+        self,
+        security_id: str,
+        from_date: datetime,
+        to_date: datetime,
+        dhan_interval: int,
+        symbol: str,
+        interval_label: str,
+    ) -> pd.DataFrame | None:
+        """Fetch and parse a single ≤MAX_REQUEST_DAYS window. None on failure --
+        callers treat a missing window as a gap, not a fatal error, so one bad
+        window doesn't discard data already fetched for the rest of the range."""
+        response = self._intraday_response(security_id, from_date, to_date, interval=dhan_interval)
+        if response.get("status") != "success":
+            logger.warning(
+                "DhanHQ historical fetch failed for %s (%s) window %s..%s: %s",
+                symbol,
+                interval_label,
+                from_date.date(),
+                to_date.date(),
+                response.get("remarks"),
+            )
+            return None
+        return _parse_ohlcv_response(response.get("data"))
+
     def get_historical(
         self, symbol: str, period: str = "1mo", interval: str = "1d"
     ) -> pd.DataFrame | None:
-        """Get historical OHLCV data for a symbol."""
+        """Get historical OHLCV data for a symbol.
+
+        Periods longer than MAX_REQUEST_DAYS (e.g. the strategy validator's "2y"
+        walk-forward window) are fetched as several sequential ≤MAX_REQUEST_DAYS
+        windows and concatenated -- see the module docstring.
+        """
         security_id = self._security_id(symbol)
         if security_id is None:
             logger.warning("No DhanHQ security ID for %s; cannot fetch historical data", symbol)
             return None
 
         days = _period_to_days(period)
-        to_date = datetime.now()
-        from_date = to_date - timedelta(days=days)
-        resample_rule: str | None = None
+        overall_to = datetime.now()
+        overall_from = overall_to - timedelta(days=days)
 
         try:
             if interval == "1d":
                 # DhanHQ's daily endpoint rejects valid security IDs such as
                 # HDFCBANK with DH-905. Its 60-minute endpoint succeeds for the
                 # same IDs, so build genuine daily candles from that source.
-                resample_rule = "1D"
-                response = self._intraday_response(security_id, from_date, to_date, interval=60)
+                dhan_interval = 60
+                resample_rule: str | None = "1D"
             else:
                 mapping = _INTRADAY_INTERVAL_MAP.get(interval)
                 if mapping is None:
                     raise ValueError(f"Unsupported interval for DhanHistoricalFeed: {interval}")
                 dhan_interval, resample_rule = mapping
-                response = self._intraday_response(
-                    security_id, from_date, to_date, interval=dhan_interval
-                )
 
-            if response.get("status") != "success":
-                logger.warning(
-                    "DhanHQ historical fetch failed for %s (%s): %s",
-                    symbol,
-                    interval,
-                    response.get("remarks"),
-                )
+            frames: list[pd.DataFrame] = []
+            window_start = overall_from
+            while window_start < overall_to:
+                window_end = min(window_start + timedelta(days=MAX_REQUEST_DAYS), overall_to)
+                try:
+                    frame = self._fetch_window(
+                        security_id, window_start, window_end, dhan_interval, symbol, interval
+                    )
+                except Exception:
+                    # One window's unexpected failure shouldn't discard frames
+                    # already fetched for the rest of the requested range.
+                    logger.warning(
+                        "Error fetching DhanHQ window for %s (%s) %s..%s",
+                        symbol,
+                        interval,
+                        window_start.date(),
+                        window_end.date(),
+                        exc_info=True,
+                    )
+                    frame = None
+                if frame is not None:
+                    frames.append(frame)
+                window_start = window_end
+
+            if not frames:
                 return None
 
-            df = _parse_ohlcv_response(response.get("data"))
-            if df is None:
-                return None
+            df = pd.concat(frames).sort_index()
+            df = df[~df.index.duplicated(keep="last")]
 
             if resample_rule is not None:
                 df = df.resample(resample_rule).agg(

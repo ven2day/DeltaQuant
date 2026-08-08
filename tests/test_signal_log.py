@@ -125,6 +125,34 @@ def test_from_signal_rejected_risk_extracts_first_failure_message():
     assert record.reason == "Outside trading hours"
 
 
+def test_from_signal_rejected_risk_prioritizes_strategy_admission_over_earlier_failures():
+    """The H-8 admission failure (risk_compliance.py check 14, evaluated LAST by list
+    order) must be the reported reason when present, even though an earlier check
+    like trading-hours or risk-reward also failed first in the list -- otherwise a
+    signal that could never be approved on any cycle reads as merely mistimed."""
+    signal = {
+        "symbol": "AMBER",
+        "signal_type": "BUY",
+        "entry_price": 433.31,
+        "timestamp": "2026-08-09T07:11:00",
+        "risk_result": {
+            "approved": False,
+            "failures": [
+                {"rule": "trading_hours", "message": "Outside trading hours (09:15-15:15)"},
+                {
+                    "rule": "strategy_admission",
+                    "message": "Strategy 'trend_following' has no current VALIDATED "
+                    "registry artifact for regime 'trending_up' (H-8 strategy admission gate)",
+                },
+            ],
+        },
+    }
+    record = SignalRecord.from_signal(signal, "rejected_risk")
+
+    assert "strategy admission gate" in record.reason
+    assert record.reason.startswith("Strategy 'trend_following'")
+
+
 def test_from_signal_missing_timestamp_falls_back_to_now():
     signal = {"symbol": "WIPRO", "signal_type": "BUY", "entry_price": 400.0}
     record = SignalRecord.from_signal(signal, "approved")

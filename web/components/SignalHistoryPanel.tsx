@@ -34,6 +34,16 @@ function sourceLabel(source: SignalRecord["source"]): string {
   return source === "backfill" ? "SIMULATED" : "LIVE";
 }
 
+function istDateKey(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  // en-CA formats as YYYY-MM-DD -- a stable, sortable key, computed in IST (not the
+  // viewer's local zone, and not raw UTC-string slicing) so a signal timestamped
+  // just after midnight IST buckets under today's date, matching what formatTime()
+  // already displays for it, instead of silently falling under the previous day.
+  return new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kolkata" }).format(d);
+}
+
 function distinctValues(signals: SignalRecord[], value: (signal: SignalRecord) => string): string[] {
   return [...new Set(signals.map(value).filter(Boolean))].sort();
 }
@@ -50,7 +60,7 @@ export function SignalHistoryPanel() {
 
   const filterOptions = useMemo(
     () => ({
-      days: distinctValues(signals, (signal) => signal.timestamp.slice(0, 10)),
+      days: distinctValues(signals, (signal) => istDateKey(signal.timestamp)),
       timeframes: distinctValues(signals, (signal) => signal.timeframe),
       strategies: distinctValues(signals, (signal) => signal.strategy),
       sources: distinctValues(signals, (signal) => signal.source ?? "live"),
@@ -65,7 +75,7 @@ export function SignalHistoryPanel() {
         const normalizedSource = signal.source ?? "live";
         return (
           signal.symbol.toLowerCase().includes(symbolQuery.trim().toLowerCase()) &&
-          (day === "all" || signal.timestamp.startsWith(day)) &&
+          (day === "all" || istDateKey(signal.timestamp) === day) &&
           (side === "all" || signal.side === side) &&
           (timeframe === "all" || signal.timeframe === timeframe) &&
           (strategy === "all" || signal.strategy === strategy) &&

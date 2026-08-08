@@ -56,7 +56,18 @@ class SignalRecord:
             derived_reason = validation.get("reasoning") or signal.get("rejection_reason") or ""
         elif status == "rejected_risk":
             failures = signal.get("risk_result", {}).get("failures", [])
-            derived_reason = failures[0].get("message", "") if failures else ""
+            # The strategy-admission failure (H-8, risk_compliance.py check 14) is the
+            # most fundamental one when present -- a trade on an unvalidated strategy
+            # can never be approved regardless of risk-reward, trading hours, or
+            # exposure, so it should be the reported reason even when an earlier
+            # check (evaluated first purely by list order, not severity) also failed.
+            # Otherwise a signal that was never admittable at all reads as merely
+            # "outside trading hours," which looks fixable when it isn't.
+            admission_failure = next(
+                (f for f in failures if f.get("rule") == "strategy_admission"), None
+            )
+            chosen = admission_failure or (failures[0] if failures else None)
+            derived_reason = chosen.get("message", "") if chosen else ""
 
         return cls(
             timestamp=signal.get("timestamp") or datetime.now().isoformat(),

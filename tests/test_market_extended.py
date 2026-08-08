@@ -82,12 +82,38 @@ async def test_manager_start_dhan(mock_settings):
 
 
 @pytest.mark.asyncio
-async def test_manager_uses_rest_quotes_when_market_is_closed(mock_settings):
+async def test_manager_falls_back_to_simulated_when_market_is_closed(mock_settings):
+    # Real quotes are only meaningful while NSE is actually open -- outside market
+    # hours the live-quote pipeline runs on simulated data instead (a separate
+    # concern from historical charts/backtests, which stay real always). See
+    # test_manager_uses_rest_quotes_when_market_is_open for the open-market case.
     mock_settings.return_value.market_data_source = "dhan"
     mock_settings.return_value.enable_dhan_quotes = True
 
     with (
         patch("src.market.manager.is_market_open", return_value=False),
+        patch("src.market.manager.QuotesFeed") as mock_feed_cls,
+    ):
+        manager = MarketDataManager(symbols=["RELIANCE"])
+
+        assert await manager.start() is False
+
+    mock_feed_cls.return_value.fetch_quotes.assert_not_called()
+    assert manager.data_source == "simulated"
+    assert manager.quotes["RELIANCE"].is_live is False
+
+
+@pytest.mark.asyncio
+async def test_manager_uses_rest_quotes_when_market_is_open(mock_settings):
+    mock_settings.return_value.market_data_source = "dhan"
+    mock_settings.return_value.enable_dhan_quotes = True
+    # No WebSocket credentials -- forces the WebSocket branch (which is also
+    # gated on is_market_open()) to fall through to REST polling instead of
+    # attempting a real connection.
+    mock_settings.return_value.dhan_access_token = None
+
+    with (
+        patch("src.market.manager.is_market_open", return_value=True),
         patch("src.market.manager.QuotesFeed") as mock_feed_cls,
     ):
         quote = MagicMock(
@@ -104,10 +130,69 @@ async def test_manager_uses_rest_quotes_when_market_is_closed(mock_settings):
         mock_feed_cls.return_value.fetch_quotes.return_value = {"RELIANCE": quote}
         manager = MarketDataManager(symbols=["RELIANCE"])
 
-        assert await manager.start() is True
+        # False, not True: REST polling is pull-based, not push -- start() returning
+        # False tells the caller (run_live_trading.py) to keep calling refresh()
+        # every cycle, or quotes freeze at this first fetch for the whole session.
+        assert await manager.start() is False
 
     assert manager.data_source == "dhan_rest"
     assert manager.quotes["RELIANCE"].is_live is True
+
+
+@pytest.mark.asyncio
+async def test_manager_refresh_switches_to_simulated_when_market_closes(mock_settings):
+    """A long-running process must transition on its own as the day rolls on --
+    no restart required. See manager.py's refresh() docstring for the bug this
+    covers: REST mode used to be reported as "live" and never got refreshed."""
+    mock_settings.return_value.market_data_source = "dhan"
+    mock_settings.return_value.enable_dhan_quotes = True
+    mock_settings.return_value.dhan_access_token = None
+
+    with (
+        patch("src.market.manager.is_market_open", return_value=True),
+        patch("src.market.manager.QuotesFeed") as mock_feed_cls,
+    ):
+        quote = MagicMock(
+            symbol="RELIANCE",
+            last_price=1325.0,
+            open=1285.0,
+            high=1325.2,
+            low=1281.2,
+            close=1280.0,
+            change=45.0,
+            change_percent=3.52,
+            volume=100,
+        )
+        mock_feed_cls.return_value.fetch_quotes.return_value = {"RELIANCE": quote}
+        manager = MarketDataManager(symbols=["RELIANCE"])
+        await manager.start()
+        assert manager.data_source == "dhan_rest"
+
+    # Market closes mid-session; the next refresh() call (not another start()) must
+    # notice and switch over, since the process is never restarted for this.
+    with patch("src.market.manager.is_market_open", return_value=False):
+        manager.refresh()
+
+    assert manager.data_source == "simulated"
+    assert manager.quotes["RELIANCE"].is_live is False
+
+
+def test_manager_refresh_repolls_dhan_rest_every_call(mock_settings):
+    """The bug: REST quotes fetched once at start() and never refreshed again for
+    the rest of the session, so the staleness clock only ever grows. refresh()
+    must actually re-poll, not just no-op because data_source is already dhan_rest."""
+    mock_settings.return_value.market_data_source = "dhan"
+    mock_settings.return_value.enable_dhan_quotes = True
+
+    with patch("src.market.manager.is_market_open", return_value=True):
+        manager = MarketDataManager(symbols=["RELIANCE"])
+        manager.data_source = "dhan_rest"
+
+        with patch.object(manager, "_poll_dhan_rest_quotes", return_value=True) as mock_poll:
+            manager.refresh()
+            manager.refresh()
+
+        assert mock_poll.call_count == 2
 
 
 def test_manager_on_websocket_quote(mock_settings):
@@ -131,6 +216,60 @@ def test_manager_get_trading_candidates(mock_settings):
     candidates = manager.get_trading_candidates(min_change=5.0)
     assert len(candidates) == 1
     assert candidates[0].symbol == "A"
+
+
+# --- Real/simulated quote lineage separation (a real position's exits/P&L must
+# never be evaluated against simulated prices, or vice versa, just because the
+# active pipeline flipped) ---
+
+
+def test_manager_get_real_quotes_unaffected_by_switch_to_simulated(mock_settings):
+    manager = MarketDataManager(symbols=["RELIANCE"])
+    real_quote = MarketQuote("RELIANCE", 1330, 1330, 1330, 1330, 1330, 0, 0, 1000, True)
+    manager._last_real_quotes["RELIANCE"] = real_quote
+
+    # Simulate the pipeline switching over (e.g. market closed mid-session).
+    manager.data_source = "simulated"
+    manager.simulated_data.tick()
+    manager._load_simulated_quotes()
+
+    real = manager.get_real_quotes(["RELIANCE"])
+    assert real["RELIANCE"].last_price == 1330
+    assert real["RELIANCE"] is real_quote
+
+
+def test_manager_get_real_quotes_omits_symbol_never_polled():
+    manager = MarketDataManager(symbols=["RELIANCE"])
+    assert manager.get_real_quotes(["RELIANCE"]) == {}
+
+
+def test_manager_get_simulated_quotes_available_even_while_real_is_active(mock_settings):
+    manager = MarketDataManager(symbols=["RELIANCE"])
+    manager.data_source = "dhan_rest"  # real pipeline currently active
+    manager._last_real_quotes["RELIANCE"] = MarketQuote(
+        "RELIANCE", 1330, 1330, 1330, 1330, 1330, 0, 0, 1000, True
+    )
+
+    sim = manager.get_simulated_quotes(["RELIANCE"])
+
+    assert "RELIANCE" in sim
+    assert sim["RELIANCE"].is_live is False
+
+
+def test_manager_real_and_simulated_quotes_stay_independent(mock_settings):
+    """The core guarantee: fetching one lineage never mutates or is affected by
+    the other, regardless of which pipeline is currently marked active."""
+    manager = MarketDataManager(symbols=["RELIANCE"])
+    manager._last_real_quotes["RELIANCE"] = MarketQuote(
+        "RELIANCE", 1330, 1330, 1330, 1330, 1330, 0, 0, 1000, True
+    )
+    manager.data_source = "simulated"
+
+    before_real = manager.get_real_quotes(["RELIANCE"])["RELIANCE"].last_price
+    manager.get_simulated_quotes(["RELIANCE"])  # reading sim quotes...
+    after_real = manager.get_real_quotes(["RELIANCE"])["RELIANCE"].last_price
+
+    assert before_real == after_real == 1330
 
 
 # --- LiveMarketData Tests ---

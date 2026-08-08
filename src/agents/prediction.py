@@ -204,6 +204,18 @@ class PredictionAgent:
         # that unknown-target row is the live-inference candidate, never a training row.
         df["target"] = df["returns"].shift(-1)
 
+        # vol_change/vol_ratio divide by a rolling volume average that is legitimately
+        # zero for an illiquid symbol or a thin bar (e.g. a resampled candle with no
+        # trades) -- pandas division produces inf, not NaN, so dropna() below would
+        # silently let it through into StandardScaler().fit(), which raises "Input X
+        # contains infinity" for the whole symbol (caught upstream, but it means this
+        # symbol's real ensemble never runs -- every prediction degrades to the fixed
+        # 0.4-confidence fallback, which can never clear a >=0.55 ML-confidence gate
+        # regardless of how good the actual signal is). Treat inf the same as NaN here
+        # so the existing dropna consistently excludes just the bad rows, not the
+        # whole symbol.
+        df[FEATURE_COLS] = df[FEATURE_COLS].replace([np.inf, -np.inf], np.nan)
+
         frame = df.dropna(subset=FEATURE_COLS)
         if frame.empty:
             return None

@@ -22,7 +22,7 @@ import pandas as pd
 
 from src.market.historical_feed import HistoricalDataFeed, HistoricalFeed
 from src.market.indicators import Timeframe
-from src.utils.market_time import now_ist
+from src.utils.market_time import is_market_hours, now_ist
 
 logger = logging.getLogger(__name__)
 
@@ -434,8 +434,19 @@ class HistoryManager:
 
         Returns None if the timeframe isn't supported or no data is available yet
         (never raises — a fetch failure just falls back to whatever is already cached).
+
+        Re-checks market hours on every call (not just once at construction): with a
+        configured simulated_stream, closed-market cycles compute indicators/signals
+        off simulated data instead of a frozen real snapshot -- so the signal-
+        generation pipeline is actually exercisable for pipeline testing on a closed
+        weekend, the same way MarketDataManager already auto-switches the live quote
+        feed. Reverts to real DhanHQ data automatically once the market reopens, no
+        restart required. Chart display and already-open positions' pricing/exits are
+        unaffected -- they resolve their own lineage separately (see
+        run_live_trading.py's _get_candles and manager.py's get_real_quotes()/
+        get_simulated_quotes()), not through this method.
         """
-        if self._simulated_stream is not None:
+        if self._simulated_stream is not None and not is_market_hours():
             return self._simulated_stream.get_history(symbol, timeframe.value, bars)
 
         if timeframe == Timeframe.D1:

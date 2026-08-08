@@ -13,11 +13,10 @@ import { useState } from "react";
 import { AccountPanel } from "@/components/AccountPanel";
 import { ActivityLogPanel } from "@/components/ActivityLogPanel";
 import { AgentActivityPanel } from "@/components/AgentActivityPanel";
-import { AIDecisionPanel } from "@/components/AIDecisionPanel";
 import { Header } from "@/components/Header";
 import { KpiRow } from "@/components/KpiRow";
-import { MarketChartsPanel } from "@/components/MarketChartsPanel";
 import { OpenPositionsPanel } from "@/components/OpenPositionsPanel";
+import { PipelinePanel } from "@/components/PipelinePanel";
 import { RegimePanel } from "@/components/RegimePanel";
 import { ScalpingCandidatesPanel } from "@/components/ScalpingCandidatesPanel";
 import { SectorMoversPanel } from "@/components/SectorMoversPanel";
@@ -69,7 +68,7 @@ export default function Home() {
 
           {activeTab === "overview" && (
             <div className="space-y-4">
-              <MarketChartsPanel stats={state} />
+              <PipelinePanel stats={state} />
               <div
                 className="columns-1 gap-4 md:columns-2 lg:columns-3 [&>*]:mb-4 [&>*]:break-inside-avoid"
                 style={{ columnFill: "balance" }}
@@ -80,7 +79,6 @@ export default function Home() {
                 <RegimePanel stats={state} />
                 <AgentActivityPanel stats={state} />
                 <AccountPanel stats={state} />
-                <AIDecisionPanel stats={state} />
               </div>
             </div>
           )}

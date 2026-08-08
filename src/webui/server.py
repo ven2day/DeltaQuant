@@ -29,6 +29,7 @@ from fastapi import (
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+from src.market.stock_discovery import MIDCAP_STOCKS, NIFTY50_STOCKS
 from src.webui.auth import (
     LoginAttemptTracker,
     create_session_token,
@@ -39,6 +40,12 @@ from src.webui.auth import (
 logger = logging.getLogger(__name__)
 
 SESSION_COOKIE_NAME = "dq_session"
+
+# Symbols chartable from the Charts tab's symbol picker -- the same NIFTY50+midcap
+# universe the discovery/signal loop scans (see stock_discovery.py), not limited to
+# currently open positions. Static and small, so served straight from this list
+# rather than threaded through as a callback like get_candles/get_snapshot.
+TRADEABLE_UNIVERSE = sorted(set(NIFTY50_STOCKS) | set(MIDCAP_STOCKS))
 
 
 class ConnectionHub:
@@ -84,7 +91,7 @@ def create_app(
     get_health: Callable[[bool], Awaitable[dict[str, Any]]],
     cors_origins: list[str],
     *,
-    get_candles: Callable[[str, str, int], list[dict[str, Any]]],
+    get_candles: Callable[[str, str, int, bool], list[dict[str, Any]]],
     username: str,
     password_hash: str,
     session_secret: str,
@@ -208,11 +215,20 @@ def create_app(
         symbol: str,
         timeframe: str = "15m",
         limit: int = 500,
+        preview_simulated: bool = False,
         _subject: str = Depends(_require_session),
     ) -> list[dict[str, Any]]:
         """Historical OHLCV for the chart tab. See get_candles's implementation in
-        run_live_trading.py (backed by HistoryManager) for the candle-shape contract."""
-        return get_candles(symbol, timeframe, limit)
+        run_live_trading.py (backed by HistoryManager) for the candle-shape contract.
+        preview_simulated forces the simulated pipeline for this request regardless
+        of open positions -- an explicit, opt-in preview, never the default."""
+        return get_candles(symbol, timeframe, limit, preview_simulated)
+
+    @app.get("/api/universe")
+    def get_universe_route(_subject: str = Depends(_require_session)) -> list[str]:
+        """NSE symbols the Charts tab's symbol picker can chart -- lets a user pull up
+        any NIFTY50/midcap stock for analysis, not just symbols with an open position."""
+        return TRADEABLE_UNIVERSE
 
     @app.get("/api/health")
     async def get_health_route(
@@ -270,7 +286,7 @@ class WebUIServer:
         port: int,
         cors_origins: list[str],
         *,
-        get_candles: Callable[[str, str, int], list[dict[str, Any]]],
+        get_candles: Callable[[str, str, int, bool], list[dict[str, Any]]],
         username: str,
         password_hash: str,
         session_secret: str,

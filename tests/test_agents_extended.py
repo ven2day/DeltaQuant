@@ -58,6 +58,33 @@ async def test_analyze_sentiment(news_analyst):
 
 
 @pytest.mark.asyncio
+async def test_analyze_sentiment_handles_leading_plus_sign_on_number(news_analyst):
+    """Groq (llama-3.1-8b-instant especially) sometimes writes a positive sentiment
+    as "+1.0" -- valid everyday notation but not valid JSON (a leading '+' on a
+    number is a hard parse error). Confirmed live against the real model: this was
+    silently defaulting EVERY sentiment call to 0.0/neutral via the except-Exception
+    fallback, for the whole time news analysis has been "working." json.loads()
+    must not be the thing that ever sees this content un-sanitized."""
+    with patch("src.agents.news_analyst.create_chat_model"):
+        mock_llm = MagicMock()
+        mock_llm.invoke.return_value.content = (
+            '{"sentiment": +1.0, "reasoning": "Extremely bullish +0.5 estimate beat"}'
+        )
+        news_analyst._llm = mock_llm
+
+        # Distinct headline text from other tests in this file -- _sentiment_cache
+        # is keyed on headline content and shared across NewsAnalyst instances, so
+        # reusing "Headline 1" here would silently hit test_analyze_sentiment's
+        # cached result instead of exercising this mock at all.
+        score, reason = await news_analyst.analyze_sentiment(["Leading-plus regression headline"])
+
+        assert score == 1.0
+        # The '+' inside the quoted reasoning string must survive untouched -- only
+        # the one right after the JSON key-value colon is a parse hazard.
+        assert "+0.5" in reason
+
+
+@pytest.mark.asyncio
 async def test_get_sentiment(news_analyst):
     with (
         patch.object(news_analyst, "fetch_news") as mock_fetch,

@@ -103,6 +103,30 @@ def test_compute_feature_frame_separates_live_row_from_labeled_matrix():
     assert not any(np.allclose(row, live_feature_vector) for row in X)
 
 
+def test_compute_feature_frame_sanitizes_infinite_volume_features():
+    """A zero-volume bar (illiquid symbol, or a thin resampled candle) makes
+    vol_change/vol_ratio divide by zero -> inf, not NaN. dropna() alone doesn't
+    remove inf, so it used to reach StandardScaler().fit() and raise "Input X
+    contains infinity" for the whole symbol -- caught upstream and silently
+    degraded to a fixed 0.4-confidence fallback, which can never clear the
+    >=0.55 ML-confidence entry gate (candidate_policy.py) regardless of how
+    good the actual signal is. Only the contaminated row should be excluded,
+    the same way an ordinary NaN row already is -- not the whole fit."""
+    df = _noisy_ohlcv(150)
+    df.loc[df.index[50], "Volume"] = 0.0
+
+    agent = PredictionAgent()
+    frame = agent._compute_feature_frame(df)
+
+    assert frame is not None
+    assert np.isfinite(frame[FEATURE_COLS].to_numpy()).all()
+
+    X, y = agent._create_features(df)
+    assert X is not None
+    assert y is not None
+    assert np.isfinite(X).all()
+
+
 def _reference_last_row_features(df: pd.DataFrame) -> np.ndarray:
     """Independent re-derivation of the feature formulas, computed on the TRUE final
     row of ``df``. Deliberately duplicated here (not imported from prediction.py) so

@@ -27,7 +27,7 @@ def _make_app(**overrides):
         get_snapshot=lambda: {"type": "state", "data": {}},
         get_signals=lambda days: [],
         get_health=lambda full: _noop_health(full),
-        get_candles=lambda symbol, timeframe, limit: [],
+        get_candles=lambda symbol, timeframe, limit, preview_simulated: [],
         cors_origins=["http://localhost:3000"],
         username=TEST_USERNAME,
         password_hash=TEST_PASSWORD_HASH,
@@ -325,10 +325,11 @@ def test_candles_route_requires_authentication():
 def test_candles_route_passes_symbol_timeframe_limit_through():
     captured: dict[str, object] = {}
 
-    def get_candles(symbol: str, timeframe: str, limit: int) -> list[dict]:
+    def get_candles(symbol: str, timeframe: str, limit: int, preview_simulated: bool) -> list[dict]:
         captured["symbol"] = symbol
         captured["timeframe"] = timeframe
         captured["limit"] = limit
+        captured["preview_simulated"] = preview_simulated
         return [{"time": 1, "open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0, "volume": 0.0}]
 
     client = _logged_in_client(get_candles=get_candles)
@@ -336,14 +337,19 @@ def test_candles_route_passes_symbol_timeframe_limit_through():
     response = client.get("/api/candles?symbol=RELIANCE&timeframe=1h&limit=100")
 
     assert response.status_code == 200
-    assert captured == {"symbol": "RELIANCE", "timeframe": "1h", "limit": 100}
+    assert captured == {
+        "symbol": "RELIANCE",
+        "timeframe": "1h",
+        "limit": 100,
+        "preview_simulated": False,
+    }
     assert response.json()[0]["close"] == 1.0
 
 
 def test_candles_route_defaults_timeframe_and_limit():
     captured: dict[str, object] = {}
 
-    def get_candles(symbol: str, timeframe: str, limit: int) -> list[dict]:
+    def get_candles(symbol: str, timeframe: str, limit: int, preview_simulated: bool) -> list[dict]:
         captured["timeframe"] = timeframe
         captured["limit"] = limit
         return []
@@ -356,10 +362,45 @@ def test_candles_route_defaults_timeframe_and_limit():
 
 
 def test_candles_route_empty_result_is_valid_json_array():
-    client = _logged_in_client(get_candles=lambda symbol, timeframe, limit: [])
+    client = _logged_in_client(get_candles=lambda symbol, timeframe, limit, preview_simulated: [])
     response = client.get("/api/candles?symbol=UNKNOWN")
     assert response.status_code == 200
     assert response.json() == []
+
+
+def test_candles_route_preview_simulated_query_param_passed_through():
+    captured: dict[str, object] = {}
+
+    def get_candles(symbol: str, timeframe: str, limit: int, preview_simulated: bool) -> list[dict]:
+        captured["preview_simulated"] = preview_simulated
+        return []
+
+    client = _logged_in_client(get_candles=get_candles)
+
+    client.get("/api/candles?symbol=RELIANCE&preview_simulated=true")
+
+    assert captured["preview_simulated"] is True
+
+
+# --- /api/universe route ---
+
+
+def test_universe_route_requires_authentication():
+    client = _make_app()
+    response = client.get("/api/universe")
+    assert response.status_code == 401
+
+
+def test_universe_route_returns_nse_symbols_sorted_and_deduped():
+    client = _logged_in_client()
+
+    response = client.get("/api/universe")
+
+    assert response.status_code == 200
+    symbols = response.json()
+    assert symbols == sorted(set(symbols))
+    assert "RELIANCE" in symbols
+    assert "TCS" in symbols
 
 
 # --- WebSocket auth ---
@@ -396,7 +437,7 @@ async def test_serve_swallows_systemexit_from_port_conflict():
         get_snapshot=lambda: {"type": "state", "data": {}},
         get_signals=lambda days: [],
         get_health=lambda full: _noop_health(full),
-        get_candles=lambda symbol, timeframe, limit: [],
+        get_candles=lambda symbol, timeframe, limit, preview_simulated: [],
         host="127.0.0.1",
         port=0,
         cors_origins=["http://localhost:3000"],
@@ -414,7 +455,7 @@ async def test_serve_swallows_unexpected_exception():
         get_snapshot=lambda: {"type": "state", "data": {}},
         get_signals=lambda days: [],
         get_health=lambda full: _noop_health(full),
-        get_candles=lambda symbol, timeframe, limit: [],
+        get_candles=lambda symbol, timeframe, limit, preview_simulated: [],
         host="127.0.0.1",
         port=0,
         cors_origins=["http://localhost:3000"],
