@@ -355,7 +355,9 @@ def _build_regime_context_enriched(
     if prediction_signals:
         enrichment_parts.append("\n### ML Prediction Consensus\n")
         for pred in prediction_signals[:5]:
-            if isinstance(pred, dict):
+            # An abstained prediction (H-7) has no usable direction -- don't inject a
+            # "flat, 0% confidence" line into the LLM context, just omit it.
+            if isinstance(pred, dict) and not pred.get("abstained"):
                 enrichment_parts.append(
                     f"- {pred.get('symbol', 'N/A')}: {pred.get('direction', 'N/A')} "
                     f"(confidence: {pred.get('confidence', 0):.0%})"

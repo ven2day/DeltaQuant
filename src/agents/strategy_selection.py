@@ -17,6 +17,7 @@ from typing import Any
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_groq import ChatGroq
 
+from src.backtesting.strategy_registry import StrategyRegistry
 from src.config import get_settings
 from src.finops import record_llm_response
 from src.utils.circuit_breaker import CircuitBreakerOpenError, get_groq_circuit_breaker
@@ -25,6 +26,31 @@ from src.utils.rate_limiter import get_groq_limiter
 from .state import TradingState
 
 logger = logging.getLogger(__name__)
+
+
+def _gate_active_strategies(strategies: list[str], regime: str) -> list[str]:
+    """Strip any strategy without a current, non-expired VALIDATED registry artifact
+    (H-8, DeltaQuant-Quant-Risk-Review.md).
+
+    Fail closed: an unknown/unvalidated/expired strategy is silently *not* removed with
+    just a warning -- it never reaches ``active_strategies`` at all, so it cannot
+    survive downstream into a validated signal or an approved trade. Every strip is
+    still logged loudly (not swallowed) so an operator can see why nothing traded.
+    """
+    settings = get_settings()
+    registry_dir = getattr(settings, "strategy_registry_dir", "data/strategy_registry")
+    registry = StrategyRegistry(str(registry_dir))
+    admitted, stripped = registry.filter_admitted(strategies, regime=regime)
+    if stripped:
+        logger.warning(
+            "Strategy admission gate (H-8): stripped %s from active strategies for regime "
+            "'%s' -- no current VALIDATED artifact in %s. Run "
+            "`uv run python scripts/validate_strategy.py` to (re)validate.",
+            stripped,
+            regime,
+            registry_dir,
+        )
+    return admitted
 
 
 STRATEGY_SYSTEM_PROMPT = """You are a Strategy Selection Agent for an automated trading system.
@@ -134,10 +160,11 @@ def strategy_selection_node(state: TradingState) -> dict[str, Any]:
         record_llm_response("strategy_selection", response, model=settings.groq_model_primary)
         result = _parse_strategy_response(response.content)
 
-        logger.info(f"Selected strategies: {result['active_strategies']}")
+        admitted = _gate_active_strategies(result["active_strategies"], regime)
+        logger.info(f"Selected strategies: {result['active_strategies']} -> admitted: {admitted}")
 
         return {
-            "active_strategies": result["active_strategies"],
+            "active_strategies": admitted,
             "strategy_reasoning": result["reasoning"],
             "messages": [response],
         }
@@ -168,11 +195,12 @@ def _fallback_strategy_selection(
     }
 
     strategies = regime_strategies.get(regime, ["trend_following"])
+    admitted = _gate_active_strategies(strategies, regime)
 
-    logger.info(f"Using fallback strategies for {regime}: {strategies}")
+    logger.info(f"Using fallback strategies for {regime}: {strategies} -> admitted: {admitted}")
 
     return {
-        "active_strategies": strategies,
+        "active_strategies": admitted,
         "strategy_reasoning": f"Fallback selection for {regime} regime. Error: {error_msg}",
         "errors": state.get("errors", []) + [f"Strategy Agent fallback: {error_msg}"],
     }

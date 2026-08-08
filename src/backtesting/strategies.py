@@ -12,7 +12,7 @@ Strategies:
 import pandas as pd
 
 from src.market.indicators import Timeframe, calculate_indicators
-from src.market.signals import SignalEngine, SignalType
+from src.market.signals import SignalEngine, SignalType, StrategyType
 
 
 class Strategy:
@@ -46,9 +46,24 @@ class RealSignalStrategy(Strategy):
 
     name = "RealSignal"
 
-    def __init__(self, symbol: str = "UNKNOWN", min_bars: int = 50):
+    def __init__(
+        self,
+        symbol: str = "UNKNOWN",
+        min_bars: int = 50,
+        strategy_types: list[StrategyType] | None = None,
+    ):
+        """
+        Args:
+            symbol: Symbol being backtested.
+            min_bars: Warm-up bars before signals are considered.
+            strategy_types: Restrict signal generation to these named strategies (all
+                four if None). Used by scripts/validate_strategy.py to walk-forward
+                validate ONE named strategy at a time for the H-8 admission registry,
+                instead of only the mixed "best signal of any strategy" default.
+        """
         self.symbol = symbol
         self.min_bars = min_bars
+        self.strategy_types = strategy_types
         self._engine = SignalEngine()
 
     def on_bar(self, row: pd.Series, history: pd.DataFrame) -> str | None:
@@ -58,7 +73,9 @@ class RealSignalStrategy(Strategy):
         df = history.rename(columns=str.lower)
         try:
             indicators = calculate_indicators(df, self.symbol, timeframe=Timeframe.D1)
-            signals = self._engine.generate_signals(indicators)
+            signals = self._engine.generate_signals(
+                indicators, active_strategies=self.strategy_types
+            )
         except Exception:
             return None
         if not signals:
