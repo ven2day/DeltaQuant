@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { checkAuthenticated } from "./api";
 import type { StateMessage, TradingStats } from "./types";
 
 const RECONNECT_DELAYS_MS = [2000, 5000, 10000];
@@ -62,18 +63,29 @@ export function useTradingState(): {
       const scheduleReconnect = (event: CloseEvent) => {
         if (cancelled) return;
         setConnected(false);
-        // 1008 = policy violation: the backend's /ws handler sends this specifically
-        // for a missing/expired/invalid session cookie (src/webui/server.py). Retrying
-        // with the same stale cookie would just loop forever — send the user to log in
-        // again instead.
-        if (event.code === 1008) {
-          window.location.assign("/login");
-          return;
-        }
-        const delay =
-          RECONNECT_DELAYS_MS[Math.min(attemptRef.current, RECONNECT_DELAYS_MS.length - 1)];
-        attemptRef.current += 1;
-        timerRef.current = setTimeout(connect, delay);
+
+        // The backend's /ws handler rejects a missing/expired/invalid session
+        // cookie by closing with code 1008 BEFORE completing the WebSocket
+        // handshake (src/webui/server.py). Browsers do not expose that code (or
+        // the underlying HTTP 403) for a handshake that never completed — they
+        // report a generic 1006 instead, so checking `event.code === 1008` here
+        // would never actually match in a real browser. Ask the backend
+        // directly via /api/session instead, which is unambiguous either way:
+        // an ordinary network blip (server restart, brief connectivity loss)
+        // still reports the session as valid and should just retry the socket,
+        // while a genuinely dead/expired session sends the user back to log in
+        // instead of retrying forever with a cookie the server will never accept.
+        checkAuthenticated().then((authenticated) => {
+          if (cancelled) return;
+          if (!authenticated) {
+            window.location.assign("/login");
+            return;
+          }
+          const delay =
+            RECONNECT_DELAYS_MS[Math.min(attemptRef.current, RECONNECT_DELAYS_MS.length - 1)];
+          attemptRef.current += 1;
+          timerRef.current = setTimeout(connect, delay);
+        });
       };
 
       socket.onclose = scheduleReconnect;

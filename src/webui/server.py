@@ -133,6 +133,7 @@ def create_app(
         # lockout entirely.
         client_ip = request.client.host if request.client else "unknown"
         if attempts.is_locked(client_ip):
+            logger.warning("Login blocked (locked out): client_ip=%s", client_ip)
             raise HTTPException(
                 status_code=429,
                 detail=(
@@ -148,8 +149,15 @@ def create_app(
         password_ok = verify_password(payload.password, password_hash)
         if not (username_ok and password_ok):
             attempts.record_failure(client_ip)
+            logger.warning(
+                "Login failed: client_ip=%s username_ok=%s password_ok=%s",
+                client_ip,
+                username_ok,
+                password_ok,
+            )
             raise HTTPException(status_code=401, detail="Invalid username or password")
 
+        logger.info("Login succeeded: client_ip=%s", client_ip)
         attempts.reset(client_ip)
         token = create_session_token(username, secret=session_secret, ttl_minutes=session_ttl_minutes)
         response.set_cookie(

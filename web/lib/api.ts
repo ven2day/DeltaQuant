@@ -5,7 +5,10 @@
 // env var to keep in sync.
 export function apiBaseUrl(): string {
   const wsUrl = process.env.NEXT_PUBLIC_WS_URL ?? "ws://127.0.0.1:8000/ws";
-  return wsUrl.replace(/^ws/, "http").replace(/\/ws$/, "");
+  // wss:// -> https://, ws:// -> http://. A naive `replace(/^ws/, "http")` breaks
+  // on wss:// (matches just the "ws" prefix of "wss", producing "httpss://") —
+  // match the full scheme including the optional trailing "s" instead.
+  return wsUrl.replace(/^ws(s?):\/\//, "http$1://").replace(/\/ws$/, "");
 }
 
 // `credentials: "include"` is required on every request: the backend's session
