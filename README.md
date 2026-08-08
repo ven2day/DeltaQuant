@@ -1,14 +1,43 @@
 # DeltaQuant
 
-DeltaQuant is a long-only NSE trading workflow that uses real DhanHQ market
-data and local paper execution. It generates multi-timeframe strategy signals
-for the full configured universe, ranks them locally, then sends only a small,
-diversified shortlist to the LangGraph agent team for review.
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](pyproject.toml)
+[![Node](https://img.shields.io/badge/node-18%2B-339933.svg)](web/package.json)
+[![Trading Mode](https://img.shields.io/badge/default_mode-paper_only-brightgreen.svg)](#safety-defaults)
 
-It is designed for paper validation first. It is not investment advice and it
-does not promise returns.
+**An agentic, paper-trading research workflow for the Indian NSE market.** A
+LangGraph pipeline of LLM-backed agents (Groq) classifies market regime,
+selects strategies, validates signals, and hands final approval to a
+deterministic risk engine — running against real DhanHQ market data with
+local, simulated execution.
 
-## What Runs
+DeltaQuant is built for research and paper validation. It is **not**
+investment advice, it does not promise returns, and live order routing is
+disabled by default (see [Safety Defaults](#safety-defaults)).
+
+---
+
+## Table of Contents
+
+- [How It Works](#how-it-works)
+- [Safety Defaults](#safety-defaults)
+- [Prerequisites](#prerequisites)
+- [Quick Start](#quick-start)
+- [Universe and Review Controls](#universe-and-review-controls)
+- [Agent Team](#agent-team)
+- [Quantitative Signal Discovery](#quantitative-signal-discovery)
+- [Data and Execution Model](#data-and-execution-model)
+- [Dashboard and Audit Trail](#dashboard-and-audit-trail)
+- [Project Structure](#project-structure)
+- [Configuration Notes](#configuration-notes)
+- [Testing and Quality](#testing-and-quality)
+- [Documentation](#documentation)
+- [Security](#security)
+- [License](#license)
+
+---
+
+## How It Works
 
 ![DeltaQuant agentic investing system](docs/assets/deltaquant-agentic-system.svg)
 
@@ -23,26 +52,30 @@ flowchart LR
     H --> I[Journal, dashboard, and learning loop]
 ```
 
-The stages have different responsibilities:
+Each stage has a distinct responsibility:
 
-1. At startup, the full `STOCK_UNIVERSE_CSV_PATH` universe (or the built-in
-   NIFTY50+midcap list if unset) is loaded as-is — no pre-filtering. Dhan
-   security IDs are resolved and historical OHLCV is pre-fetched for every
-   symbol in it.
-2. Every cycle, each available symbol receives deterministic strategy analysis
-   on `SIGNAL_TIMEFRAMES`. Forming candles are excluded by default.
-3. The local sklearn direction model scores only symbol/timeframe pairs where a
-   strategy fired. Technical confidence, sample-smoothed closed-trade outcomes,
-   and risk/reward are combined into estimated probability and expected R.
-4. Ranked symbols are capped per sector and truncated to `MAX_ACTIVE_STOCKS`.
-   Only the first `LLM_REVIEW_MAX_SYMBOLS` receive news and agent review.
-5. A failed or fallback LLM review is analysis-only. It cannot create a paper
-   or broker position.
-6. The risk engine and the long-only paper engine remain the final authority.
+1. **Universe load.** At startup, the full `STOCK_UNIVERSE_CSV_PATH` universe
+   (or the built-in NIFTY50+midcap list if unset) is loaded as-is — no
+   pre-filtering. Dhan security IDs are resolved and historical OHLCV is
+   pre-fetched for every symbol.
+2. **Strategy scan.** Every cycle, each available symbol receives
+   deterministic strategy analysis on `SIGNAL_TIMEFRAMES`. Forming candles are
+   excluded by default to avoid intra-bar repainting.
+3. **Local ranking.** A local scikit-learn direction model scores only
+   symbol/timeframe pairs where a strategy fired. Technical confidence,
+   sample-smoothed closed-trade outcomes, and risk/reward combine into an
+   estimated win probability and expected R.
+4. **Shortlisting.** Ranked symbols are capped per sector and truncated to
+   `MAX_ACTIVE_STOCKS`. Only the top `LLM_REVIEW_MAX_SYMBOLS` receive news
+   enrichment and LLM agent review.
+5. **Agent review.** A failed or degraded LLM review is analysis-only — it can
+   never create a paper or broker position (fail-closed).
+6. **Final authority.** The deterministic risk engine and the long-only paper
+   engine have the last word regardless of what the agents recommend.
 
 ## Safety Defaults
 
-The checked-in example configuration is deliberately conservative:
+The checked-in `.env.example` is deliberately conservative:
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
@@ -56,17 +89,36 @@ The checked-in example configuration is deliberately conservative:
 | Agent fallback | fail closed | Degraded LLM review cannot open a new position. |
 
 `local_paper` uses real Dhan prices but keeps the wallet, fills, fees, and
-positions in the local durable paper ledger. It does not call the broker order
-endpoint.
+positions in a local, durable paper ledger. It never calls the broker order
+endpoint. Enabling `live` execution requires clearing three independent gates
+(`trading_mode=live`, `allow_live_orders=true`, and valid Dhan credentials) —
+see [Configuration Notes](#configuration-notes).
+
+## Prerequisites
+
+| Requirement | Version | Used for |
+| --- | --- | --- |
+| [Python](https://www.python.org/) | 3.11+ | Backend agent pipeline and trading loop |
+| [uv](https://github.com/astral-sh/uv) | latest | Python dependency management |
+| [Node.js](https://nodejs.org/) | 18+ | Web dashboard (optional) |
+| [PostgreSQL](https://www.postgresql.org/) | any recent | Agent memory, signal history, paper ledger |
+| [DhanHQ](https://dhan.co/) account | — | Live market data (quotes + historical OHLCV) |
+| [Groq](https://groq.com/) API key | — | LLM agent reasoning (free tier is sufficient) |
+
+Without a Dhan account, the live loop automatically falls back to simulated
+data instead of failing — useful for evaluating the system end to end before
+wiring up a broker.
 
 ## Quick Start
 
 ### 1. Install dependencies
 
-```powershell
+```bash
 uv sync --extra dev --extra web
-Copy-Item .env.example .env
+cp .env.example .env
 ```
+
+> Windows (PowerShell): `Copy-Item .env.example .env`
 
 Configure the required values in `.env`:
 
@@ -87,30 +139,36 @@ ENABLE_DHAN_HISTORICAL_DATA=true
 ENABLE_DHAN_QUOTES=true
 ```
 
-### 2. Start the paper workflow
+### 2. Validate configuration
 
-```powershell
+```bash
+uv run python scripts/check_config.py
+```
+
+### 3. Start the paper trading workflow
+
+```bash
 uv run --extra web python scripts/run_live_trading.py
 ```
 
-The backend dashboard is served at `http://127.0.0.1:8010` when
-`ENABLE_WEB_UI=true`.
+The backend dashboard API is served at `http://127.0.0.1:8010` once
+`ENABLE_WEB_UI=true` is set in `.env`.
 
-### 3. Start the optional web frontend
+### 4. Start the web dashboard (optional)
 
-```powershell
-Set-Location web
+```bash
+cd web
 npm install
+cp .env.local.example .env.local   # set NEXT_PUBLIC_WS_URL if the backend isn't local
 npm run dev
 ```
 
-Open `http://localhost:3000`. The frontend expects the backend WebSocket URL
-from `web/.env.local`.
+Open `http://localhost:3000`.
 
-## Universe And Review Controls
+## Universe and Review Controls
 
 The full configured CSV receives local strategy analysis. The controls below
-limit the ranked shortlist and LLM workload, not signal-generation coverage.
+limit the ranked shortlist and LLM workload — not signal-generation coverage.
 
 | Setting | Purpose | Typical value |
 | --- | --- | --- |
@@ -122,10 +180,11 @@ limit the ranked shortlist and LLM workload, not signal-generation coverage.
 | `TRADING_CYCLE_SECONDS` | Interval between full agent review cycles. | `120` |
 | `SIGNAL_TIMEFRAMES` | Comma-separated Dhan timeframes. | `15m,30m,1h,4h` |
 
-Sending hundreds of raw quote records to an LLM is slow and expensive. Local
-strategies and ML cover the universe; Groq reviews only the strongest evidence.
-Set `LLM_REVIEW_ALL_SIGNALS=true` to send every generated signal instead; the
-daily FinOps budget still gates new LLM cycles.
+Sending hundreds of raw quote records to an LLM on every cycle is slow and
+expensive. Local strategies and ML cover the full universe; Groq reviews only
+the strongest evidence. Set `LLM_REVIEW_ALL_SIGNALS=true` to send every
+generated signal instead — the daily FinOps budget still gates new LLM cycles
+regardless.
 
 ## Agent Team
 
@@ -137,97 +196,155 @@ daily FinOps budget still gates new LLM cycles.
 | Market Regime | Classifies the reviewed market context. | Groq LLM |
 | Strategy Selection | Selects compatible strategies. | Groq LLM |
 | Signal Validation | Filters raw technical signals. | Groq LLM |
-| Risk And Compliance | Enforces position, loss, exposure, and time rules. | Deterministic |
+| Risk and Compliance | Enforces position, loss, exposure, and time rules. | Deterministic |
 
-The agents review candidates. They do not replace data quality, portfolio
-construction, or risk controls.
+The agents review candidates; they do not replace data quality, portfolio
+construction, or risk controls. `risk_compliance` is a rules engine, not an
+LLM, and has final say on every entry.
 
 ## Quantitative Signal Discovery
 
-The NVIDIA quantitative-signal-discovery workflow is adapted to the existing
-Groq, Dhan, FinOps, and paper-trading stack. With
-`SIGNAL_DISCOVERY_AUTO_RUN=true`, it researches the full configured universe on
-`15m`, `30m`, `1h`, and `4h` automatically every 24 hours. The schedule is
-separate from the 120-second trading cycle so formula generation cannot delay
-quotes, exits, or deterministic strategy scanning. An on-demand run is also available:
+An NVIDIA-style quantitative-signal-discovery workflow (Signal / Code / Eval
+agents) is adapted to the existing Groq, Dhan, FinOps, and paper-trading
+stack. With `SIGNAL_DISCOVERY_AUTO_RUN=true`, it researches the full
+configured universe on `15m`, `30m`, `1h`, and `4h` automatically every 24
+hours. This schedule is separate from the 120-second trading cycle, so
+formula generation never delays quotes, exits, or deterministic strategy
+scanning. An on-demand run is also available:
 
-```powershell
+```bash
 uv run python scripts/discover_signals.py "volume-adjusted momentum"
 ```
 
-The Signal Agent proposes allowlisted formulas. A deterministic local Code
-Agent compiles formulas as restricted AST (never `exec`), and the Eval Agent
-calculates cross-sectional Spearman Rank-IC against forward returns. Failed
-signals receive Groq optimization feedback and retry. Only candidates meeting
-both `abs(IC) >= SIGNAL_DISCOVERY_IC_THRESHOLD` and
-`p <= SIGNAL_DISCOVERY_P_VALUE_THRESHOLD` are stored under
-`data/discovered_signals/<timeframe>/`.
+The **Signal Agent** proposes formulas from a fixed operator allowlist. A
+deterministic local **Code Agent** compiles them as a restricted AST walk
+(never `exec`/`eval`), and the **Eval Agent** computes cross-sectional
+Spearman Rank-IC against forward returns. Failed formulas receive Groq
+optimization feedback and retry. Only candidates clearing both
+`abs(IC) >= SIGNAL_DISCOVERY_IC_THRESHOLD` and a **Bonferroni-corrected**
+p-value bar are persisted under `data/discovered_signals/<timeframe>/`.
 
-When `SIGNAL_DISCOVERY_ENABLED=true`, accepted artifacts are quality-gated again
-at load, evaluated on the live cross-sectional Dhan panel, sign-inverted when IC
-is negative, standardized, and applied as a bounded probability tilt only to a
-strategy signal on the matching timeframe. Accepted formulas are scored during
-every 120-second strategy cycle; the slower formula-invention and Rank-IC research
-runs in a background task. Discovery never submits an order.
+When `SIGNAL_DISCOVERY_ENABLED=true`, accepted artifacts are re-validated at
+load, evaluated on the live cross-sectional Dhan panel, sign-inverted when IC
+is negative, standardized, and applied as a small, bounded probability tilt to
+a strategy signal on the matching timeframe — never to position sizing or risk
+gates. Discovery never submits an order.
 
-## Data And Execution Model
+## Data and Execution Model
 
-- **Quotes:** `MarketDataManager` tracks the full configured universe directly
+- **Quotes.** `MarketDataManager` tracks the full configured universe directly
   from startup (no pre-narrowing scan) — live via WebSocket where subscription
-  coverage exists, REST polling otherwise. `MAX_ACTIVE_STOCKS` only bounds
-  the post-ML ranked shortlist, not what gets quoted or strategy-scanned.
-- **History:** `DhanHistoricalFeed` obtains Dhan candles. Daily OHLCV is
-  constructed from Dhan 60-minute data because the daily endpoint may reject
-  otherwise valid requests. History is cached locally for reuse.
-- **No fabricated data:** Symbols without sufficient real OHLCV are excluded
-  from review for that cycle.
-- **Paper fills:** `LocalPaperEngine` applies configurable slippage and
-  NSE-style charges, persists the wallet and positions, and keeps a complete
-  order ledger.
-- **Exits:** `ExitManager` handles stop, target, trailing, partial, time, and
+  coverage exists, REST polling otherwise. `MAX_ACTIVE_STOCKS` only bounds the
+  post-ML ranked shortlist, not what gets quoted or strategy-scanned.
+- **History.** `DhanHistoricalFeed` obtains Dhan candles, paginated past
+  Dhan's 90-day API window. Daily OHLCV is constructed from Dhan 60-minute
+  data because the daily endpoint can reject otherwise-valid requests. History
+  is cached locally for reuse.
+- **No fabricated data.** Symbols without sufficient real OHLCV are excluded
+  from review for that cycle; a real/simulated data source is never silently
+  substituted mid-position (see `entry_data_source` lineage tracking).
+- **Paper fills.** `LocalPaperEngine` applies configurable slippage and
+  NSE-style charges, persists the wallet and positions to PostgreSQL, and
+  keeps a complete order ledger.
+- **Exits.** `ExitManager` handles stop, target, trailing, partial, time, and
   regime exits for existing positions.
 
-## Dashboard And Audit Trail
+## Dashboard and Audit Trail
 
-The backend exposes state, signal history, paper trades, and health data. The
-web UI shows open positions, closed paper trades, market status, sector movers,
-scalping candidates, and signal outcomes.
+The backend exposes state, signal history, paper trades, and health data over
+a WebSocket + REST API. The web UI shows open positions, closed paper trades,
+market status, sector movers, scalping candidates, and a full signal-pipeline
+audit trail — including *why* a candidate was rejected at each stage.
 
-The following records are durable:
+The following records are durable in PostgreSQL:
 
 - Paper orders and reconstructed closed-trade history
 - Trade journal entries and net realized P&L
 - Signal history with validation and risk-rejection reasons
 - Daily risk state, performance statistics, and learning-loop outcomes
 
-A reduced cash balance is not by itself a loss: it can represent capital held
-in an open paper position. Use total portfolio value and the trade history
+A reduced cash balance is not by itself a loss — it can represent capital held
+in an open paper position. Use total portfolio value and trade history
 together when reconciling the account.
+
+## Project Structure
+
+```
+DeltaQuant/
+├── scripts/                 # Entry points (run_live_trading.py, check_config.py, ...)
+├── src/
+│   ├── agents/               # LangGraph nodes: regime, strategy, validation, risk
+│   ├── api/                  # Health checks
+│   ├── backtesting/          # Backtest engine + walk-forward validation
+│   ├── config/                # Centralized pydantic-settings configuration
+│   ├── dashboard/             # Terminal (rich) dashboard
+│   ├── db/                    # SQLAlchemy models and migrations
+│   ├── execution/              # Paper engine, live broker adapter, exit manager
+│   ├── finops/                 # LLM cost tracking and budget alerts
+│   ├── market/                 # Quotes, history, indicators, signal ranking
+│   ├── memory/                 # Learn-from-losses feedback loop
+│   ├── notifications/          # Telegram alerts
+│   ├── profit/                  # Risk-bounded profit-goal planner
+│   ├── signal_discovery/        # Quantitative signal-discovery workflow
+│   ├── utils/                    # Rate limiter, circuit breaker, market time (IST)
+│   └── webui/                    # FastAPI backend for the web dashboard
+├── web/                      # Next.js dashboard frontend
+├── tests/                    # pytest suite
+├── docs/                     # Architecture and design documentation
+└── .env.example              # Full, documented configuration reference
+```
 
 ## Configuration Notes
 
-- Langfuse tracing is optional. Set `LANGFUSE_TRACING_ENABLED=true` only after
-  configuring both Langfuse API keys; it does not disable Dhan, Groq, or paper
-  execution.
-- Groq rate limits or malformed agent responses are visible in logs. The system
-  retains analysis but blocks new entries until a healthy review completes.
-- `dhan_paper` and `live` modes are separate from `local_paper`. Do not enable
-  live orders without independently validating the full workflow.
-- Signal discovery is an experimental research process, not evidence of future
-  profitability. Paper validation remains required after Rank-IC acceptance.
+- Langfuse tracing is optional observability only. Set
+  `LANGFUSE_TRACING_ENABLED=true` after configuring both Langfuse API keys —
+  it never gates Dhan, Groq, or paper execution, and it never affects trading
+  decisions.
+- Groq rate limits or malformed agent responses are visible in logs. The
+  system retains prior analysis but blocks new entries until a healthy review
+  completes.
+- `dhan_paper` and `live` execution modes are separate from `local_paper`.
+  `dhan_paper` always resolves to a simulated fill (no verified Dhan sandbox
+  exists) and can never reach a live route. Do not enable `live` orders
+  without independently validating the full workflow in paper mode first.
+- Signal discovery is an experimental research process, not evidence of
+  future profitability. Paper validation remains required after Rank-IC
+  acceptance.
 
-## Testing
+## Testing and Quality
 
-```powershell
+```bash
 uv sync --extra dev --extra web
-uv run pytest -q
-uv run ruff check .
+
+uv run --extra dev pytest -q                # full test suite
+uv run --extra dev pytest --cov=src         # with coverage
+uv run --extra dev ruff check .             # lint
+uv run --extra dev ruff format .            # format
+uv run --extra dev mypy src                 # type-check (strict mode)
 ```
 
 ## Documentation
 
-- [Introduction](docs/1_Introduction.md)
-- [High-Level Design](docs/2_High_Level_Design.md)
-- [Low-Level Design](docs/3_Low_Level_Design.md)
-- [System Design Decisions](docs/4_System_Design.md)
-- [Component Reference](docs/5_Components.md)
+| Document | Contents |
+| --- | --- |
+| [Introduction](docs/1_Introduction.md) | Project goals and scope |
+| [High-Level Design](docs/2_High_Level_Design.md) | System architecture overview |
+| [Low-Level Design](docs/3_Low_Level_Design.md) | Module- and function-level detail |
+| [System Design Decisions](docs/4_System_Design.md) | Key trade-offs and rationale |
+| [Component Reference](docs/5_Components.md) | Per-component reference |
+
+## Security
+
+- Never commit `.env` — it is gitignored, and `.env.example` is the tracked
+  reference for required variables.
+- All secrets (`GROQ_API_KEY`, `DHAN_ACCESS_TOKEN`, `DATABASE_URL`, etc.) are
+  loaded via `pydantic-settings` `SecretStr` fields, never logged in plain
+  text.
+- Report a vulnerability by opening a private security advisory on this
+  repository rather than a public issue.
+
+## License
+
+Released under the [MIT License](LICENSE). This project is educational and
+for paper-trading research only — it is not investment advice, and past
+strategy performance (paper or backtested) does not guarantee future results.
