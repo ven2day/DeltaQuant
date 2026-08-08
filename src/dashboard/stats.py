@@ -262,7 +262,7 @@ class TradingDashboard:
                 del self.stats.open_positions[i]
                 break
 
-    def sync_positions(self, positions) -> None:
+    def sync_positions(self, positions, managed_positions=()) -> None:
         """Rebuild the display list from the execution engine's actual positions.
 
         This is the robust alternative to add_position()/remove_position(): those
@@ -272,7 +272,18 @@ class TradingDashboard:
         being real and holding real capital). Calling this every dashboard
         refresh instead makes the display a mirror of ground truth, not a
         separately-maintained shadow copy that can drift from it.
+
+        ``positions`` are the paper engine's own ``Position`` objects (source of
+        truth for qty/entry/current/pnl). ``managed_positions`` are the exit
+        manager's ``ManagedPosition`` objects, joined in by position_id purely to
+        surface ``timeframe`` (which the paper engine's Position doesn't carry —
+        threading it through place_order()/ExecutionService as well wasn't
+        justified just for a display field) alongside entry_time/strategy, which
+        both objects already have.
         """
+        timeframe_by_id = {
+            str(mp.position_id): mp.timeframe for mp in managed_positions if mp.timeframe
+        }
         synced = []
         for p in positions:
             item = {
@@ -283,6 +294,7 @@ class TradingDashboard:
                 "pnl": p.unrealized_pnl,
             }
             if hasattr(p, "position_id"):
+                # Position.entry_time is already an ISO string (see place_order()).
                 item.update(
                     {
                         "position_id": p.position_id,
@@ -290,6 +302,9 @@ class TradingDashboard:
                         "target": p.target_price,
                         "stop": p.stop_loss,
                         "status": "OPEN",
+                        "entry_time": p.entry_time,
+                        "strategy": p.strategy,
+                        "timeframe": timeframe_by_id.get(str(p.position_id), ""),
                     }
                 )
             synced.append(item)

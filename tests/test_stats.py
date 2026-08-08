@@ -158,6 +158,59 @@ def test_dashboard_sync_positions_empty_clears_display(dashboard):
     assert dashboard.stats.open_positions == []
 
 
+class _FakeManagedPosition:
+    """Just enough shape of exit_manager.ManagedPosition for the sync_positions join."""
+
+    def __init__(self, position_id, timeframe):
+        self.position_id = position_id
+        self.timeframe = timeframe
+
+
+class _FakePaperPosition(_FakePosition):
+    """Adds the fields only present on paper_engine.Position (gated by hasattr(p,
+    "position_id") in sync_positions), matching the real object's shape."""
+
+    def __init__(
+        self, symbol, side, quantity, entry_price, position_id, entry_time, strategy, **kwargs
+    ):
+        super().__init__(symbol, side, quantity, entry_price, **kwargs)
+        self.position_id = position_id
+        self.entry_time = entry_time
+        self.strategy = strategy
+        self.current_price = entry_price
+        self.target_price = entry_price * 1.02
+        self.stop_loss = entry_price * 0.98
+
+
+def test_dashboard_sync_positions_joins_timeframe_from_managed_positions(dashboard):
+    # Position.entry_time is already an ISO string (see paper_engine.place_order());
+    # timeframe lives only on the exit manager's ManagedPosition and must be joined
+    # in by position_id rather than expected directly on the paper engine's Position.
+    positions = [
+        _FakePaperPosition(
+            "TCS", "BUY", 10, 4000.0, position_id="POS-1", entry_time="2026-08-08T09:15:00", strategy="momentum"
+        )
+    ]
+    managed = [_FakeManagedPosition(position_id="POS-1", timeframe="15m")]
+
+    dashboard.sync_positions(positions, managed)
+
+    assert dashboard.stats.open_positions[0]["entry_time"] == "2026-08-08T09:15:00"
+    assert dashboard.stats.open_positions[0]["strategy"] == "momentum"
+    assert dashboard.stats.open_positions[0]["timeframe"] == "15m"
+
+
+def test_dashboard_sync_positions_timeframe_blank_without_managed_match(dashboard):
+    positions = [
+        _FakePaperPosition(
+            "TCS", "BUY", 10, 4000.0, position_id="POS-1", entry_time="2026-08-08T09:15:00", strategy="momentum"
+        )
+    ]
+    # No managed_positions passed at all -- must not raise, timeframe defaults blank.
+    dashboard.sync_positions(positions)
+    assert dashboard.stats.open_positions[0]["timeframe"] == ""
+
+
 def test_dashboard_sync_paper_account_mirrors_durable_wallet(dashboard):
     dashboard.start(balance=1_000_000.0)
     dashboard.sync_paper_account(

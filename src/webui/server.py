@@ -84,6 +84,7 @@ def create_app(
     get_health: Callable[[bool], Awaitable[dict[str, Any]]],
     cors_origins: list[str],
     *,
+    get_candles: Callable[[str, str, int], list[dict[str, Any]]],
     username: str,
     password_hash: str,
     session_secret: str,
@@ -202,6 +203,17 @@ def create_app(
 
         return LocalPaperEngine().get_closed_trade_history(limit=limit)
 
+    @app.get("/api/candles")
+    def get_candles_route(
+        symbol: str,
+        timeframe: str = "15m",
+        limit: int = 500,
+        _subject: str = Depends(_require_session),
+    ) -> list[dict[str, Any]]:
+        """Historical OHLCV for the chart tab. See get_candles's implementation in
+        run_live_trading.py (backed by HistoryManager) for the candle-shape contract."""
+        return get_candles(symbol, timeframe, limit)
+
     @app.get("/api/health")
     async def get_health_route(
         full: bool = False, _subject: str = Depends(_require_session)
@@ -258,6 +270,7 @@ class WebUIServer:
         port: int,
         cors_origins: list[str],
         *,
+        get_candles: Callable[[str, str, int], list[dict[str, Any]]],
         username: str,
         password_hash: str,
         session_secret: str,
@@ -272,6 +285,7 @@ class WebUIServer:
             get_signals,
             get_health,
             cors_origins,
+            get_candles=get_candles,
             username=username,
             password_hash=password_hash,
             session_secret=session_secret,

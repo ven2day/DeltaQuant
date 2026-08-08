@@ -49,6 +49,7 @@ class ManagedPosition:
     stop_loss: float
     target_price: float
     strategy: str = ""
+    timeframe: str = ""
     regime_at_entry: str = ""
     current_stop: float = 0.0
     highest_price: float = 0.0
@@ -94,6 +95,7 @@ class ManagedPosition:
             "mae": self.mae,
             "mfe": self.mfe,
             "strategy": self.strategy,
+            "timeframe": self.timeframe,
             "regime_at_entry": self.regime_at_entry,
         }
 
@@ -167,6 +169,7 @@ class ExitManager:
         strategy: str = "",
         regime: str = "",
         entry_time: datetime | None = None,
+        timeframe: str = "",
     ) -> ManagedPosition:
         pos = ManagedPosition(
             position_id=position_id,
@@ -178,6 +181,7 @@ class ExitManager:
             stop_loss=stop_loss,
             target_price=target_price,
             strategy=strategy,
+            timeframe=timeframe,
             regime_at_entry=regime,
         )
         self._positions[position_id] = pos

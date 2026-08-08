@@ -12,6 +12,9 @@ export interface Position {
   target?: number;
   stop?: number;
   status?: string;
+  entry_time?: string;
+  strategy?: string;
+  timeframe?: string;
 }
 
 export interface Quote {

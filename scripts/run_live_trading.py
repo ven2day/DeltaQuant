@@ -518,11 +518,27 @@ async def run_live_trading():
     web_task: asyncio.Task | None = None
     if settings.enable_web_ui:
         from src.api.health import health_check
+        from src.webui.candles import dataframe_to_candles
         from src.webui.schema import stats_to_dict
         from src.webui.server import ConnectionHub, WebUIServer
 
         async def _get_health_dict(full: bool) -> dict[str, Any]:
             return (await health_check(include_slow_checks=full)).to_dict()
+
+        def _get_candles(symbol: str, timeframe: str, limit: int) -> list[dict[str, Any]]:
+            """Historical OHLCV for the dashboard's Charts tab. Reuses the same
+            HistoryManager the trading loop itself computes indicators/signals from —
+            never a second, independently-fetched price series (see the
+            simulator-coherence work: one instrument state, one price process)."""
+            if timeframe == Timeframe.D1.value:
+                frame = history_manager.get_history(symbol, bars=limit)
+            else:
+                try:
+                    tf = Timeframe(timeframe)
+                except ValueError:
+                    return []
+                frame = history_manager.get_multi_timeframe_history(symbol, tf, bars=limit)
+            return dataframe_to_candles(frame)
 
         hub = ConnectionHub()
         web_server = WebUIServer(
@@ -530,6 +546,7 @@ async def run_live_trading():
             get_snapshot=lambda: {"type": "state", "data": stats_to_dict(dashboard.stats)},
             get_signals=signal_logger.read_recent,
             get_health=lambda full: _get_health_dict(full),
+            get_candles=_get_candles,
             host=settings.web_ui_host,
             port=settings.web_ui_port,
             cors_origins=settings.web_ui_cors_origins.split(","),
@@ -641,7 +658,7 @@ async def run_live_trading():
                 market_manager.simulated_data.event_time.isoformat()
             )
         dashboard.sync_paper_account(paper_engine.get_stats())
-        dashboard.sync_positions(paper_engine.get_positions())
+        dashboard.sync_positions(paper_engine.get_positions(), exit_manager.get_managed_positions())
         if hub is not None:
             await hub.broadcast({"type": "state", "data": stats_to_dict(dashboard.stats)})
 
@@ -1688,6 +1705,7 @@ async def run_live_trading():
                     target_price=target_price,
                     strategy=strategy,
                     regime=regime,
+                    timeframe=str(trade.get("timeframe", "")),
                 )
                 try:
                     trade_record = {
