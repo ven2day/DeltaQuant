@@ -1337,6 +1337,7 @@ async def run_live_trading():
             daily_stats=daily_stats,
             thread_id=workflow_id,
             precomputed_predictions=precomputed_predictions_map,
+            data_namespace=data_namespace,
         )
         last_review_fingerprint = review_fingerprint
 

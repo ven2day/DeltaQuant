@@ -226,6 +226,7 @@ async def run_trading_cycle(
     daily_stats: dict[str, Any] = None,
     thread_id: str = "default",
     precomputed_predictions: dict[str, dict[str, Any]] | None = None,
+    data_namespace: str = "paper_market_data",
 ) -> TradingState:
     """
     Run a complete trading cycle through the agent graph.
@@ -243,6 +244,10 @@ async def run_trading_cycle(
             for its own ranking pass, keyed by "SYMBOL|TIMEFRAME". The support-agent
             prediction_node reuses these instead of re-fetching history and
             re-running the ensemble for symbols it already covers.
+        data_namespace: Namespace of the current run's data (MOCK_NAMESPACE vs
+            PAPER_DATA_NAMESPACE) -- threaded into TradingState so nodes reading
+            historical performance/lesson data query the caller's actual namespace
+            instead of always defaulting to paper_market_data (see H-9).
 
     Returns:
         Final trading state with decisions
@@ -251,7 +256,7 @@ async def run_trading_cycle(
     # Create initial state with inputs. Coerce every input to native Python types: quotes,
     # indicators and P&L-derived stats can carry numpy scalars, which crash the msgpack
     # checkpoint boundary (see to_native / #18).
-    state = create_initial_state()
+    state = create_initial_state(data_namespace=data_namespace)
     state["market_data"] = to_native(market_data)
     state["indicators"] = to_native(indicators)
     state["signals"] = to_native(

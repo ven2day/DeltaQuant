@@ -156,6 +156,14 @@ class TradingState(TypedDict):
     timestamp: str
     errors: list[str]
 
+    # Namespace of the current run's data (MOCK_NAMESPACE / PAPER_DATA_NAMESPACE from
+    # src/execution/lifecycle.py). Nodes that read historical performance/lesson data
+    # (e.g. strategy_selection's LLM context) must pass this through to
+    # get_performance_tracker()/AgentMemoryDB rather than relying on the default, or a
+    # mock/simulated session silently reads live-data-paper history into its prompt
+    # context (and vice versa) -- see DeltaQuant-Quant-Risk-Review.md H-9.
+    data_namespace: str
+
     # ===========================================
     # Sentiment & Prediction (Free Tier)
     # ===========================================
@@ -184,12 +192,16 @@ class TradingState(TypedDict):
 
 def create_initial_state(
     workflow_id: str | None = None,
+    data_namespace: str = "paper_market_data",
 ) -> TradingState:
     """
     Create an initial empty trading state.
 
     Args:
         workflow_id: Optional workflow identifier
+        data_namespace: Namespace of the current run's data (see the field docstring
+            on TradingState.data_namespace); defaults to the live-data-paper namespace,
+            matching PerformanceTracker's/AgentMemoryDB's own default.
 
     Returns:
         Initialized TradingState with default values
@@ -232,6 +244,7 @@ def create_initial_state(
         workflow_id=workflow_id,
         timestamp=datetime.now().isoformat(),
         errors=[],
+        data_namespace=data_namespace,
         # Sentiment & Prediction (Free Tier)
         news_sentiment={},
         news_headlines=[],

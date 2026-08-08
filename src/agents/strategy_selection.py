@@ -108,7 +108,10 @@ def strategy_selection_node(state: TradingState) -> dict[str, Any]:
         ]
 
         # Build context
-        context = _build_strategy_context(regime, regime_confidence, strategy_lessons, daily_stats)
+        data_namespace = state.get("data_namespace", "paper_market_data")
+        context = _build_strategy_context(
+            regime, regime_confidence, strategy_lessons, daily_stats, data_namespace
+        )
 
         messages = [
             SystemMessage(content=STRATEGY_SYSTEM_PROMPT),
@@ -180,6 +183,7 @@ def _build_strategy_context(
     regime_confidence: float,
     lessons: list[dict[str, Any]],
     daily_stats: dict[str, Any],
+    data_namespace: str = "paper_market_data",
 ) -> str:
     """Build context for strategy selection."""
 
@@ -197,7 +201,10 @@ def _build_strategy_context(
     try:
         from src.memory.performance_tracker import get_performance_tracker
 
-        tracker = get_performance_tracker()
+        # H-9: must query the CURRENT run's namespace (mock vs live-data-paper), not the
+        # tracker's bare default -- otherwise a mock/simulated session's strategy-selection
+        # prompt is built from unrelated live-data (or vice versa) history.
+        tracker = get_performance_tracker(data_namespace)
         performance_data = tracker.get_all_strategy_performance(regime)
         for strategy, win_rate in sorted(
             performance_data.items(), key=lambda x: x[1], reverse=True

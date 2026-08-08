@@ -279,6 +279,41 @@ def test_build_strategy_context():
     assert "bull" in context
 
 
+@patch("src.memory.performance_tracker.get_performance_tracker")
+def test_build_strategy_context_queries_given_namespace(mock_get_tracker):
+    # H-9 regression: a mock/simulated session's LLM context must be built from ITS OWN
+    # namespace, not the tracker's bare "paper_market_data" default -- otherwise a
+    # simulated run's strategy-selection prompt is silently populated from unrelated
+    # live-data-paper history (or vice versa).
+    mock_tracker = MagicMock()
+    mock_tracker.get_all_strategy_performance.return_value = {}
+    mock_get_tracker.return_value = mock_tracker
+
+    _build_strategy_context("bull", 0.9, [], {}, data_namespace="mock_simulated")
+
+    mock_get_tracker.assert_called_once_with("mock_simulated")
+
+
+@patch("src.agents.strategy_selection.ChatGroq")
+@patch("src.agents.strategy_selection.get_settings")
+@patch("src.memory.performance_tracker.get_performance_tracker")
+def test_strategy_selection_node_threads_data_namespace_from_state(
+    mock_get_tracker, mock_settings, mock_llm_cls
+):
+    mock_settings.return_value.groq_api_key.get_secret_value.return_value = "token"
+    mock_llm = MagicMock()
+    mock_llm.invoke.return_value.content = '{"active_strategies": ["breakout"], "reasoning": "vol"}'
+    mock_llm_cls.return_value = mock_llm
+    mock_tracker = MagicMock()
+    mock_tracker.get_all_strategy_performance.return_value = {}
+    mock_get_tracker.return_value = mock_tracker
+
+    state = create_initial_state(data_namespace="mock_simulated")
+    strategy_selection_node(state)
+
+    mock_get_tracker.assert_called_once_with("mock_simulated")
+
+
 def test_parse_strategy_response():
     content = '{"active_strategies": ["momentum"], "reasoning": "trend"}'
     res = _parse_strategy_response(content)
