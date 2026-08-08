@@ -15,6 +15,11 @@ dependencies = [
     "langgraph>=0.2.0",
     "langchain-core>=0.3.0",
     "langchain-groq>=0.2.0",
+    # Optional LLM providers (selected via LLM_PROVIDER; see src/agents/llm_factory.py).
+    # DeepSeek has no dedicated LangChain package -- it's OpenAI-API-compatible, so
+    # langchain-openai talks to it via base_url.
+    "langchain-google-genai>=2.0.0",
+    "langchain-openai>=0.2.0",
     # Observability
     # Broker API
     "dhanhq>=2.0.0",

@@ -275,10 +275,9 @@ def test_identify_patterns(analyzer):
 
 @pytest.fixture
 def classifier():
-    with patch("src.memory.classifier.get_settings") as mock_settings:
-        mock_settings.return_value.groq_api_key.get_secret_value.return_value = "fake"
-        mock_settings.return_value.groq_model_fallback = "fake-model"
-        with patch("src.memory.classifier.ChatGroq") as mock_llm:
+    with patch("src.memory.classifier.primary_and_fallback_models") as mock_models:
+        mock_models.return_value = ("fake-primary-model", "fake-model")
+        with patch("src.memory.classifier.create_chat_model") as mock_llm:
             clf = MistakeClassifier()
             clf._llm = mock_llm
             yield clf

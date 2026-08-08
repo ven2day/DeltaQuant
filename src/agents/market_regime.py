@@ -15,13 +15,18 @@ import logging
 from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_groq import ChatGroq
 
+from src.agents.llm_factory import (
+    create_chat_model,
+    current_provider,
+    get_llm_circuit_breaker,
+    get_llm_limiter,
+    primary_and_fallback_models,
+)
 from src.config import get_settings
 from src.finops import record_llm_response
-from src.utils.circuit_breaker import CircuitBreakerOpenError, get_groq_circuit_breaker
+from src.utils.circuit_breaker import CircuitBreakerOpenError
 from src.utils.errors import RateLimitError
-from src.utils.rate_limiter import get_groq_limiter
 
 from .state import MarketRegime, TradingState
 
@@ -59,16 +64,10 @@ single weak signal; prefer "ranging" with lower confidence when unsure.
 Consider the memory lessons carefully to avoid past mistakes."""
 
 
-def create_regime_agent() -> ChatGroq:
-    """Create the market regime classification agent."""
-    settings = get_settings()
-
-    return ChatGroq(
-        api_key=settings.groq_api_key.get_secret_value(),
-        model_name=settings.groq_model_primary,
-        temperature=settings.groq_temperature,
-        max_tokens=1024,
-    )
+def create_regime_agent():
+    """Create the market regime classification agent (currently configured provider)."""
+    primary_model, _fallback_model = primary_and_fallback_models()
+    return create_chat_model(primary_model, max_tokens=1024)
 
 
 def market_regime_node(state: TradingState) -> dict[str, Any]:
@@ -91,8 +90,8 @@ def market_regime_node(state: TradingState) -> dict[str, Any]:
     if not settings.enable_llm_agents:
         return _fallback_regime_classification(state, "LLM agents disabled via settings")
 
-    rate_limiter = get_groq_limiter()
-    circuit_breaker = get_groq_circuit_breaker()
+    rate_limiter = get_llm_limiter()
+    circuit_breaker = get_llm_circuit_breaker()
 
     try:
         # Extract relevant data for regime analysis
@@ -115,14 +114,14 @@ def market_regime_node(state: TradingState) -> dict[str, Any]:
 
         # Check circuit breaker state
         if not circuit_breaker.is_available:
-            raise CircuitBreakerOpenError("groq_api", circuit_breaker.recovery_time)
+            raise CircuitBreakerOpenError(f"{current_provider()}_api", circuit_breaker.recovery_time)
 
         # Apply rate limiting before LLM call
         if settings.enable_rate_limiting:
             rate_limiter.acquire_sync()
 
         # Try primary model first, fallback on rate limit
-        models_to_try = [settings.groq_model_primary, settings.groq_model_fallback]
+        models_to_try = list(primary_and_fallback_models())
 
         response = None
         last_error = None
@@ -130,12 +129,9 @@ def market_regime_node(state: TradingState) -> dict[str, Any]:
         for model_name in models_to_try:
             try:
 
-                def invoke_llm():
-                    agent = ChatGroq(
-                        api_key=settings.groq_api_key.get_secret_value(),
-                        model_name=model_name,
-                        temperature=settings.groq_temperature,
-                        max_tokens=1024,
+                def invoke_llm(model_name=model_name):
+                    agent = create_chat_model(
+                        model_name, temperature=settings.groq_temperature, max_tokens=1024
                     )
                     return agent.invoke(messages)
 

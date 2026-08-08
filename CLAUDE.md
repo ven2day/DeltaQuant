@@ -67,12 +67,27 @@ lives in `should_continue_after_*` predicate functions.
 Every LLM node (see [src/agents/market_regime.py](src/agents/market_regime.py) as the
 reference implementation) follows the same resilience pattern — **preserve it when editing or adding agents**:
 
-- Acquire the shared rate limiter (`get_groq_limiter`) and circuit breaker
-  (`get_groq_circuit_breaker`) before calling the LLM.
-- Try `settings.groq_model_primary`, then fall back to `groq_model_fallback` on rate-limit (429) errors.
+- Acquire the shared rate limiter (`get_llm_limiter`) and circuit breaker
+  (`get_llm_circuit_breaker`) — both from [src/agents/llm_factory.py](src/agents/llm_factory.py)
+  — before calling the LLM.
+- Try the primary model, then fall back to the fallback model on rate-limit (429) errors — get
+  both via `primary_and_fallback_models()`, never read `settings.groq_model_primary` directly in
+  an agent (that hardcodes Groq; see below).
 - On **any** failure (circuit open, rate limit, parse error), return a deterministic
   `_fallback_*` result instead of raising. The graph must never crash on a bad LLM call.
 - LLM output is JSON; parsing strips ```` ```json ```` / ```` ``` ```` fences and clamps/validates fields.
+
+**Provider selection.** `settings.llm_provider` (`groq`/`gemini`/`deepseek`) selects the LLM
+provider for every agent at once — [llm_factory.py](src/agents/llm_factory.py)'s
+`create_chat_model(model_name, ...)` is the one place that constructs a chat model; agents must
+call it (or `get_llm_limiter()`/`get_llm_circuit_breaker()`/`primary_and_fallback_models()`,
+also there) instead of importing `ChatGroq` directly. Groq stays the validated default; Gemini/
+DeepSeek are additional, cheaper options. Switching `LLM_PROVIDER` **fails closed at startup**
+without the matching API key (`GOOGLE_API_KEY`/`DEEPSEEK_API_KEY`) set — see
+`validate_configuration()` in [settings.py](src/config/settings.py). DeepSeek has no dedicated
+LangChain package; it's reached via `langchain_openai.ChatOpenAI` pointed at its OpenAI-compatible
+`api.deepseek.com` endpoint. FinOps pricing (`src/finops/cost_tracker.py`) has entries for all
+three providers' models in one flat dict (model names don't collide across providers).
 
 **Support-agent state contracts.** The support agents enrich `TradingState` with keys the
 regime/validation agents read; the *types must match* or the enrichment is silently dropped

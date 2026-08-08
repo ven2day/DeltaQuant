@@ -23,11 +23,18 @@ from src.utils.market_time import now_ist
 logger = logging.getLogger(__name__)
 
 
-# Groq list prices in USD per 1M tokens (input, output). These are estimates for
-# paid-tier-equivalent cost and are easily overridden via register_pricing(); the
-# free tier bills $0 regardless. Unknown models use the most expensive listed
-# text-model rates so a model rename cannot silently bypass the spend gate.
+# List prices in USD per 1M tokens (input, output), across every supported provider
+# (see src/agents/llm_factory.py) -- model names are unique across providers, so one
+# flat dict keyed by model name (rather than namespacing per-provider) is sufficient;
+# CostTracker.price_for() just looks up whatever model string record_llm_response() was
+# given. These are estimates for paid-tier-equivalent cost and are easily overridden via
+# register_pricing(); the free tier bills $0 regardless. Unknown models use the most
+# expensive listed text-model rates so a model rename cannot silently bypass the spend
+# gate. Gemini/DeepSeek figures are approximate list prices at time of writing --
+# verify against the provider's current pricing page before relying on them for a real
+# budget decision.
 DEFAULT_GROQ_PRICING: dict[str, tuple[float, float]] = {
+    # Groq
     "llama-3.3-70b-versatile": (0.59, 0.79),
     "llama-3.1-8b-instant": (0.05, 0.08),
     "openai/gpt-oss-20b": (0.075, 0.30),
@@ -36,6 +43,14 @@ DEFAULT_GROQ_PRICING: dict[str, tuple[float, float]] = {
     "llama-3.1-70b-versatile": (0.59, 0.79),
     "llama3-70b-8192": (0.59, 0.79),
     "llama3-8b-8192": (0.05, 0.08),
+    # Gemini (Google AI Studio list pricing, approximate)
+    "gemini-2.0-flash": (0.10, 0.40),
+    "gemini-1.5-flash": (0.075, 0.30),
+    "gemini-1.5-pro": (1.25, 5.00),
+    # DeepSeek (approximate; DeepSeek also has a separate, cheaper cache-hit input
+    # rate this table does not model -- it uses the standard cache-miss rate)
+    "deepseek-chat": (0.27, 1.10),
+    "deepseek-reasoner": (0.55, 2.19),
 }
 _FALLBACK_PRICING: tuple[float, float] = (0.60, 3.00)
 

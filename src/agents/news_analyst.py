@@ -21,13 +21,18 @@ from urllib.parse import quote
 
 import feedparser
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_groq import ChatGroq
 
+from src.agents.llm_factory import (
+    create_chat_model,
+    current_provider,
+    get_llm_circuit_breaker,
+    get_llm_limiter,
+    primary_and_fallback_models,
+)
 from src.config import get_settings
 from src.finops import record_llm_response
 from src.utils.cache import get_news_cache, get_sentiment_cache
-from src.utils.circuit_breaker import CircuitBreakerOpenError, get_groq_circuit_breaker
-from src.utils.rate_limiter import get_groq_limiter
+from src.utils.circuit_breaker import CircuitBreakerOpenError
 
 logger = logging.getLogger(__name__)
 
@@ -109,18 +114,16 @@ class NewsAnalyst:
         self._llm = None
         self._news_cache = get_news_cache()
         self._sentiment_cache = get_sentiment_cache()
-        self._rate_limiter = get_groq_limiter()
-        self._circuit_breaker = get_groq_circuit_breaker()
+        self._rate_limiter = get_llm_limiter()
+        self._circuit_breaker = get_llm_circuit_breaker()
 
-    def _get_llm(self) -> ChatGroq:
-        """Get or create LLM instance."""
+    def _get_llm(self):
+        """Get or create LLM instance (currently configured provider)."""
         if self._llm is None:
-            self._llm = ChatGroq(
-                api_key=self.settings.groq_api_key.get_secret_value(),
-                model_name=self.settings.groq_model_fallback,  # Use smaller model for news
-                temperature=0.1,
-                max_tokens=256,
-            )
+            # Use the smaller/cheaper fallback-tier model for news -- sentiment scoring
+            # from a handful of headlines doesn't need the primary model's capability.
+            _primary_model, fallback_model = primary_and_fallback_models()
+            self._llm = create_chat_model(fallback_model, temperature=0.1, max_tokens=256)
         return self._llm
 
     def fetch_news(self, query: str, max_items: int = 10) -> list[NewsItem]:
@@ -199,7 +202,9 @@ class NewsAnalyst:
         try:
             # Check circuit breaker
             if not self._circuit_breaker.is_available:
-                raise CircuitBreakerOpenError("groq_api", self._circuit_breaker.recovery_time)
+                raise CircuitBreakerOpenError(
+                    f"{current_provider()}_api", self._circuit_breaker.recovery_time
+                )
 
             # Apply rate limiting
             if self.settings.enable_rate_limiting:
@@ -219,7 +224,8 @@ class NewsAnalyst:
                 return llm.invoke(messages)
 
             response = self._circuit_breaker.call(invoke_llm)
-            record_llm_response("news_analyst", response, model=self.settings.groq_model_fallback)
+            _primary_model, fallback_model = primary_and_fallback_models()
+            record_llm_response("news_analyst", response, model=fallback_model)
             content = response.content.strip()
 
             # Parse JSON response

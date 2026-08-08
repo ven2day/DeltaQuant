@@ -226,6 +226,16 @@ def get_groq_circuit_breaker() -> CircuitBreaker:
     return get_circuit_breaker("groq_api", failure_threshold=3, recovery_time=30.0)
 
 
+def get_llm_provider_circuit_breaker(provider: str) -> CircuitBreaker:
+    """Get the circuit breaker for an LLM provider ("groq"/"gemini"/"deepseek").
+
+    Same failure_threshold/recovery_time as get_groq_circuit_breaker() for every
+    provider -- named per-provider ("gemini_api", "deepseek_api", ...) via the shared
+    get_circuit_breaker() registry, so each provider trips independently.
+    """
+    return get_circuit_breaker(f"{provider}_api", failure_threshold=3, recovery_time=30.0)
+
+
 def get_broker_circuit_breaker() -> CircuitBreaker:
     """Get circuit breaker for broker API."""
     return get_circuit_breaker("broker_api", failure_threshold=5, recovery_time=60.0)

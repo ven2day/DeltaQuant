@@ -103,32 +103,32 @@ async def check_database() -> ServiceHealth:
 
 
 async def check_groq_api() -> ServiceHealth:
-    """Check Groq API connectivity."""
+    """Check connectivity for the currently configured LLM provider (name kept as
+    check_groq_api for the caller/tests; the check itself follows settings.llm_provider,
+    not just Groq -- see src/agents/llm_factory.py)."""
     start = time.time()
+    provider = get_settings().llm_provider
+    service_name = f"{provider}_api"
 
     try:
         from langchain_core.messages import HumanMessage
-        from langchain_groq import ChatGroq
 
-        settings = get_settings()
+        from src.agents.llm_factory import create_chat_model, primary_and_fallback_models
 
-        # Simple ping to Groq
-        llm = ChatGroq(
-            api_key=settings.groq_api_key.get_secret_value(),
-            model_name=settings.groq_model_fallback,  # Use smaller model
-            temperature=0,
-            max_tokens=5,
-        )
+        _primary_model, fallback_model = primary_and_fallback_models()
+
+        # Simple ping using the smaller/cheaper fallback-tier model
+        llm = create_chat_model(fallback_model, temperature=0, max_tokens=5)
 
         llm.invoke([HumanMessage(content="Say OK")])
 
         latency = (time.time() - start) * 1000
         return ServiceHealth(
-            name="groq_api",
+            name=service_name,
             status=HealthStatus.HEALTHY,
             latency_ms=latency,
-            message="Groq API responding",
-            details={"model": settings.groq_model_fallback},
+            message=f"{provider} API responding",
+            details={"model": fallback_model},
         )
     except Exception as e:
         latency = (time.time() - start) * 1000
@@ -136,17 +136,17 @@ async def check_groq_api() -> ServiceHealth:
         # Check if rate limited
         if "rate_limit" in str(e).lower() or "429" in str(e):
             return ServiceHealth(
-                name="groq_api",
+                name=service_name,
                 status=HealthStatus.DEGRADED,
                 latency_ms=latency,
-                message="Groq API rate limited",
+                message=f"{provider} API rate limited",
             )
 
         return ServiceHealth(
-            name="groq_api",
+            name=service_name,
             status=HealthStatus.UNHEALTHY,
             latency_ms=latency,
-            message=f"Groq API error: {str(e)[:100]}",
+            message=f"{provider} API error: {str(e)[:100]}",
         )
 
 

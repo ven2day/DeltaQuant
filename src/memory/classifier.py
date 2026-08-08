@@ -13,9 +13,8 @@ from typing import Any
 from uuid import uuid4
 
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_groq import ChatGroq
 
-from src.config import get_settings
+from src.agents.llm_factory import create_chat_model, primary_and_fallback_models
 
 from .analyzer import TradeOutcome
 
@@ -111,20 +110,16 @@ class MistakeClassifier:
     to generate actionable learning lessons.
     """
 
-    _llm: ChatGroq = None
+    _llm: Any = None
 
     def __post_init__(self):
         self._initialize_llm()
 
     def _initialize_llm(self) -> None:
-        """Initialize the LLM for classification."""
-        settings = get_settings()
-        self._llm = ChatGroq(
-            api_key=settings.groq_api_key.get_secret_value(),
-            model_name=settings.groq_model_fallback,  # Use faster model for classification
-            temperature=0.2,
-            max_tokens=512,
-        )
+        """Initialize the LLM for classification (currently configured provider)."""
+        # Use the faster/cheaper fallback-tier model for classification.
+        _primary_model, fallback_model = primary_and_fallback_models()
+        self._llm = create_chat_model(fallback_model, temperature=0.2, max_tokens=512)
 
     def classify(self, outcome: TradeOutcome) -> ClassifiedMistake | None:
         """

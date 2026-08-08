@@ -15,6 +15,7 @@ from .circuit_breaker import (
     CircuitBreakerOpenError,
     get_broker_circuit_breaker,
     get_groq_circuit_breaker,
+    get_llm_provider_circuit_breaker,
     get_market_data_circuit_breaker,
 )
 from .errors import (
@@ -35,13 +36,14 @@ from .events import (
     TradingEvent,
     get_event_bus,
 )
-from .rate_limiter import RateLimiter, get_groq_limiter, rate_limited
+from .rate_limiter import RateLimiter, get_groq_limiter, get_llm_provider_limiter, rate_limited
 
 __all__ = [
     # Rate limiting
     "RateLimiter",
     "rate_limited",
     "get_groq_limiter",
+    "get_llm_provider_limiter",
     # Caching
     "TTLCache",
     "cached",
@@ -63,6 +65,7 @@ __all__ = [
     "CircuitBreaker",
     "CircuitBreakerOpenError",
     "get_groq_circuit_breaker",
+    "get_llm_provider_circuit_breaker",
     "get_broker_circuit_breaker",
     "get_market_data_circuit_breaker",
     # Events

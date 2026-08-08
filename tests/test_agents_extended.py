@@ -47,7 +47,7 @@ def test_fetch_news(news_analyst):
 
 @pytest.mark.asyncio
 async def test_analyze_sentiment(news_analyst):
-    with patch("src.agents.news_analyst.ChatGroq"):
+    with patch("src.agents.news_analyst.create_chat_model"):
         mock_llm = MagicMock()
         mock_llm.invoke.return_value.content = '{"sentiment": 0.8, "reasoning": "Good news"}'
         news_analyst._llm = mock_llm

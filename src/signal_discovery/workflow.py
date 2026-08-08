@@ -17,8 +17,8 @@ from typing import Any
 
 import pandas as pd
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_groq import ChatGroq
 
+from src.agents.llm_factory import create_chat_model, primary_and_fallback_models
 from src.config import get_settings
 from src.finops import get_cost_tracker
 from src.finops.cost_tracker import record_llm_response
@@ -63,14 +63,9 @@ class SignalDiscoveryWorkflow:
         min_cross_section: int = 8,
         output_directory: str = "data/discovered_signals",
     ) -> None:
-        settings = get_settings()
-        self.model_name = settings.groq_model_primary
-        self.llm = llm or ChatGroq(
-            api_key=settings.groq_api_key.get_secret_value(),
-            model_name=self.model_name,
-            temperature=0.5,
-            max_tokens=1800,
-        )
+        primary_model, _fallback_model = primary_and_fallback_models()
+        self.model_name = primary_model
+        self.llm = llm or create_chat_model(self.model_name, temperature=0.5, max_tokens=1800)
         self.num_signals = max(1, min(10, int(num_signals)))
         self.max_iterations = max(1, min(10, int(max_iterations)))
         self.ic_threshold = abs(float(ic_threshold))

@@ -15,12 +15,17 @@ import logging
 from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_groq import ChatGroq
 
+from src.agents.llm_factory import (
+    create_chat_model,
+    current_provider,
+    get_llm_circuit_breaker,
+    get_llm_limiter,
+    primary_and_fallback_models,
+)
 from src.config import get_settings
 from src.finops import record_llm_response
-from src.utils.circuit_breaker import CircuitBreakerOpenError, get_groq_circuit_breaker
-from src.utils.rate_limiter import get_groq_limiter
+from src.utils.circuit_breaker import CircuitBreakerOpenError
 
 from .state import TradingState
 
@@ -71,16 +76,10 @@ Be selective - it's better to miss a trade than take a bad one.
 Quality over quantity."""
 
 
-def create_validation_agent() -> ChatGroq:
-    """Create the signal validation agent."""
-    settings = get_settings()
-
-    return ChatGroq(
-        api_key=settings.groq_api_key.get_secret_value(),
-        model_name=settings.groq_model_primary,
-        temperature=settings.groq_temperature,
-        max_tokens=2048,
-    )
+def create_validation_agent():
+    """Create the signal validation agent (currently configured provider)."""
+    primary_model, _fallback_model = primary_and_fallback_models()
+    return create_chat_model(primary_model, max_tokens=2048)
 
 
 def signal_validation_node(state: TradingState) -> dict[str, Any]:
@@ -105,8 +104,8 @@ def signal_validation_node(state: TradingState) -> dict[str, Any]:
             state, state.get("signals", []), "LLM agents disabled via settings"
         )
 
-    rate_limiter = get_groq_limiter()
-    circuit_breaker = get_groq_circuit_breaker()
+    rate_limiter = get_llm_limiter()
+    circuit_breaker = get_llm_circuit_breaker()
 
     try:
         signals = state.get("signals", [])
@@ -142,18 +141,20 @@ def signal_validation_node(state: TradingState) -> dict[str, Any]:
 
         # Check circuit breaker
         if not circuit_breaker.is_available:
-            raise CircuitBreakerOpenError("groq_api", circuit_breaker.recovery_time)
+            raise CircuitBreakerOpenError(f"{current_provider()}_api", circuit_breaker.recovery_time)
 
         # Apply rate limiting
         if settings.enable_rate_limiting:
             rate_limiter.acquire_sync()
+
+        primary_model, _fallback_model = primary_and_fallback_models()
 
         def invoke_llm():
             agent = create_validation_agent()
             return agent.invoke(messages)
 
         response = circuit_breaker.call(invoke_llm)
-        record_llm_response("signal_validation", response, model=settings.groq_model_primary)
+        record_llm_response("signal_validation", response, model=primary_model)
         result = _parse_validation_response(response.content, signals)
 
         validated = result["validated"]

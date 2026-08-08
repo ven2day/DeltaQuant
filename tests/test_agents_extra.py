@@ -77,7 +77,7 @@ def test_parse_regime_response():
     assert res["regime"] == MarketRegime.UNKNOWN.value
 
 
-@patch("src.agents.market_regime.ChatGroq")
+@patch("src.agents.market_regime.create_chat_model")
 @patch("src.agents.market_regime.get_settings")
 def test_market_regime_node(mock_settings, mock_llm_cls):
     mock_settings.return_value.groq_api_key.get_secret_value.return_value = "token"
@@ -94,7 +94,7 @@ def test_market_regime_node(mock_settings, mock_llm_cls):
     assert result["regime_confidence"] == 0.6
 
 
-@patch("src.agents.market_regime.ChatGroq")
+@patch("src.agents.market_regime.create_chat_model")
 @patch("src.agents.market_regime.get_settings")
 def test_market_regime_node_skips_llm_when_disabled(mock_settings, mock_llm_cls):
     mock_settings.return_value.enable_llm_agents = False
@@ -107,7 +107,7 @@ def test_market_regime_node_skips_llm_when_disabled(mock_settings, mock_llm_cls)
     assert result["regime"] == "trending_up"
 
 
-@patch("src.agents.market_regime.ChatGroq")
+@patch("src.agents.market_regime.create_chat_model")
 def test_market_regime_node_error(mock_llm_cls):
     mock_llm_cls.side_effect = Exception("API Error")
 
@@ -261,7 +261,7 @@ def test_parse_validation_response():
     assert len(res["rejected"]) == 1
 
 
-@patch("src.agents.signal_validation.ChatGroq")
+@patch("src.agents.signal_validation.create_chat_model")
 @patch("src.agents.signal_validation.get_settings")
 def test_signal_validation_node(mock_settings, mock_llm_cls):
     mock_settings.return_value.groq_api_key.get_secret_value.return_value = "token"
@@ -278,7 +278,7 @@ def test_signal_validation_node(mock_settings, mock_llm_cls):
     assert len(result["validated_signals"]) == 1
 
 
-@patch("src.agents.signal_validation.ChatGroq")
+@patch("src.agents.signal_validation.create_chat_model")
 @patch("src.agents.signal_validation.get_settings")
 def test_signal_validation_node_skips_llm_when_disabled(mock_settings, mock_llm_cls):
     mock_settings.return_value.enable_llm_agents = False
@@ -315,7 +315,7 @@ def test_build_strategy_context_queries_given_namespace(mock_get_tracker):
     mock_get_tracker.assert_called_once_with("mock_simulated")
 
 
-@patch("src.agents.strategy_selection.ChatGroq")
+@patch("src.agents.strategy_selection.create_chat_model")
 @patch("src.agents.strategy_selection.get_settings")
 @patch("src.memory.performance_tracker.get_performance_tracker")
 def test_strategy_selection_node_threads_data_namespace_from_state(
@@ -347,7 +347,7 @@ def test_parse_strategy_response():
     assert "trend_following" in res["active_strategies"]
 
 
-@patch("src.agents.strategy_selection.ChatGroq")
+@patch("src.agents.strategy_selection.create_chat_model")
 @patch("src.agents.strategy_selection.get_settings")
 def test_strategy_selection_node(mock_settings, mock_llm_cls, tmp_path):
     # H-8: strategy_selection_node now gates its output through the strategy admission
@@ -365,7 +365,7 @@ def test_strategy_selection_node(mock_settings, mock_llm_cls, tmp_path):
     assert result["active_strategies"] == ["breakout"]
 
 
-@patch("src.agents.strategy_selection.ChatGroq")
+@patch("src.agents.strategy_selection.create_chat_model")
 @patch("src.agents.strategy_selection.get_settings")
 def test_strategy_selection_node_skips_llm_when_disabled(mock_settings, mock_llm_cls, tmp_path):
     _register_validated_strategy(tmp_path, "momentum")

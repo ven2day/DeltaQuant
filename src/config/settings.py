@@ -90,6 +90,49 @@ class Settings(BaseSettings):
     )
 
     # ===========================================
+    # LLM Provider selection (Groq / Gemini / DeepSeek)
+    # ===========================================
+    # Every LLM-backed agent node (market_regime, strategy_selection, signal_validation,
+    # news_analyst) goes through src/agents/llm_factory.py rather than hardcoding a
+    # provider, so switching this one setting moves every agent at once. Groq stays the
+    # default -- it's what's been validated against this codebase's prompts; Gemini/
+    # DeepSeek are available, cheaper alternatives for future use (see
+    # llm_factory.create_chat_model).
+    llm_provider: Literal["groq", "gemini", "deepseek"] = Field(
+        default="groq",
+        description="Which LLM provider every agent node uses. Switching this requires "
+        "the matching API key to be set (see validate_configuration) -- there is no "
+        "silent fallback to Groq if e.g. GOOGLE_API_KEY is missing.",
+    )
+    google_api_key: SecretStr = Field(
+        default="",
+        description="Google AI Studio API key for Gemini (required when LLM_PROVIDER=gemini).",
+    )
+    gemini_model_primary: str = Field(
+        default="gemini-2.0-flash",
+        description="Primary Gemini model for agent reasoning.",
+    )
+    gemini_model_fallback: str = Field(
+        default="gemini-1.5-flash",
+        description="Fallback Gemini model for rate-limit scenarios.",
+    )
+    deepseek_api_key: SecretStr = Field(
+        default="",
+        description="DeepSeek API key (required when LLM_PROVIDER=deepseek). DeepSeek is "
+        "OpenAI-API-compatible; served via langchain-openai pointed at api.deepseek.com.",
+    )
+    deepseek_model_primary: str = Field(
+        default="deepseek-chat",
+        description="Primary DeepSeek model for agent reasoning.",
+    )
+    deepseek_model_fallback: str = Field(
+        default="deepseek-chat",
+        description="Fallback DeepSeek model for rate-limit scenarios (DeepSeek does not "
+        "publish a distinct lighter tier the way Groq/Gemini do, so this defaults to the "
+        "same model; override if that changes).",
+    )
+
+    # ===========================================
     # Broker API - DhanHQ (Optional for free tier)
     # ===========================================
     dhan_client_id: str | None = Field(
@@ -922,6 +965,25 @@ class Settings(BaseSettings):
                 "ENABLE_WEB_UI=true requires WEB_UI_SESSION_SECRET to be set — without it, "
                 "login sessions cannot be signed. Generate one with "
                 "`uv run python scripts/set_dashboard_password.py`."
+            )
+
+        # ---------------------------------------------------------------
+        # Fatal: LLM_PROVIDER must have its matching API key configured. There is no
+        # silent fallback to Groq -- an operator who sets LLM_PROVIDER=gemini but
+        # forgets GOOGLE_API_KEY should get a clear startup failure, not agents that
+        # mysteriously fail every call at runtime and fall back to degraded/deterministic
+        # behavior (which the existing per-agent resilience pattern would otherwise mask
+        # as "just another LLM failure").
+        # ---------------------------------------------------------------
+        if self.llm_provider == "gemini" and not self.google_api_key.get_secret_value():
+            fatal.append(
+                "LLM_PROVIDER=gemini requires GOOGLE_API_KEY to be set (get one from "
+                "Google AI Studio: https://aistudio.google.com/apikey)."
+            )
+        if self.llm_provider == "deepseek" and not self.deepseek_api_key.get_secret_value():
+            fatal.append(
+                "LLM_PROVIDER=deepseek requires DEEPSEEK_API_KEY to be set (get one from "
+                "https://platform.deepseek.com/api_keys)."
             )
 
         # Validate risk parameters

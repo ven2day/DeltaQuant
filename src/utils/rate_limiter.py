@@ -156,6 +156,39 @@ def get_groq_limiter() -> RateLimiter:
     return _groq_limiter
 
 
+# Per-provider limiters for the non-Groq LLM providers (see src/agents/llm_factory.py).
+# Kept separate from _groq_limiter/get_groq_limiter above rather than folding Groq into
+# this dict too, so existing tests that reset the Groq singleton directly
+# (`src.utils.rate_limiter._groq_limiter = None`) keep working unchanged.
+_provider_limiters: dict[str, RateLimiter] = {}
+
+# Conservative free-tier requests-per-minute defaults. These are deliberately cautious
+# estimates (easy to raise for a paid tier) -- the cost of guessing too low is a slower
+# agent cycle; the cost of guessing too high is a 429 storm.
+_PROVIDER_REQUESTS_PER_MINUTE: dict[str, int] = {
+    "gemini": 15,
+    "deepseek": 60,
+}
+
+
+def get_llm_provider_limiter(provider: str) -> RateLimiter:
+    """Get or create the rate limiter for an LLM provider ("groq"/"gemini"/"deepseek").
+
+    "groq" delegates to get_groq_limiter() (the pre-existing singleton) rather than a
+    second bucket, so there is exactly one Groq limiter regardless of which name a
+    caller uses to reach it.
+    """
+    if provider == "groq":
+        return get_groq_limiter()
+    if provider not in _provider_limiters:
+        _provider_limiters[provider] = RateLimiter(
+            requests_per_minute=_PROVIDER_REQUESTS_PER_MINUTE.get(provider, 30),
+            max_retries=3,
+            base_backoff=2.0,
+        )
+    return _provider_limiters[provider]
+
+
 # Global rate limiter instance for DhanHQ's Data APIs (quote/ohlc/historical/intraday
 # charts). DhanHQ documents a single account-wide cap of 5 requests/second across
 # these endpoints *combined*, not a separate budget per endpoint (confirmed live: a
