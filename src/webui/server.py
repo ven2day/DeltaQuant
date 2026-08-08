@@ -3,6 +3,12 @@
 Runs inside the same asyncio event loop as ``run_live_trading.py`` (as a
 background task, mirroring the existing Dhan WebSocket ``listen_task`` pattern) —
 not a separate process, no IPC.
+
+Every route (REST and the ``/ws`` WebSocket) requires a valid session — see
+``src/webui/auth.py``. There is no unauthenticated read path: the dashboard exposes
+wallet balance, positions, and trading activity, and this app is designed to be
+reachable over the network, not just loopback (M-8,
+DeltaQuant-Quant-Risk-Review.md).
 """
 
 import logging
@@ -10,10 +16,29 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 import uvicorn
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import (
+    Cookie,
+    Depends,
+    FastAPI,
+    HTTPException,
+    Request,
+    Response,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+from src.webui.auth import (
+    LoginAttemptTracker,
+    create_session_token,
+    verify_password,
+    verify_session_token,
+)
 
 logger = logging.getLogger(__name__)
+
+SESSION_COOKIE_NAME = "dq_session"
 
 
 class ConnectionHub:
@@ -47,44 +72,148 @@ class ConnectionHub:
             self.disconnect(ws)
 
 
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
 def create_app(
     hub: ConnectionHub,
     get_snapshot: Callable[[], dict[str, Any]],
     get_signals: Callable[[int], list[dict[str, Any]]],
     get_health: Callable[[bool], Awaitable[dict[str, Any]]],
     cors_origins: list[str],
+    *,
+    username: str,
+    password_hash: str,
+    session_secret: str,
+    session_ttl_minutes: int = 720,
+    cookie_secure: bool = False,
+    login_max_attempts: int = 5,
+    login_lockout_minutes: int = 15,
 ) -> FastAPI:
-    """Build the FastAPI app: snapshot, signal-history and health endpoints plus the WebSocket."""
+    """Build the FastAPI app: snapshot, signal-history, health, and auth routes plus the WebSocket.
+
+    ``password_hash`` is a ``hash_password()`` string (never a plaintext password —
+    see ``scripts/set_dashboard_password.py``). ``session_secret`` signs session
+    tokens; it must be long, random, and stable across restarts (a rotated secret
+    invalidates every existing session, logging everyone out). ``cookie_secure``
+    should be True whenever the app is served over HTTPS (it prevents the browser
+    from ever sending the session cookie over plain HTTP) — see the caller in
+    ``scripts/run_live_trading.py`` for how it's derived from settings.
+    """
     app = FastAPI(title="₹DeltaQuant Web UI")
+    attempts = LoginAttemptTracker(
+        max_attempts=login_max_attempts, lockout_minutes=login_lockout_minutes
+    )
 
     app.add_middleware(
         CORSMiddleware,
         allow_origins=cors_origins,
-        allow_methods=["GET"],
+        allow_credentials=True,
+        allow_methods=["GET", "POST"],
         allow_headers=["*"],
     )
 
+    def _require_session(dq_session: str | None = Cookie(default=None)) -> str:
+        """FastAPI dependency: 401s any request without a valid session cookie."""
+        if dq_session is None:
+            raise HTTPException(status_code=401, detail="Not authenticated")
+        subject = verify_session_token(dq_session, secret=session_secret)
+        if subject is None:
+            raise HTTPException(status_code=401, detail="Session invalid or expired")
+        return subject
+
+    @app.post("/api/login")
+    def login(payload: LoginRequest, request: Request, response: Response) -> dict[str, Any]:
+        # Keyed on the direct TCP peer, not X-Forwarded-For: this port may be
+        # reached directly (not only through a reverse proxy), and a client-
+        # supplied header must never be trusted to key a security control — it
+        # would let an attacker spoof a fresh IP on every request and bypass the
+        # lockout entirely.
+        client_ip = request.client.host if request.client else "unknown"
+        if attempts.is_locked(client_ip):
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    f"Too many failed login attempts. Try again in "
+                    f"{login_lockout_minutes} minutes."
+                ),
+            )
+        # Always run verify_password even when the username is already known to
+        # be wrong, so a mismatched username doesn't short-circuit into a faster
+        # response than a mismatched password — that timing gap is itself an
+        # oracle for valid usernames.
+        username_ok = payload.username == username
+        password_ok = verify_password(payload.password, password_hash)
+        if not (username_ok and password_ok):
+            attempts.record_failure(client_ip)
+            raise HTTPException(status_code=401, detail="Invalid username or password")
+
+        attempts.reset(client_ip)
+        token = create_session_token(username, secret=session_secret, ttl_minutes=session_ttl_minutes)
+        response.set_cookie(
+            key=SESSION_COOKIE_NAME,
+            value=token,
+            httponly=True,
+            secure=cookie_secure,
+            samesite="lax",
+            max_age=session_ttl_minutes * 60,
+            path="/",
+        )
+        return {"ok": True, "username": username}
+
+    @app.post("/api/logout")
+    def logout(response: Response) -> dict[str, Any]:
+        response.delete_cookie(key=SESSION_COOKIE_NAME, path="/")
+        return {"ok": True}
+
+    @app.get("/api/session")
+    def session_status(dq_session: str | None = Cookie(default=None)) -> dict[str, Any]:
+        if dq_session is None:
+            return {"authenticated": False}
+        subject = verify_session_token(dq_session, secret=session_secret)
+        return {"authenticated": subject is not None, "username": subject}
+
     @app.get("/api/state")
-    def get_state() -> dict[str, Any]:
+    def get_state(_subject: str = Depends(_require_session)) -> dict[str, Any]:
         return get_snapshot()
 
     @app.get("/api/signals")
-    def get_signals_route(days: int = 7) -> list[dict[str, Any]]:
+    def get_signals_route(
+        days: int = 7, _subject: str = Depends(_require_session)
+    ) -> list[dict[str, Any]]:
         return get_signals(days)
 
     @app.get("/api/trades")
-    def get_trades_route(limit: int = 250) -> list[dict[str, Any]]:
+    def get_trades_route(
+        limit: int = 250, _subject: str = Depends(_require_session)
+    ) -> list[dict[str, Any]]:
         """Return the durable, net-of-charges paper trade ledger."""
         from src.execution.paper_engine import LocalPaperEngine
 
         return LocalPaperEngine().get_closed_trade_history(limit=limit)
 
     @app.get("/api/health")
-    async def get_health_route(full: bool = False) -> dict[str, Any]:
+    async def get_health_route(
+        full: bool = False, _subject: str = Depends(_require_session)
+    ) -> dict[str, Any]:
         return await get_health(full)
 
     @app.websocket("/ws")
     async def ws_endpoint(websocket: WebSocket) -> None:
+        # Auth happens BEFORE accept(): a browser's WebSocket handshake carries
+        # cookies automatically (it's a normal HTTP request with Upgrade headers),
+        # so the same session cookie set by /api/login is available here without
+        # needing a token in the URL (which would otherwise leak into proxy/access
+        # logs). Rejecting pre-accept sends a proper handshake failure instead of
+        # accepting the socket and immediately closing it.
+        token = websocket.cookies.get(SESSION_COOKIE_NAME)
+        subject = verify_session_token(token, secret=session_secret) if token else None
+        if subject is None:
+            await websocket.close(code=1008)  # 1008 = policy violation
+            return
+
         await websocket.accept()
         hub.connect(websocket)
         try:
@@ -120,8 +249,29 @@ class WebUIServer:
         host: str,
         port: int,
         cors_origins: list[str],
+        *,
+        username: str,
+        password_hash: str,
+        session_secret: str,
+        session_ttl_minutes: int = 720,
+        cookie_secure: bool = False,
+        login_max_attempts: int = 5,
+        login_lockout_minutes: int = 15,
     ) -> None:
-        app = create_app(hub, get_snapshot, get_signals, get_health, cors_origins)
+        app = create_app(
+            hub,
+            get_snapshot,
+            get_signals,
+            get_health,
+            cors_origins,
+            username=username,
+            password_hash=password_hash,
+            session_secret=session_secret,
+            session_ttl_minutes=session_ttl_minutes,
+            cookie_secure=cookie_secure,
+            login_max_attempts=login_max_attempts,
+            login_lockout_minutes=login_lockout_minutes,
+        )
         config = uvicorn.Config(app, host=host, port=port, log_level="warning")
         self._server = uvicorn.Server(config)
         self._host = host

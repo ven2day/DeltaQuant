@@ -533,6 +533,13 @@ async def run_live_trading():
             host=settings.web_ui_host,
             port=settings.web_ui_port,
             cors_origins=settings.web_ui_cors_origins.split(","),
+            username=settings.web_ui_username,
+            password_hash=settings.web_ui_password_hash,
+            session_secret=settings.web_ui_session_secret,
+            session_ttl_minutes=settings.web_ui_session_ttl_minutes,
+            cookie_secure=settings.web_ui_cookie_secure,
+            login_max_attempts=settings.web_ui_login_max_attempts,
+            login_lockout_minutes=settings.web_ui_login_lockout_minutes,
         )
         web_task = asyncio.create_task(web_server.serve())
         dashboard.stats.log_activity(

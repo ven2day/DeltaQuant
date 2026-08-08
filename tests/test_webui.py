@@ -4,13 +4,48 @@ from unittest.mock import patch
 import pytest
 
 from src.dashboard.stats import TradingStats
+from src.webui.auth import hash_password
 from src.webui.schema import stats_to_dict
 from src.webui.server import ConnectionHub, WebUIServer, create_app
+
+TEST_USERNAME = "admin"
+TEST_PASSWORD = "correct-horse-battery-staple"
+TEST_PASSWORD_HASH = hash_password(TEST_PASSWORD)
+TEST_SESSION_SECRET = "test-session-secret"
 
 
 async def _noop_health(full: bool) -> dict:
     """Stand-in get_health for tests that don't exercise the health route itself."""
     return {"status": "healthy", "services": [], "full": full}
+
+
+def _make_app(**overrides):
+    from fastapi.testclient import TestClient
+
+    defaults = dict(
+        hub=ConnectionHub(),
+        get_snapshot=lambda: {"type": "state", "data": {}},
+        get_signals=lambda days: [],
+        get_health=lambda full: _noop_health(full),
+        cors_origins=["http://localhost:3000"],
+        username=TEST_USERNAME,
+        password_hash=TEST_PASSWORD_HASH,
+        session_secret=TEST_SESSION_SECRET,
+    )
+    defaults.update(overrides)
+    app = create_app(**defaults)
+    return TestClient(app)
+
+
+def _logged_in_client(**overrides):
+    """A TestClient that has already completed a successful login (cookie carries
+    across requests automatically via TestClient's underlying session)."""
+    client = _make_app(**overrides)
+    response = client.post(
+        "/api/login", json={"username": TEST_USERNAME, "password": TEST_PASSWORD}
+    )
+    assert response.status_code == 200, response.text
+    return client
 
 
 # --- schema.stats_to_dict tests ---
@@ -103,26 +138,125 @@ async def test_broadcast_disconnects_clients_that_raise():
     assert len(good.sent) == 2  # still connected, received both broadcasts
 
 
+# --- Auth: /api/login, /api/logout, /api/session ---
+
+
+def test_login_with_correct_credentials_sets_cookie_and_succeeds():
+    client = _make_app()
+    response = client.post(
+        "/api/login", json={"username": TEST_USERNAME, "password": TEST_PASSWORD}
+    )
+    assert response.status_code == 200
+    assert response.json()["ok"] is True
+    assert "dq_session" in response.cookies
+
+
+def test_login_with_wrong_password_rejected():
+    client = _make_app()
+    response = client.post(
+        "/api/login", json={"username": TEST_USERNAME, "password": "wrong"}
+    )
+    assert response.status_code == 401
+    assert "dq_session" not in response.cookies
+
+
+def test_login_with_wrong_username_rejected():
+    client = _make_app()
+    response = client.post(
+        "/api/login", json={"username": "nobody", "password": TEST_PASSWORD}
+    )
+    assert response.status_code == 401
+
+
+def test_login_lockout_after_max_attempts():
+    client = _make_app(login_max_attempts=3, login_lockout_minutes=15)
+    for _ in range(3):
+        response = client.post(
+            "/api/login", json={"username": TEST_USERNAME, "password": "wrong"}
+        )
+        assert response.status_code == 401
+
+    # Correct credentials are now also rejected — the lockout is by IP, not by
+    # correctness, exactly what stops online guessing regardless of luck.
+    response = client.post(
+        "/api/login", json={"username": TEST_USERNAME, "password": TEST_PASSWORD}
+    )
+    assert response.status_code == 429
+
+
+def test_logout_clears_session():
+    client = _logged_in_client()
+    assert client.get("/api/session").json()["authenticated"] is True
+
+    response = client.post("/api/logout")
+    assert response.status_code == 200
+
+    assert client.get("/api/session").json()["authenticated"] is False
+
+
+def test_session_status_reflects_auth_state():
+    client = _make_app()
+    assert client.get("/api/session").json() == {"authenticated": False}
+
+    client.post("/api/login", json={"username": TEST_USERNAME, "password": TEST_PASSWORD})
+    status = client.get("/api/session").json()
+    assert status["authenticated"] is True
+    assert status["username"] == TEST_USERNAME
+
+
+# --- Auth: protected REST routes ---
+
+
+@pytest.mark.parametrize(
+    "method,path",
+    [
+        ("get", "/api/state"),
+        ("get", "/api/signals"),
+        ("get", "/api/trades"),
+        ("get", "/api/health"),
+    ],
+)
+def test_protected_routes_reject_unauthenticated_requests(method, path):
+    client = _make_app()
+    response = getattr(client, method)(path)
+    assert response.status_code == 401
+
+
+def test_protected_route_rejects_garbage_cookie():
+    client = _make_app()
+    client.cookies.set("dq_session", "not-a-valid-token")
+    response = client.get("/api/state")
+    assert response.status_code == 401
+
+
+def test_protected_route_rejects_token_signed_with_wrong_secret():
+    from src.webui.auth import create_session_token
+
+    client = _make_app()
+    forged = create_session_token(TEST_USERNAME, secret="wrong-secret", ttl_minutes=30)
+    client.cookies.set("dq_session", forged)
+    response = client.get("/api/state")
+    assert response.status_code == 401
+
+
+def test_state_route_accessible_after_login():
+    client = _logged_in_client(get_snapshot=lambda: {"type": "state", "data": {"x": 1}})
+    response = client.get("/api/state")
+    assert response.status_code == 200
+    assert response.json() == {"type": "state", "data": {"x": 1}}
+
+
 # --- /api/signals route ---
 
 
 def test_get_signals_route_passes_days_query_param_through():
-    from fastapi.testclient import TestClient
-
     captured: dict[str, int] = {}
 
     def get_signals(days: int) -> list[dict]:
         captured["days"] = days
         return [{"symbol": "TCS", "side": "BUY", "status": "approved"}]
 
-    app = create_app(
-        hub=ConnectionHub(),
-        get_snapshot=lambda: {"type": "state", "data": {}},
-        get_signals=get_signals,
-        get_health=lambda full: _noop_health(full),
-        cors_origins=["http://localhost:3000"],
-    )
-    client = TestClient(app)
+    client = _logged_in_client(get_signals=get_signals)
 
     response = client.get("/api/signals?days=3")
 
@@ -132,22 +266,13 @@ def test_get_signals_route_passes_days_query_param_through():
 
 
 def test_get_signals_route_defaults_to_seven_days():
-    from fastapi.testclient import TestClient
-
     captured: dict[str, int] = {}
 
     def get_signals(days: int) -> list[dict]:
         captured["days"] = days
         return []
 
-    app = create_app(
-        hub=ConnectionHub(),
-        get_snapshot=lambda: {"type": "state", "data": {}},
-        get_signals=get_signals,
-        get_health=lambda full: _noop_health(full),
-        cors_origins=["http://localhost:3000"],
-    )
-    client = TestClient(app)
+    client = _logged_in_client(get_signals=get_signals)
 
     client.get("/api/signals")
 
@@ -158,22 +283,13 @@ def test_get_signals_route_defaults_to_seven_days():
 
 
 def test_get_health_route_defaults_to_fast_checks_only():
-    from fastapi.testclient import TestClient
-
     captured: dict[str, bool] = {}
 
     async def get_health(full: bool) -> dict:
         captured["full"] = full
         return {"status": "healthy", "services": []}
 
-    app = create_app(
-        hub=ConnectionHub(),
-        get_snapshot=lambda: {"type": "state", "data": {}},
-        get_signals=lambda days: [],
-        get_health=get_health,
-        cors_origins=["http://localhost:3000"],
-    )
-    client = TestClient(app)
+    client = _logged_in_client(get_health=get_health)
 
     response = client.get("/api/health")
 
@@ -183,26 +299,36 @@ def test_get_health_route_defaults_to_fast_checks_only():
 
 
 def test_get_health_route_passes_full_query_param_through():
-    from fastapi.testclient import TestClient
-
     captured: dict[str, bool] = {}
 
     async def get_health(full: bool) -> dict:
         captured["full"] = full
         return {"status": "healthy", "services": []}
 
-    app = create_app(
-        hub=ConnectionHub(),
-        get_snapshot=lambda: {"type": "state", "data": {}},
-        get_signals=lambda days: [],
-        get_health=get_health,
-        cors_origins=["http://localhost:3000"],
-    )
-    client = TestClient(app)
+    client = _logged_in_client(get_health=get_health)
 
     client.get("/api/health?full=true")
 
     assert captured["full"] is True
+
+
+# --- WebSocket auth ---
+
+
+def test_websocket_rejected_without_session_cookie():
+    from starlette.websockets import WebSocketDisconnect
+
+    client = _make_app()
+    with pytest.raises(WebSocketDisconnect):
+        with client.websocket_connect("/ws"):
+            pass
+
+
+def test_websocket_accepted_with_valid_session_cookie():
+    client = _logged_in_client(get_snapshot=lambda: {"type": "state", "data": {"ok": True}})
+    with client.websocket_connect("/ws") as ws:
+        message = ws.receive_json()
+        assert message == {"type": "state", "data": {"ok": True}}
 
 
 # --- WebUIServer startup-failure isolation ---
@@ -223,6 +349,9 @@ async def test_serve_swallows_systemexit_from_port_conflict():
         host="127.0.0.1",
         port=0,
         cors_origins=["http://localhost:3000"],
+        username=TEST_USERNAME,
+        password_hash=TEST_PASSWORD_HASH,
+        session_secret=TEST_SESSION_SECRET,
     )
     with patch.object(server._server, "serve", side_effect=SystemExit(3)):
         await server.serve()  # must not raise
@@ -237,6 +366,9 @@ async def test_serve_swallows_unexpected_exception():
         host="127.0.0.1",
         port=0,
         cors_origins=["http://localhost:3000"],
+        username=TEST_USERNAME,
+        password_hash=TEST_PASSWORD_HASH,
+        session_secret=TEST_SESSION_SECRET,
     )
     with patch.object(server._server, "serve", side_effect=RuntimeError("boom")):
         await server.serve()  # must not raise
