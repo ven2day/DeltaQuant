@@ -468,6 +468,7 @@ class TradeJournal:
     def _extract_decision_chain(self, state: dict[str, Any]) -> dict[str, Any]:
         """Extract decision chain from state for audit trail."""
         return {
+            "trade_horizon": state.get("trade_horizon", "SWING"),
             "regime": {
                 "value": state.get("regime"),
                 "confidence": state.get("regime_confidence"),

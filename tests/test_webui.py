@@ -92,6 +92,30 @@ def test_stats_to_dict_preserves_nested_fields(stats):
     assert data["activity_log"][-1]["message"] == "hello"
 
 
+def test_stats_to_dict_round_trips_scalp_fields(stats):
+    # Stage 5: scalp_opportunities/scalp_funnel are plain list/dict fields on
+    # TradingStats -- must survive dataclasses.asdict() + json.dumps() unmangled,
+    # exactly like every other nested field, with zero webui backend changes.
+    stats.scalp_opportunities = [
+        {"symbol": "RELIANCE", "direction": "BUY", "final_decision": "ENTER_NOW"}
+    ]
+    stats.scalp_funnel = {"raw_triggers": 42, "h8_admitted": 0}
+
+    data = stats_to_dict(stats)
+    dumped = json.loads(json.dumps(data))  # must be JSON round-trippable too
+
+    assert dumped["scalp_opportunities"][0]["symbol"] == "RELIANCE"
+    assert dumped["scalp_funnel"]["raw_triggers"] == 42
+
+
+def test_stats_to_dict_scalp_fields_default_empty():
+    # scalp_enabled=False must mean an empty, not missing, funnel/opportunity list --
+    # the UI can render "no scalp activity" instead of a KeyError.
+    data = stats_to_dict(TradingStats())
+    assert data["scalp_opportunities"] == []
+    assert data["scalp_funnel"] == {}
+
+
 # --- ConnectionHub tests ---
 
 

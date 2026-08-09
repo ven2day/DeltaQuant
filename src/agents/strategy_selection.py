@@ -17,10 +17,10 @@ from typing import Any
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from src.agents.llm_factory import (
-    create_chat_model,
     current_provider,
     get_llm_circuit_breaker,
     get_llm_limiter,
+    invoke_with_fallback,
     primary_and_fallback_models,
 )
 from src.backtesting.strategy_registry import StrategyRegistry
@@ -28,6 +28,7 @@ from src.config import get_settings
 from src.finops import record_llm_response
 from src.market.signals import StrategyType
 from src.utils.circuit_breaker import CircuitBreakerOpenError
+from src.utils.formatting import plain_english_fallback_cause
 
 from .state import TradingState
 
@@ -39,26 +40,34 @@ logger = logging.getLogger(__name__)
 _VALID_STRATEGY_NAMES = [member.value for member in StrategyType]
 
 
-def _gate_active_strategies(strategies: list[str], regime: str) -> list[str]:
+def _gate_active_strategies(
+    strategies: list[str], regime: str, *, trade_horizon: str = "SWING"
+) -> list[str]:
     """Strip any strategy without a current, non-expired VALIDATED registry artifact
-    (H-8, DeltaQuant-Quant-Risk-Review.md).
+    for this exact trade_horizon (H-8, DeltaQuant-Quant-Risk-Review.md).
 
-    Fail closed: an unknown/unvalidated/expired strategy is silently *not* removed with
-    just a warning -- it never reaches ``active_strategies`` at all, so it cannot
-    survive downstream into a validated signal or an approved trade. Every strip is
-    still logged loudly (not swallowed) so an operator can see why nothing traded.
+    Fail closed: an unknown/unvalidated/expired/wrong-horizon strategy is silently
+    *not* removed with just a warning -- it never reaches ``active_strategies`` at
+    all, so it cannot survive downstream into a validated signal or an approved
+    trade. Every strip is still logged loudly (not swallowed) so an operator can see
+    why nothing traded. ``trade_horizon`` is matched exactly against the registry
+    artifact -- a SWING-validated artifact can never admit a SCALP request, so
+    promoting scalping never silently inherits swing's (daily-bar) validation.
     """
     settings = get_settings()
     registry_dir = getattr(settings, "strategy_registry_dir", "data/strategy_registry")
     registry = StrategyRegistry(str(registry_dir))
-    admitted, stripped = registry.filter_admitted(strategies, regime=regime)
+    admitted, stripped = registry.filter_admitted(
+        strategies, regime=regime, trade_horizon=trade_horizon
+    )
     if stripped:
         logger.warning(
             "Strategy admission gate (H-8): stripped %s from active strategies for regime "
-            "'%s' -- no current VALIDATED artifact in %s. Run "
+            "'%s' / trade_horizon '%s' -- no current VALIDATED artifact in %s. Run "
             "`uv run python scripts/validate_strategy.py` to (re)validate.",
             stripped,
             regime,
+            trade_horizon,
             registry_dir,
         )
     return admitted
@@ -95,12 +104,6 @@ Respond with JSON:
         "strategy_name": "why selected or rejected"
     }
 }"""
-
-
-def create_strategy_agent():
-    """Create the strategy selection agent (currently configured provider)."""
-    primary_model, _fallback_model = primary_and_fallback_models()
-    return create_chat_model(primary_model, max_tokens=1024)
 
 
 def strategy_selection_node(state: TradingState) -> dict[str, Any]:
@@ -160,17 +163,25 @@ def strategy_selection_node(state: TradingState) -> dict[str, Any]:
         if settings.enable_rate_limiting:
             rate_limiter.acquire_sync()
 
-        primary_model, _fallback_model = primary_and_fallback_models()
+        model_used = primary_and_fallback_models()[0]
 
-        def invoke_llm():
-            agent = create_strategy_agent()
-            return agent.invoke(messages)
+        def _record_model_used(name: str) -> None:
+            nonlocal model_used
+            model_used = name
 
-        response = circuit_breaker.call(invoke_llm)
-        record_llm_response("strategy_selection", response, model=primary_model)
+        response = invoke_with_fallback(
+            messages,
+            circuit_breaker=circuit_breaker,
+            max_tokens=1024,
+            on_model_selected=_record_model_used,
+        )
+        record_llm_response("strategy_selection", response, model=model_used)
         result = _parse_strategy_response(response.content)
 
-        admitted = _gate_active_strategies(result["active_strategies"], regime)
+        trade_horizon = state.get("trade_horizon", "SWING")
+        admitted = _gate_active_strategies(
+            result["active_strategies"], regime, trade_horizon=trade_horizon
+        )
         logger.info(f"Selected strategies: {result['active_strategies']} -> admitted: {admitted}")
 
         return {
@@ -210,14 +221,18 @@ def _fallback_strategy_selection(
         "volatile": ["breakout"],
     }
 
+    trade_horizon = state.get("trade_horizon", "SWING")
     strategies = regime_strategies.get(regime, ["trend_following"])
-    admitted = _gate_active_strategies(strategies, regime)
+    admitted = _gate_active_strategies(strategies, regime, trade_horizon=trade_horizon)
 
     logger.info(f"Using fallback strategies for {regime}: {strategies} -> admitted: {admitted}")
 
     return {
         "active_strategies": admitted,
-        "strategy_reasoning": f"Fallback selection for {regime} regime. Error: {error_msg}",
+        "strategy_reasoning": (
+            f"AI review skipped because {plain_english_fallback_cause(error_msg)}. "
+            f"Backup rule selected the default strategy set for '{regime}'."
+        ),
         "errors": state.get("errors", []) + [f"Strategy Agent fallback: {error_msg}"],
     }
 

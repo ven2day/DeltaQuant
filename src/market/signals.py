@@ -49,6 +49,21 @@ class StrategyType(Enum):
     EMA_CCI = "ema_cci"
 
 
+class TradeHorizon(Enum):
+    """Which trading horizon a signal/strategy-version is governed under.
+
+    Purely a classification tag at this layer -- it carries no risk/admission logic
+    itself. SWING is the existing, long-established path (default for backward
+    compatibility with every pre-existing signal/registry artifact); SCALP is the new
+    5m/15m execution horizon. The H-8 registry (src/backtesting/strategy_registry.py)
+    and the risk/validation agents are the actual enforcement points that key off this
+    value -- see DeltaQuant-Quant-Risk-Review.md H-8.
+    """
+
+    SWING = "SWING"
+    SCALP = "SCALP"
+
+
 @dataclass
 class TradingSignal:
     """Represents a trading signal from the signal engine."""
@@ -77,6 +92,11 @@ class TradingSignal:
     # Metadata
     timestamp: datetime = field(default_factory=datetime.now)
 
+    # Which trading horizon this signal belongs to. Defaults to SWING so every
+    # existing call site (all of them, pre-dating this field) keeps producing
+    # exactly the signals it always has.
+    trade_horizon: TradeHorizon = TradeHorizon.SWING
+
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for agent consumption."""
         return {
@@ -95,6 +115,7 @@ class TradingSignal:
             "reasons": self.reasons,
             "indicators": self.indicators,
             "timestamp": self.timestamp.isoformat(),
+            "trade_horizon": self.trade_horizon.value,
         }
 
 

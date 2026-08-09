@@ -96,9 +96,9 @@ class Settings(BaseSettings):
     # news_analyst) goes through src/agents/llm_factory.py rather than hardcoding a
     # provider, so switching this one setting moves every agent at once. Groq stays the
     # default -- it's what's been validated against this codebase's prompts; Gemini/
-    # DeepSeek are available, cheaper alternatives for future use (see
-    # llm_factory.create_chat_model).
-    llm_provider: Literal["groq", "gemini", "deepseek"] = Field(
+    # DeepSeek/Qwen (Alibaba Cloud DashScope) are available, cheaper alternatives for
+    # future use (see llm_factory.create_chat_model).
+    llm_provider: Literal["groq", "gemini", "deepseek", "qwen"] = Field(
         default="groq",
         description="Which LLM provider every agent node uses. Switching this requires "
         "the matching API key to be set (see validate_configuration) -- there is no "
@@ -130,6 +130,32 @@ class Settings(BaseSettings):
         description="Fallback DeepSeek model for rate-limit scenarios (DeepSeek does not "
         "publish a distinct lighter tier the way Groq/Gemini do, so this defaults to the "
         "same model; override if that changes).",
+    )
+    # Field/env-var name matches DashScope's own convention (DASHSCOPE_API_KEY) rather
+    # than a DeltaQuant-invented QWEN_API_KEY -- same precedent as google_api_key above
+    # (GOOGLE_API_KEY, not GEMINI_API_KEY): the key is issued by the platform, not the
+    # model family.
+    dashscope_api_key: SecretStr = Field(
+        default="",
+        description="Alibaba Cloud DashScope API key for Qwen (required when "
+        "LLM_PROVIDER=qwen). Qwen is OpenAI-API-compatible via DashScope's "
+        "compatible-mode endpoint; served via langchain-openai pointed at qwen_base_url.",
+    )
+    qwen_base_url: str = Field(
+        default="https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+        description="DashScope OpenAI-compatible-mode base URL. Defaults to the "
+        "international endpoint; accounts provisioned in mainland China should override "
+        "this to https://dashscope.aliyuncs.com/compatible-mode/v1.",
+    )
+    qwen_model_primary: str = Field(
+        default="qwen3.7-plus",
+        description="Primary Qwen model for agent reasoning.",
+    )
+    qwen_model_fallback: str = Field(
+        default="qwen3.7-plus",
+        description="Fallback Qwen model for rate-limit scenarios. Defaults to the same "
+        "model as primary (like DeepSeek above) -- override once a confirmed lighter "
+        "DashScope tier is picked for this account.",
     )
 
     # ===========================================
@@ -607,6 +633,154 @@ class Settings(BaseSettings):
     )
 
     # ===========================================
+    # Scalp trading horizon (SCALP, distinct from the SWING defaults above).
+    # Everything here is off/inert until scalp_enabled=True — see CLAUDE.md "Scalp
+    # horizon" section. None of this weakens or bypasses H-8 or any risk_compliance
+    # check; it only supplies horizon-specific thresholds those gates read.
+    # ===========================================
+    scalp_enabled: bool = Field(
+        default=False,
+        description="Master switch for the scalp scan/rank/gate pipeline. False = "
+        "byte-identical behavior to before this feature existed.",
+    )
+    enable_signal_consolidation: bool = Field(
+        default=False,
+        description="Consolidate multiple strategies agreeing on the same "
+        "symbol+timeframe+direction into one stronger signal before ranking, instead of "
+        "treating each as an independent candidate. Off by default so the existing swing "
+        "candidate mix is provably unchanged until explicitly enabled.",
+    )
+    scalp_signal_timeframes: str = Field(
+        default="5m,15m",
+        description="Comma-separated timeframes the scalp signal scan runs strategies on "
+        "(same format/parser as signal_timeframes).",
+    )
+    scalp_confirmation_timeframes: str = Field(
+        default="5m,15m,30m,1h,4h",
+        description="Comma-separated timeframes read for multi-timeframe scalp "
+        "confirmation. Semantics: 5m=execution, 15m=primary setup/confirmation, "
+        "30m=directional confirmation, 1h=context, 4h=optional macro filter.",
+    )
+    scalp_macro_filter_enabled: bool = Field(
+        default=True,
+        description="Whether the optional 4h macro-context filter participates in "
+        "multi-timeframe scalp confirmation (scalp_confirmation_timeframes' 4h leg).",
+    )
+    scalp_required_mtf_alignment: int = Field(
+        default=3,
+        ge=1,
+        le=5,
+        description="Minimum number of confirmation timeframes that must agree "
+        "(execution/primary/directional/context/macro) for a scalp candidate to pass "
+        "multi-timeframe confirmation.",
+    )
+    scalp_risk_per_trade: float = Field(
+        default=0.01,
+        description="Max risk per SCALP-horizon trade as a fraction of capital — tighter "
+        "than swing's risk_per_trade (0.02) since scalp stops are much closer.",
+    )
+    scalp_max_position_pct: float = Field(
+        default=0.05,
+        description="Max SCALP-horizon position size as a fraction of capital — tighter "
+        "than swing's max_position_pct (0.10).",
+    )
+    scalp_target_pct: float = Field(
+        default=0.8,
+        description="Default SCALP-horizon take-profit, percent above entry — an order of "
+        "magnitude tighter than swing's paper_target_pct (3.5), matching a 5-15m horizon.",
+    )
+    scalp_stop_loss_pct: float = Field(
+        default=0.4,
+        description="Default SCALP-horizon stop-loss, percent below entry.",
+    )
+    scalp_min_rr: float = Field(
+        default=1.5,
+        description="Minimum risk-reward ratio for the SCALP-horizon signal_validation "
+        "fallback rule. Deliberately shipped equal to the swing fallback's hardcoded 1.5 "
+        "so this stage only makes the bar horizon-selectable, never lowers it.",
+    )
+    scalp_min_confidence: float = Field(
+        default=0.6,
+        ge=0.0,
+        le=1.0,
+        description="Minimum signal confidence for the SCALP-horizon signal_validation "
+        "fallback rule. Deliberately shipped equal to the swing fallback's hardcoded 0.6.",
+    )
+    scalp_min_volume_ratio: float = Field(
+        default=1.2,
+        ge=0.0,
+        description="Minimum current-bar volume divided by its 20-bar average, required by "
+        "the scalp EntryQualityEvaluator's relative-volume check.",
+    )
+    scalp_matrix_reject_score: float = Field(
+        default=0.35,
+        ge=0.0,
+        le=1.0,
+        description="Per-timeframe assessment-matrix score below which a symbol/timeframe "
+        "cell is labeled REJECT outright (below this, WAIT up to scalp_min_confidence, "
+        "at/above scalp_min_confidence, BUY -- subject to regime compatibility). This is a "
+        "descriptive label only; it never substitutes for the H-8 admission gate or "
+        "signal_validation, both of which still run independently before any trade.",
+    )
+    scalp_vwap_max_distance_pct: float = Field(
+        default=0.5,
+        ge=0.0,
+        description="Max acceptable distance from session VWAP (percent of price) for the "
+        "EntryQualityEvaluator to consider an entry not yet extended.",
+    )
+    scalp_ema9_max_distance_pct: float = Field(
+        default=0.6,
+        ge=0.0,
+        description="Max acceptable distance from EMA9 (percent of price) for the "
+        "EntryQualityEvaluator to consider an entry not yet extended.",
+    )
+    scalp_atr_extension_max_multiple: float = Field(
+        default=1.5,
+        gt=0.0,
+        description="Max acceptable distance from VWAP expressed as a multiple of ATR — "
+        "an ATR-normalized extension check independent of the flat percent checks above, "
+        "so the same threshold behaves consistently across low- and high-volatility names.",
+    )
+    scalp_wick_ratio_max: float = Field(
+        default=0.6,
+        gt=0.0,
+        le=1.0,
+        description="Max acceptable wick-to-range ratio on the triggering candle before "
+        "the EntryQualityEvaluator treats it as rejection/indecision rather than a clean "
+        "trigger.",
+    )
+    scalp_swing_lookback_bars: int = Field(
+        default=40,
+        ge=10,
+        description="Bars of 5m history scanned for recent swing support/resistance in the "
+        "EntryQualityEvaluator (reuses scalping_screener's zigzag detector).",
+    )
+    scalp_breakout_retest_lookback_bars: int = Field(
+        default=12,
+        ge=3,
+        description="Bars of 5m history scanned for breakout/retest state detection in the "
+        "EntryQualityEvaluator.",
+    )
+    scalp_resistance_min_distance_pct: float = Field(
+        default=0.3,
+        ge=0.0,
+        description="Minimum distance (percent of price) a BUY entry must clear from the "
+        "nearest detected swing resistance.",
+    )
+    scalp_max_active_symbols: int = Field(
+        default=5,
+        ge=1,
+        description="Max symbols retained in the scalp ranker's shortlist per cycle "
+        "(scalp analogue of max_active_stocks).",
+    )
+    scalp_ranking_weight_entry_quality: float = Field(default=0.30, ge=0.0)
+    scalp_ranking_weight_mtf_alignment: float = Field(default=0.20, ge=0.0)
+    scalp_ranking_weight_volume_liquidity: float = Field(default=0.15, ge=0.0)
+    scalp_ranking_weight_regime: float = Field(default=0.10, ge=0.0)
+    scalp_ranking_weight_historical_expectancy: float = Field(default=0.15, ge=0.0)
+    scalp_ranking_weight_ml_probability: float = Field(default=0.10, ge=0.0)
+
+    # ===========================================
     # Tail-risk guards (deterministic; independent of the LLM stack)
     # ===========================================
     kill_switch_flatten: bool = Field(
@@ -985,6 +1159,11 @@ class Settings(BaseSettings):
                 "LLM_PROVIDER=deepseek requires DEEPSEEK_API_KEY to be set (get one from "
                 "https://platform.deepseek.com/api_keys)."
             )
+        if self.llm_provider == "qwen" and not self.dashscope_api_key.get_secret_value():
+            fatal.append(
+                "LLM_PROVIDER=qwen requires DASHSCOPE_API_KEY to be set (get one from "
+                "Alibaba Cloud DashScope: https://dashscope.console.aliyun.com/apiKey)."
+            )
 
         # Validate risk parameters
         if self.risk_per_trade > self.max_position_pct:
@@ -995,6 +1174,29 @@ class Settings(BaseSettings):
         if self.max_total_risk < self.risk_per_trade:
             warnings.append(
                 f"max_total_risk ({self.max_total_risk}) should not be less than risk_per_trade ({self.risk_per_trade})"
+            )
+
+        # Scalp ranking weights are a weighted blend, not independent knobs -- warn (don't
+        # fail closed) if they drift from summing to 1.0, same severity as the risk-param
+        # sanity checks above.
+        scalp_weight_sum = (
+            self.scalp_ranking_weight_entry_quality
+            + self.scalp_ranking_weight_mtf_alignment
+            + self.scalp_ranking_weight_volume_liquidity
+            + self.scalp_ranking_weight_regime
+            + self.scalp_ranking_weight_historical_expectancy
+            + self.scalp_ranking_weight_ml_probability
+        )
+        if abs(scalp_weight_sum - 1.0) > 0.01:
+            warnings.append(
+                f"scalp_ranking_weight_* fields sum to {scalp_weight_sum:.3f}, expected 1.0"
+            )
+
+        if self.scalp_matrix_reject_score >= self.scalp_min_confidence:
+            warnings.append(
+                f"scalp_matrix_reject_score ({self.scalp_matrix_reject_score}) should be less "
+                f"than scalp_min_confidence ({self.scalp_min_confidence}), or every WAIT band "
+                "collapses to zero width"
             )
 
         # Validate market hours

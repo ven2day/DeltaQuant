@@ -17,15 +17,16 @@ from typing import Any
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from src.agents.llm_factory import (
-    create_chat_model,
     current_provider,
     get_llm_circuit_breaker,
     get_llm_limiter,
+    invoke_with_fallback,
     primary_and_fallback_models,
 )
 from src.config import get_settings
 from src.finops import record_llm_response
 from src.utils.circuit_breaker import CircuitBreakerOpenError
+from src.utils.formatting import plain_english_fallback_cause
 
 from .state import TradingState
 
@@ -74,12 +75,6 @@ Give a calibrated confidence (genuine probability the trade works), not a defaul
 
 Be selective - it's better to miss a trade than take a bad one.
 Quality over quantity."""
-
-
-def create_validation_agent():
-    """Create the signal validation agent (currently configured provider)."""
-    primary_model, _fallback_model = primary_and_fallback_models()
-    return create_chat_model(primary_model, max_tokens=2048)
 
 
 def signal_validation_node(state: TradingState) -> dict[str, Any]:
@@ -147,14 +142,19 @@ def signal_validation_node(state: TradingState) -> dict[str, Any]:
         if settings.enable_rate_limiting:
             rate_limiter.acquire_sync()
 
-        primary_model, _fallback_model = primary_and_fallback_models()
+        model_used = primary_and_fallback_models()[0]
 
-        def invoke_llm():
-            agent = create_validation_agent()
-            return agent.invoke(messages)
+        def _record_model_used(name: str) -> None:
+            nonlocal model_used
+            model_used = name
 
-        response = circuit_breaker.call(invoke_llm)
-        record_llm_response("signal_validation", response, model=primary_model)
+        response = invoke_with_fallback(
+            messages,
+            circuit_breaker=circuit_breaker,
+            max_tokens=2048,
+            on_model_selected=_record_model_used,
+        )
+        record_llm_response("signal_validation", response, model=model_used)
         result = _parse_validation_response(response.content, signals)
 
         validated = result["validated"]
@@ -183,33 +183,75 @@ def _fallback_signal_validation(
     error_msg: str,
 ) -> dict[str, Any]:
     """
-    Fallback signal validation using rule-based logic.
+    Fallback signal validation using simple rule-based logic instead of the LLM.
 
-    Used when LLM is unavailable. Only passes high-confidence signals
-    from active strategies.
+    Used when the LLM is unavailable. Only passes signals that are from an active
+    strategy, with confidence/risk-reward at or above the horizon-appropriate bar --
+    a much cruder bar than the LLM's actual reasoning, so this should be rare and
+    short-lived, not a steady state. Every rejection explains both WHY the AI
+    reviewer was skipped and WHICH specific check the signal failed, in plain
+    English, instead of the previous generic "Fallback: Failed rule-based validation."
+
+    Thresholds are horizon-aware: a SCALP-tagged signal (``signal["trade_horizon"]``,
+    falling back to the cycle's ``state["trade_horizon"]``) is checked against
+    ``settings.scalp_min_confidence``/``scalp_min_rr`` instead of the swing 0.6/1.5.
+    Both scalp defaults ship numerically EQUAL to the swing hardcoded bar (see
+    settings.py) -- this only makes the bar horizon-selectable, it never silently
+    lowers it.
     """
     active_strategies = state.get("active_strategies", [])
+    cause = plain_english_fallback_cause(error_msg)
+    settings = get_settings()
 
     validated = []
     rejected = []
 
     for signal in signals:
-        # Only validate if from active strategy
         strategy = signal.get("strategy", "")
         confidence = signal.get("confidence", 0)
         rr_ratio = signal.get("risk_reward_ratio", 0)
+        trade_horizon = signal.get("trade_horizon", state.get("trade_horizon", "SWING"))
+        if trade_horizon == "SCALP":
+            min_confidence = settings.scalp_min_confidence
+            min_rr = settings.scalp_min_rr
+        else:
+            min_confidence = 0.6
+            min_rr = 1.5
 
-        # Simple rule-based validation
-        is_valid = strategy in active_strategies and confidence >= 0.6 and rr_ratio >= 1.5
+        is_valid = (
+            strategy in active_strategies and confidence >= min_confidence and rr_ratio >= min_rr
+        )
 
         if is_valid:
             signal["validation"] = {
                 "confidence": 0.5,
-                "reasoning": "Fallback: Passed basic rule-based checks",
+                "reasoning": (
+                    f"AI review skipped because {cause}. Backup check passed it: "
+                    f"strategy '{strategy}' is active, confidence {confidence:.0%}, "
+                    f"risk-reward {rr_ratio:.2f}."
+                ),
             }
             validated.append(signal)
         else:
-            signal["rejection_reason"] = "Fallback: Failed rule-based validation"
+            if strategy not in active_strategies:
+                specific = (
+                    f"strategy '{strategy}' isn't one of today's approved strategies "
+                    f"({', '.join(active_strategies) or 'none admitted'})"
+                )
+            elif confidence < min_confidence:
+                specific = (
+                    f"confidence {confidence:.0%} is below the {min_confidence:.0%} "
+                    "backup-check minimum"
+                )
+            else:
+                specific = (
+                    f"risk-reward {rr_ratio:.2f} is below the {min_rr:.2f} "
+                    "backup-check minimum"
+                )
+            signal["rejection_reason"] = (
+                f"AI review skipped because {cause}, so a simplified backup check ran "
+                f"instead — it rejected this signal because {specific}."
+            )
             rejected.append(signal)
 
     logger.info(f"Fallback validation: {len(validated)} passed, {len(rejected)} rejected")
@@ -349,6 +391,15 @@ def _parse_validation_response(
             start = content.find("```") + 3
             end = content.find("```", start)
             content = content[start:end].strip()
+        elif "{" in content and not content.startswith("{"):
+            # Some models prepend prose/a heading before a bare JSON object with no
+            # code fence (see the same fix in market_regime.py's _parse_regime_response
+            # -- observed from Qwen). Take the JSON object itself rather than failing
+            # to parse the leading prose as JSON.
+            start = content.find("{")
+            end = content.rfind("}")
+            if end > start:
+                content = content[start : end + 1]
 
         result = json.loads(content)
         validations = result.get("validations", [])
@@ -381,14 +432,29 @@ def _parse_validation_response(
         processed_ids = {v.get("signal_id") for v in validations}
         for signal in original_signals:
             if signal.get("signal_id") not in processed_ids:
-                signal["validation"] = {"decision": "reject", "reasoning": "Not processed"}
+                signal["validation"] = {
+                    "decision": "reject",
+                    "reasoning": (
+                        "The AI reviewer's response didn't include a decision for this "
+                        "signal (only some of the candidates it was sent) -- rejected "
+                        "rather than assumed approved."
+                    ),
+                }
                 rejected.append(signal)
 
     except json.JSONDecodeError as e:
-        logger.warning(f"Failed to parse validation response: {e}")
-        # Reject all on parse error
+        # Log the raw content for debugging, but never show it to the user as
+        # "reasoning" -- a truncated dump of the model's own output reads as
+        # corrupted data, not an explanation.
+        logger.warning(f"Failed to parse validation response: {e}. Raw content: {content[:200]}")
         for signal in original_signals:
-            signal["validation"] = {"decision": "reject", "reasoning": "Parse error"}
+            signal["validation"] = {
+                "decision": "reject",
+                "reasoning": (
+                    "The AI reviewer's response could not be read (malformed response) "
+                    "-- rejected rather than assumed approved."
+                ),
+            }
             rejected.append(signal)
 
     return {"validated": validated, "rejected": rejected}

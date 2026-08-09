@@ -1,9 +1,9 @@
 import type { LucideIcon } from "lucide-react";
 import { Sparkline } from "./Sparkline";
 
-// Stat tile contract: label, value (proportional figures, not tabular — this
-// is a display-size number, not a table column), optional signed delta
-// (color = direction × whether up is good), optional trend sparkline.
+// Stat tile contract: label, value (tabular-nums -- this is a terminal-style
+// ticker figure, values must align vertically), optional signed delta shown
+// inline (not stacked, to keep the strip dense), optional trend sparkline.
 export function StatTile({
   label,
   value,
@@ -29,18 +29,26 @@ export function StatTile({
         : "text-status-critical";
 
   return (
-    <div className="rounded-xl border border-border bg-surface p-4 shadow-card">
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-1.5 text-xs font-medium text-ink-muted">
-          {Icon && <Icon size={14} strokeWidth={2} />}
+    <div className="flex flex-1 items-center justify-between gap-3 px-4 py-2.5">
+      <div className="min-w-0">
+        <div className="flex items-center gap-1.5 text-[10.5px] font-semibold uppercase tracking-wide text-ink-muted">
+          {Icon && <Icon size={11} strokeWidth={2.5} />}
           {label}
         </div>
-        {trend && trend.length > 1 && (
-          <Sparkline values={trend} color={trendColor ?? "var(--cat-1)"} />
-        )}
+        <div className="mt-1 flex items-baseline gap-2">
+          <span className="tabular text-lg font-semibold leading-none text-ink-primary">
+            {value}
+          </span>
+          {delta && (
+            <span className={`tabular text-[11px] font-medium leading-none ${deltaColor}`}>
+              {delta}
+            </span>
+          )}
+        </div>
       </div>
-      <div className="mt-1 text-2xl font-semibold text-ink-primary">{value}</div>
-      {delta && <div className={`mt-0.5 text-xs font-medium ${deltaColor}`}>{delta}</div>}
+      {trend && trend.length > 1 && (
+        <Sparkline values={trend} color={trendColor ?? "var(--cat-1)"} />
+      )}
     </div>
   );
 }

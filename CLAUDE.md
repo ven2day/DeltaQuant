@@ -77,17 +77,18 @@ reference implementation) follows the same resilience pattern — **preserve it 
   `_fallback_*` result instead of raising. The graph must never crash on a bad LLM call.
 - LLM output is JSON; parsing strips ```` ```json ```` / ```` ``` ```` fences and clamps/validates fields.
 
-**Provider selection.** `settings.llm_provider` (`groq`/`gemini`/`deepseek`) selects the LLM
+**Provider selection.** `settings.llm_provider` (`groq`/`gemini`/`deepseek`/`qwen`) selects the LLM
 provider for every agent at once — [llm_factory.py](src/agents/llm_factory.py)'s
 `create_chat_model(model_name, ...)` is the one place that constructs a chat model; agents must
 call it (or `get_llm_limiter()`/`get_llm_circuit_breaker()`/`primary_and_fallback_models()`,
 also there) instead of importing `ChatGroq` directly. Groq stays the validated default; Gemini/
-DeepSeek are additional, cheaper options. Switching `LLM_PROVIDER` **fails closed at startup**
-without the matching API key (`GOOGLE_API_KEY`/`DEEPSEEK_API_KEY`) set — see
-`validate_configuration()` in [settings.py](src/config/settings.py). DeepSeek has no dedicated
-LangChain package; it's reached via `langchain_openai.ChatOpenAI` pointed at its OpenAI-compatible
-`api.deepseek.com` endpoint. FinOps pricing (`src/finops/cost_tracker.py`) has entries for all
-three providers' models in one flat dict (model names don't collide across providers).
+DeepSeek/Qwen are additional, cheaper options. Switching `LLM_PROVIDER` **fails closed at startup**
+without the matching API key (`GOOGLE_API_KEY`/`DEEPSEEK_API_KEY`/`DASHSCOPE_API_KEY`) set — see
+`validate_configuration()` in [settings.py](src/config/settings.py). DeepSeek and Qwen (Alibaba
+Cloud DashScope) have no dedicated LangChain package; both are reached via
+`langchain_openai.ChatOpenAI` pointed at their OpenAI-compatible endpoints (`api.deepseek.com`,
+`settings.qwen_base_url`). FinOps pricing (`src/finops/cost_tracker.py`) has entries for all four
+providers' models in one flat dict (model names don't collide across providers).
 
 **Support-agent state contracts.** The support agents enrich `TradingState` with keys the
 regime/validation agents read; the *types must match* or the enrichment is silently dropped
@@ -184,6 +185,83 @@ sample-smoothed historical win rate per strategy/regime, and `expected_r = p*RR 
 a rank score; `select_diversified_signals()` then applies the sector cap and
 `max_active_stocks`/`llm_review_max_symbols` truncation (skipped entirely when
 `llm_review_all_signals=true`). This is the only shortlisting step before the agent graph.
+
+### Scalp horizon (parallel to swing, additive-only)
+
+A second, independently-governed trade horizon for 5m/15m NSE scalping, gated end-to-end
+behind `settings.scalp_enabled` (default **False** — with it off, behavior is byte-identical
+to before this feature existed). The swing path above is never modified by any of this; every
+scalp module is either new or an additive extension of an existing one.
+
+**Pipeline** (`src/market/scalp_scan.py` `run_scalp_scan()`, called once per cycle from
+`scripts/run_live_trading.py`'s "Step 2b/2c/2d", separately from the swing scan): a **second**
+`SignalEngine` instance (tighter `scalp_stop_loss_pct`/`scalp_target_pct`) runs across the
+**full** `scalp_confirmation_timeframes` set (default `5m,15m,30m,1h,4h` — every role needs its
+own strategy-driven signals, not just the origination timeframe) →
+[signal_consolidation.py](src/market/signal_consolidation.py) `consolidate_signals()` merges
+multiple strategies agreeing on the same symbol+timeframe+direction into one
+`ConsolidatedSignal` (confidence boosted by agreement, capped, never fabricated from
+nothing) → [assessment_matrix.py](src/market/assessment_matrix.py) `build_assessment_matrix()`
+produces one BUY/WAIT/REJECT `TimeframeAssessment` per timeframe, using **that timeframe's own
+locally-inferred regime** (via `signal_ranking.infer_signal_regime`), not one regime label
+collapsed across the whole cycle — a cell can never read "BUY" unless
+[regime_compatibility.py](src/market/regime_compatibility.py) `is_regime_compatible()` says
+that strategy fits that timeframe's own regime, and can never read "BUY" for a SELL-dominant
+cell (this system only ever labels long-only entries) →
+[scalp_confirmation.py](src/market/scalp_confirmation.py) `confirm_multi_timeframe()` checks
+role alignment (5m=execution, 15m=primary, 30m=directional, 1h=context, 4h=optional macro via
+`scalp_macro_filter_enabled`) against `scalp_required_mtf_alignment`, failing closed on any
+timeframe with no data at all (never "assume aligned") →
+[entry_quality.py](src/market/entry_quality.py) `evaluate_entry_quality()` — deterministic
+VWAP/EMA9/ATR-extension/swing-support-resistance/breakout-retest/relative-volume/wick checks
+(reusing [price_geometry.py](src/market/price_geometry.py)'s helpers, kept separate from
+`candidate_policy.py` so the swing path's evaluator is never touched) — returns
+ENTER_NOW/WAIT_PULLBACK/WAIT_BREAKOUT/REJECT plus a preferred entry range → surviving
+candidates become [scalp_opportunity.py](src/market/scalp_opportunity.py) `ScalpOpportunity`
+objects (the one canonical object carried scanner → ranker → agents → UI → execution) →
+`regime_compatibility.filter_regime_compatible()` is a **cost filter only** (never a
+substitute for H-8; it has no import of `StrategyRegistry` at all) run before any LLM call →
+[scalp_ranking.py](src/market/scalp_ranking.py) `rank_scalp_opportunities()` — a **separate**
+weighted formula from swing's `rank_signals()` (`settings.scalp_ranking_weight_*`, validated
+to sum to ~1.0 at startup), not a horizon parameter bolted onto the swing formula.
+
+**H-8 stays fail-closed, extended not bypassed**
+([strategy_registry.py](src/backtesting/strategy_registry.py)): `StrategyVersion` gained
+`timeframe`/`trade_horizon` fields (trailing defaults `""`/`"SWING"`, so every pre-existing
+on-disk artifact loads unchanged and can only ever match a SWING request — it can never
+silently admit a SCALP one). `strategy_selection_node`'s gate and `risk_compliance_node`'s
+check #14 both now pass the cycle's `trade_horizon` through. Scalp survivors are sent through
+the **existing** LangGraph pipeline a second time per cycle (`run_trading_cycle(...,
+trade_horizon="SCALP")`) — zero new graph nodes. `signal_validation.py`'s LLM-unavailable
+fallback threshold (`rr_ratio`/`confidence`) is horizon-selectable
+(`scalp_min_rr`/`scalp_min_confidence`) but ships **numerically equal** to swing's hardcoded
+1.5/0.6 — this only makes the bar parameterizable, it never silently lowers it.
+`RiskLimits.from_settings(trade_horizon=...)` swaps in `scalp_max_position_pct` for check #3
+only; every other check (exposure, daily caps, drawdown, correlation, and H-8 itself) is
+identical regardless of horizon. **No `SCALP`-horizon registry artifact exists until someone
+deliberately runs** `uv run python scripts/validate_strategy.py --interval 5m --trade-horizon
+SCALP` (an operational step, not a code change — see `RealSignalStrategy`'s `timeframe` param
+and `BacktestEngine`'s `interval`-aware Sharpe annualization, both previously hardcoded to
+daily) — until then every scalp candidate fails closed at H-8 with an explicit "no current
+VALIDATED registry artifact" reason, which is the gate working correctly, not a bug.
+
+**Execution** reuses `ExecutionService.submit_async`/`lifecycle_store`/`exit_manager`/`journal`
+exactly as swing does — none of those modules were modified. Position sizing uses
+`scalp_risk_per_trade`/`scalp_max_position_pct` instead of swing's `risk_per_trade`/
+`max_position_pct`; the idempotency key always contains a literal `"scalp"` tag plus the
+horizon-suffixed workflow ID, so a same-cycle, same-symbol swing and scalp entry can never
+collide or be deduplicated against each other. Historical scalp win-rate is looked up under a
+`f"scalp::{strategy}"` namespaced key (`scalp_ranking.scalp_performance_key`) rather than a new
+DB column — this repo has no migration tooling
+(`Base.metadata.create_all()` never alters an existing table, see `src/db/base.py`), so a
+namespaced free-text key is the correct fix for keeping scalp/swing track records from
+colliding, not a schema change.
+
+**Funnel observability**: `dashboard.stats.scalp_funnel` (raw_triggers → consolidated →
+mtf_candidates → entry_quality_passed → regime_compatible → h8_admitted → sent_to_ai →
+ai_approved → execution_accepted) and `scalp_opportunities` (top-ranked, per-cycle) are plain
+`TradingStats` fields, auto-serialized by the existing `stats_to_dict()` — surfaced in the web
+UI's "Scalp Decisions" tab ([ScalpDecisionTable.tsx](web/components/ScalpDecisionTable.tsx)).
 
 ### Quantitative signal discovery (offline research, isolated from execution)
 

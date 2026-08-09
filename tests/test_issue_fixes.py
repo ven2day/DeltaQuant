@@ -26,7 +26,7 @@ from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 
 from src.agents.prediction import PredictionSignal
 from src.agents.risk_compliance import risk_compliance_node
-from src.utils.formatting import fmt_optional
+from src.utils.formatting import fmt_optional, plain_english_fallback_cause
 from src.utils.market_time import IST
 from src.utils.serialization import to_native
 
@@ -136,6 +136,38 @@ def test_fmt_optional_matches_the_indicator_warmup_case() -> None:
     rsi = None  # indicator still in warm-up
     # Bare formatting would raise TypeError here; the helper must not.
     assert f"(RSI: {fmt_optional(rsi, '.1f')})" == "(RSI: N/A)"
+
+
+# ---------------------------------------------------------------------------
+# plain_english_fallback_cause — replaces the old unhelpful "Fallback: Failed
+# rule-based validation" with a reason a non-engineer can actually understand.
+# ---------------------------------------------------------------------------
+
+
+def test_plain_english_fallback_cause_rate_limit() -> None:
+    msg = "Error code: 429 - rate_limit_exceeded on tokens per day (TPD)"
+    assert plain_english_fallback_cause(msg) == "the AI reviewer hit its daily usage limit"
+
+
+def test_plain_english_fallback_cause_circuit_breaker_open() -> None:
+    msg = "Service groq_api unavailable (circuit breaker open). Retry in 30.0s"
+    assert (
+        plain_english_fallback_cause(msg)
+        == "the AI reviewer is temporarily paused after repeated failures"
+    )
+
+
+def test_plain_english_fallback_cause_disabled() -> None:
+    assert (
+        plain_english_fallback_cause("LLM agents disabled via settings")
+        == "AI review is turned off in settings"
+    )
+
+
+def test_plain_english_fallback_cause_unknown_error() -> None:
+    assert (
+        plain_english_fallback_cause("Connection refused") == "the AI reviewer failed unexpectedly"
+    )
 
 
 # ---------------------------------------------------------------------------

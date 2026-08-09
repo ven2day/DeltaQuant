@@ -12,6 +12,7 @@ Features:
 """
 
 import logging
+import math
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
@@ -21,6 +22,30 @@ import pandas as pd
 
 from src.execution.costs import CostModel
 from src.market.historical_feed import HistoricalDataFeed
+
+# NSE cash-market session length (09:15-15:30 IST) in minutes -- the basis for
+# converting an intraday interval into "bars per trading day" for Sharpe
+# annualization (see _annualization_factor).
+_NSE_SESSION_MINUTES = 375
+_MINUTES_PER_INTERVAL: dict[str, int] = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "1h": 60, "4h": 240}
+
+
+def _annualization_factor(interval: str) -> float:
+    """Sharpe annualization factor for ``interval``-bar returns.
+
+    Generalizes the classic ``sqrt(252)`` daily-Sharpe annualization to
+    ``sqrt(252 * bars_per_day)``: daily data has 1 bar/day, so this reduces to
+    exactly ``sqrt(252)`` for every pre-existing caller (interval defaults to
+    ``"1d"``, unrecognized/None also fall back to plain ``sqrt(252)``) -- this is a
+    strict superset of the old behavior, never a change to it. Without this
+    correction, feeding intraday bars into the un-annualized `sqrt(252)` formula
+    would silently overstate Sharpe by sqrt(bars_per_day).
+    """
+    minutes = _MINUTES_PER_INTERVAL.get(interval)
+    if not minutes:
+        return math.sqrt(252)
+    bars_per_day = _NSE_SESSION_MINUTES / minutes
+    return math.sqrt(252 * bars_per_day)
 
 logger = logging.getLogger(__name__)
 
@@ -192,16 +217,24 @@ class BacktestEngine:
         self,
         symbol: str,
         period: str = "1y",
+        interval: str = "1d",
     ) -> pd.DataFrame | None:
-        """Fetch historical data for backtesting."""
+        """Fetch historical data for backtesting.
+
+        ``interval`` defaults to "1d" (daily bars), matching every pre-existing
+        caller's behavior exactly (HistoricalDataFeed.get_historical's own default).
+        Pass e.g. "5m" to fetch intraday bars for a scalp-horizon validation run --
+        see scripts/validate_strategy.py's --interval flag.
+        """
         feed = HistoricalDataFeed(symbols=[symbol])
-        return feed.get_historical(symbol, period=period)
+        return feed.get_historical(symbol, period=period, interval=interval)
 
     def run(
         self,
         strategy: Strategy,
         data: pd.DataFrame,
         symbol: str = "UNKNOWN",
+        interval: str = "1d",
     ) -> BacktestResult:
         """
         Run backtest on historical data.
@@ -210,6 +243,10 @@ class BacktestEngine:
             strategy: Strategy instance
             data: OHLCV DataFrame with DatetimeIndex
             symbol: Stock symbol
+            interval: The actual bar frequency of ``data`` (default "1d", matching
+                every pre-existing caller) -- used only to annualize the Sharpe
+                ratio correctly (see _annualization_factor). Never affects trade
+                logic itself, which already runs bar-by-bar generically.
 
         Returns:
             BacktestResult with metrics
@@ -322,6 +359,7 @@ class BacktestEngine:
             trades=trades,
             equity_curve=equity_curve,
             final_capital=capital,
+            interval=interval,
         )
 
     def _calculate_metrics(
@@ -332,6 +370,7 @@ class BacktestEngine:
         trades: list[Trade],
         equity_curve: list[float],
         final_capital: float,
+        interval: str = "1d",
     ) -> BacktestResult:
         """Calculate performance metrics."""
 
@@ -361,10 +400,11 @@ class BacktestEngine:
         max_drawdown = np.max(drawdown)
         max_drawdown_pct = (max_drawdown / np.max(peak)) * 100 if np.max(peak) > 0 else 0
 
-        # Sharpe Ratio (annualized, assuming 252 trading days)
+        # Sharpe Ratio, annualized for the bar's actual frequency (see
+        # _annualization_factor -- daily bars reduce to exactly the classic sqrt(252)).
         returns = np.diff(equity) / equity[:-1]
         if len(returns) > 1 and np.std(returns) > 0:
-            sharpe = (np.mean(returns) / np.std(returns)) * np.sqrt(252)
+            sharpe = (np.mean(returns) / np.std(returns)) * _annualization_factor(interval)
         else:
             sharpe = 0
 

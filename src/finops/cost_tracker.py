@@ -51,6 +51,11 @@ DEFAULT_GROQ_PRICING: dict[str, tuple[float, float]] = {
     # rate this table does not model -- it uses the standard cache-miss rate)
     "deepseek-chat": (0.27, 1.10),
     "deepseek-reasoner": (0.55, 2.19),
+    # Qwen (Alibaba Cloud DashScope Model Marketplace, confirmed from the console:
+    # $0.32-0.96/M input, $1.28-3.84/M output, tiered by context length -- the
+    # higher/long-context tier is used here since underestimating a per-call cost is
+    # the wrong direction to be wrong in for a spend gate)
+    "qwen3.7-plus": (0.96, 3.84),
 }
 _FALLBACK_PRICING: tuple[float, float] = (0.60, 3.00)
 

@@ -31,7 +31,9 @@ with patch("src.config.get_settings") as mock_get_settings:
     mock_get_settings.return_value = mock_settings
 
 
-def _register_validated_strategy(directory, strategy_name: str) -> None:
+def _register_validated_strategy(
+    directory, strategy_name: str, *, timeframe: str = "", trade_horizon: str = "SWING"
+) -> None:
     """Seed a current VALIDATED H-8 registry artifact for ``strategy_name`` in
     ``directory`` -- test helper for strategy_selection_node's admission gate."""
     from src.backtesting.strategy_registry import StrategyRegistry, build_strategy_version
@@ -44,6 +46,8 @@ def _register_validated_strategy(directory, strategy_name: str) -> None:
         oos_expectancy=2.0,
         oos_return_pct=10.0,
         fold_consistency=0.8,
+        timeframe=timeframe,
+        trade_horizon=trade_horizon,
     )
     StrategyRegistry(directory).register(version)
 
@@ -77,7 +81,30 @@ def test_parse_regime_response():
     assert res["regime"] == MarketRegime.UNKNOWN.value
 
 
-@patch("src.agents.market_regime.create_chat_model")
+def test_parse_regime_response_extracts_bare_json_after_markdown_heading():
+    """Observed from Qwen: a markdown heading before a bare JSON object (no code
+    fence) used to fail to parse entirely, dumping the raw truncated response into
+    the user-facing "reasoning" field. Must now parse the JSON object itself."""
+    content = (
+        "## Market Regime Classification\n"
+        '{"regime": "ranging", "confidence": 0.5, "reasoning": "low ADX"}'
+    )
+    res = _parse_regime_response(content)
+    assert res["regime"] == "ranging"
+    assert res["confidence"] == 0.5
+    assert res["reasoning"] == "low ADX"
+
+
+def test_parse_regime_response_genuine_parse_failure_is_plain_english():
+    """When it genuinely can't be parsed, the reasoning shown to the user must not be
+    a raw dump of the model's output (reads as corrupted data)."""
+    res = _parse_regime_response("not json at all, no braces here")
+    assert res["regime"] == MarketRegime.UNKNOWN.value
+    assert "could not be read" in res["reasoning"]
+    assert "not json at all" not in res["reasoning"]
+
+
+@patch("src.agents.llm_factory.create_chat_model")
 @patch("src.agents.market_regime.get_settings")
 def test_market_regime_node(mock_settings, mock_llm_cls):
     mock_settings.return_value.groq_api_key.get_secret_value.return_value = "token"
@@ -107,7 +134,7 @@ def test_market_regime_node_skips_llm_when_disabled(mock_settings, mock_llm_cls)
     assert result["regime"] == "trending_up"
 
 
-@patch("src.agents.market_regime.create_chat_model")
+@patch("src.agents.llm_factory.create_chat_model")
 def test_market_regime_node_error(mock_llm_cls):
     mock_llm_cls.side_effect = Exception("API Error")
 
@@ -118,7 +145,24 @@ def test_market_regime_node_error(mock_llm_cls):
         result = market_regime_node(state)
 
     assert result["regime"] == "trending_up"
-    assert "fallback" in result["regime_reasoning"].lower()
+    assert "backup rule" in result["regime_reasoning"].lower()
+
+
+@patch("src.agents.llm_factory.create_chat_model")
+def test_market_regime_node_error_reasoning_is_plain_english(mock_llm_cls):
+    """Regression guard: the fallback reasoning used to end with a raw dump of the
+    exception ("... Error: <raw exception str>"). Must be readable prose instead."""
+    mock_llm_cls.side_effect = Exception(
+        "Service qwen_api unavailable (circuit breaker open). Retry in 30.0s"
+    )
+    state = create_initial_state()
+    state["market_data"] = {"A": {"change_percent": 1.0}}
+
+    with patch("src.agents.market_regime.get_settings"):
+        result = market_regime_node(state)
+
+    assert "AI review skipped because" in result["regime_reasoning"]
+    assert "Error: Service qwen_api" not in result["regime_reasoning"]
 
 
 # --- Risk Compliance Tests ---
@@ -261,7 +305,69 @@ def test_parse_validation_response():
     assert len(res["rejected"]) == 1
 
 
-@patch("src.agents.signal_validation.create_chat_model")
+def test_parse_validation_response_extracts_bare_json_after_markdown_heading():
+    signals = [{"signal_id": "1"}]
+    content = '## Validation\n{"validations": [{"signal_id": "1", "decision": "approve"}]}'
+    res = _parse_validation_response(content, signals)
+    assert len(res["validated"]) == 1
+
+
+def test_parse_validation_response_unprocessed_signal_reason_is_plain_english():
+    """A signal the LLM's response never mentioned must not say the bare, unexplained
+    'Not processed' -- must say why it was rejected anyway (missing from the
+    response, not assumed approved)."""
+    signals = [{"signal_id": "1"}, {"signal_id": "2"}]
+    content = '{"validations": [{"signal_id": "1", "decision": "approve"}]}'
+
+    res = _parse_validation_response(content, signals)
+
+    unprocessed = [s for s in res["rejected"] if s["signal_id"] == "2"]
+    assert len(unprocessed) == 1
+    reason = unprocessed[0]["validation"]["reasoning"]
+    assert reason != "Not processed"
+    assert "didn't include a decision" in reason
+
+
+def test_parse_validation_response_genuine_parse_failure_is_plain_english():
+    signals = [{"signal_id": "1"}]
+
+    res = _parse_validation_response("not json at all, no braces here", signals)
+
+    assert len(res["rejected"]) == 1
+    reason = res["rejected"][0]["validation"]["reasoning"]
+    assert reason != "Parse error"
+    assert "could not be read" in reason
+
+
+@patch("src.agents.llm_factory.create_chat_model")
+@patch("src.agents.signal_validation.get_settings")
+def test_signal_validation_node_falls_back_to_secondary_model_on_rate_limit(
+    mock_settings, mock_llm_cls
+):
+    """Same regression guard as strategy_selection's version, for signal_validation_node."""
+    mock_settings.return_value.groq_api_key.get_secret_value.return_value = "token"
+
+    mock_agent_ok = MagicMock()
+    mock_agent_ok.invoke.return_value.content = (
+        '{"validations": [{"signal_id": "1", "decision": "approve"}]}'
+    )
+    mock_llm_cls.side_effect = [
+        Exception("Error code: 429 - rate_limit_exceeded on tokens per day"),
+        mock_agent_ok,
+    ]
+
+    state = create_initial_state()
+    state["signals"] = [{"signal_id": "1"}]
+
+    result = signal_validation_node(state)
+
+    assert mock_llm_cls.call_count == 2
+    assert len(result["validated_signals"]) == 1
+    # Confirms it took the real LLM path, not _fallback_signal_validation.
+    assert result["validated_signals"][0]["signal_id"] == "1"
+
+
+@patch("src.agents.llm_factory.create_chat_model")
 @patch("src.agents.signal_validation.get_settings")
 def test_signal_validation_node(mock_settings, mock_llm_cls):
     mock_settings.return_value.groq_api_key.get_secret_value.return_value = "token"
@@ -278,7 +384,7 @@ def test_signal_validation_node(mock_settings, mock_llm_cls):
     assert len(result["validated_signals"]) == 1
 
 
-@patch("src.agents.signal_validation.create_chat_model")
+@patch("src.agents.llm_factory.create_chat_model")
 @patch("src.agents.signal_validation.get_settings")
 def test_signal_validation_node_skips_llm_when_disabled(mock_settings, mock_llm_cls):
     mock_settings.return_value.enable_llm_agents = False
@@ -290,6 +396,36 @@ def test_signal_validation_node_skips_llm_when_disabled(mock_settings, mock_llm_
 
     mock_llm_cls.assert_not_called()
     assert len(result["validated_signals"]) == 1
+
+
+@patch("src.agents.llm_factory.create_chat_model")
+@patch("src.agents.signal_validation.get_settings")
+def test_fallback_validation_rejection_reason_is_specific_and_plain_english(
+    mock_settings, mock_llm_cls
+):
+    """Regression guard for the generic, unhelpful 'Fallback: Failed rule-based
+    validation' message (gave no indication of why the AI reviewer was skipped or
+    which check the signal actually failed). The new message must name both."""
+    mock_settings.return_value.enable_llm_agents = False
+    state = create_initial_state()
+    state["active_strategies"] = ["mean_reversion"]
+    state["signals"] = [
+        {
+            "signal_id": "1",
+            "strategy": "trend_following",  # not in active_strategies
+            "confidence": 0.9,
+            "risk_reward_ratio": 2.0,
+        }
+    ]
+
+    result = signal_validation_node(state)
+
+    assert len(result["rejected_signals"]) == 1
+    reason = result["rejected_signals"][0]["rejection_reason"]
+    assert "AI review is turned off in settings" in reason
+    assert "trend_following" in reason
+    assert "mean_reversion" in reason
+    assert reason != "Fallback: Failed rule-based validation"
 
 
 # --- Strategy Selection Tests ---
@@ -315,7 +451,7 @@ def test_build_strategy_context_queries_given_namespace(mock_get_tracker):
     mock_get_tracker.assert_called_once_with("mock_simulated")
 
 
-@patch("src.agents.strategy_selection.create_chat_model")
+@patch("src.agents.llm_factory.create_chat_model")
 @patch("src.agents.strategy_selection.get_settings")
 @patch("src.memory.performance_tracker.get_performance_tracker")
 def test_strategy_selection_node_threads_data_namespace_from_state(
@@ -360,7 +496,46 @@ def test_parse_strategy_response_accepts_ema_strategies():
     assert res["active_strategies"] == ["ema_heiken_ashi_rsi", "ema_psar", "ema_cci"]
 
 
-@patch("src.agents.strategy_selection.create_chat_model")
+@patch("src.agents.llm_factory.create_chat_model")
+@patch("src.agents.strategy_selection.get_settings")
+def test_strategy_selection_node_falls_back_to_secondary_model_on_rate_limit(
+    mock_settings, mock_llm_cls, tmp_path
+):
+    """Regression guard: strategy_selection_node (and signal_validation_node, tested
+    separately below) used to call ONLY the primary model -- discarding
+    primary_and_fallback_models()'s second element entirely -- so once Groq's daily
+    token quota on the primary model was exhausted, every call failed straight to the
+    crude rule-based fallback for the rest of the day, even though the secondary model
+    (a different model = a different Groq daily-quota bucket) was still working fine
+    for market_regime and news_analyst. Both nodes now go through
+    llm_factory.invoke_with_fallback, the same retry-on-429 path market_regime always
+    had -- this proves a primary-model 429 no longer skips straight to the fallback
+    rule-based validation."""
+    _register_validated_strategy(tmp_path, "breakout")
+    mock_settings.return_value.groq_api_key.get_secret_value.return_value = "token"
+    mock_settings.return_value.strategy_registry_dir = str(tmp_path)
+
+    mock_agent_ok = MagicMock()
+    mock_agent_ok.invoke.return_value.content = (
+        '{"active_strategies": ["breakout"], "reasoning": "vol"}'
+    )
+    # First create_chat_model() call (primary model) raises a 429; the second
+    # (fallback model) succeeds -- invoke_with_fallback must try both, in order.
+    mock_llm_cls.side_effect = [
+        Exception("Error code: 429 - rate_limit_exceeded on tokens per day"),
+        mock_agent_ok,
+    ]
+
+    state = create_initial_state()
+    result = strategy_selection_node(state)
+
+    assert mock_llm_cls.call_count == 2
+    assert result["active_strategies"] == ["breakout"]
+    # Confirms it took the real LLM path, not _fallback_strategy_selection.
+    assert result["strategy_reasoning"] == "vol"
+
+
+@patch("src.agents.llm_factory.create_chat_model")
 @patch("src.agents.strategy_selection.get_settings")
 def test_strategy_selection_node(mock_settings, mock_llm_cls, tmp_path):
     # H-8: strategy_selection_node now gates its output through the strategy admission
@@ -378,7 +553,7 @@ def test_strategy_selection_node(mock_settings, mock_llm_cls, tmp_path):
     assert result["active_strategies"] == ["breakout"]
 
 
-@patch("src.agents.strategy_selection.create_chat_model")
+@patch("src.agents.llm_factory.create_chat_model")
 @patch("src.agents.strategy_selection.get_settings")
 def test_strategy_selection_node_skips_llm_when_disabled(mock_settings, mock_llm_cls, tmp_path):
     _register_validated_strategy(tmp_path, "momentum")
@@ -392,6 +567,10 @@ def test_strategy_selection_node_skips_llm_when_disabled(mock_settings, mock_llm
 
     mock_llm_cls.assert_not_called()
     assert result["active_strategies"] == ["momentum", "trend_following"]
+    assert "AI review skipped because AI review is turned off in settings" in (
+        result["strategy_reasoning"]
+    )
+    assert "Error:" not in result["strategy_reasoning"]
 
 
 def test_strategy_selection_node_strips_strategies_with_no_registry_entry(tmp_path):
@@ -407,3 +586,28 @@ def test_strategy_selection_node_strips_strategies_with_no_registry_entry(tmp_pa
         result = strategy_selection_node(state)
 
     assert result["active_strategies"] == []
+
+
+def test_strategy_selection_node_is_horizon_aware(tmp_path):
+    """A strategy validated only on SWING must not be admitted for a SCALP-horizon
+    cycle, and a SCALP-horizon-validated strategy must not leak into a SWING cycle --
+    proven through the actual node, not just the registry unit.
+    """
+    _register_validated_strategy(tmp_path, "momentum")  # SWING (default)
+    _register_validated_strategy(tmp_path, "breakout", timeframe="5m", trade_horizon="SCALP")
+
+    with patch("src.agents.strategy_selection.get_settings") as mock_settings:
+        mock_settings.return_value.enable_llm_agents = False
+        mock_settings.return_value.strategy_registry_dir = str(tmp_path)
+
+        swing_state = create_initial_state(trade_horizon="SWING")
+        swing_state["regime"] = "trending_up"
+        swing_result = strategy_selection_node(swing_state)
+
+        scalp_state = create_initial_state(trade_horizon="SCALP")
+        scalp_state["regime"] = "volatile"  # -> fallback default is ["breakout"]
+        scalp_result = strategy_selection_node(scalp_state)
+
+    assert "momentum" in swing_result["active_strategies"]
+    assert "breakout" not in swing_result["active_strategies"]  # SCALP-only artifact
+    assert scalp_result["active_strategies"] == ["breakout"]  # admitted under SCALP
