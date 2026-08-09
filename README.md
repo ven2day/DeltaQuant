@@ -494,28 +494,90 @@ LANGFUSE_SECRET_KEY=sk-...
 
 ```
 DeltaQuant/
-├── scripts/                  # Entry points — see Scripts Reference above
 ├── src/
-│   ├── agents/                # LangGraph nodes: regime, strategy, validation, risk
-│   ├── api/                   # Health checks
-│   ├── backtesting/           # Backtest engine + walk-forward (OOS) validation
-│   ├── config/                 # Centralized pydantic-settings configuration
-│   ├── dashboard/               # Shared TradingStats used by the web backend
-│   ├── db/                      # SQLAlchemy models and column migrations
-│   ├── execution/                # Paper engine, live broker adapter, exit manager
-│   ├── finops/                    # LLM cost tracking, budgets, alerts
-│   ├── market/                     # Quotes, history, indicators, signal ranking
-│   ├── memory/                      # Learn-from-losses feedback loop
-│   ├── notifications/                # Telegram alerts
-│   ├── observability/                 # Optional Langfuse tracing
-│   ├── profit/                         # Risk-bounded profit-goal planner
-│   ├── signal_discovery/                # Quantitative signal-discovery workflow
-│   ├── utils/                            # Rate limiter, circuit breaker, IST market time
-│   └── webui/                             # FastAPI backend for the web dashboard
-├── web/                       # Next.js dashboard frontend
-├── tests/                     # pytest suite
-├── docs/                      # Architecture and design documentation
-└── .env.example               # Full, documented configuration reference
+│   ├── agents/                    # 🧠 The "brain" — LangGraph nodes
+│   │   ├── graph.py                 # Builds the StateGraph, wires conditional edges
+│   │   ├── market_regime.py         # Groq: trending / ranging / volatile classification
+│   │   ├── strategy_selection.py    # Groq: active strategies + H-8 admission gate
+│   │   ├── signal_validation.py     # Groq: filters raw technical signals
+│   │   ├── risk_compliance.py       # Deterministic rules engine — final say on every order
+│   │   ├── news_analyst.py          # Google RSS sentiment scoring
+│   │   ├── sentiment.py             # Market mood index (fear/greed)
+│   │   ├── prediction.py            # scikit-learn short-horizon direction model
+│   │   └── llm_factory.py           # Provider-agnostic chat model + rate limiter/breaker
+│   ├── market/                    # 🌐 Data ingestion, indicators, ranking
+│   │   ├── manager.py               # MarketDataManager — live/simulated auto-switch
+│   │   ├── history_manager.py       # Multi-timeframe OHLCV history
+│   │   ├── dhan_quotes_feed.py      # DhanHQ REST quotes
+│   │   ├── dhan_historical_feed.py  # Paginated Dhan historical candles (90-day API cap)
+│   │   ├── websocket_feed.py        # DhanHQ live WebSocket client
+│   │   ├── simulated_data.py        # Deterministic market simulator (after-hours)
+│   │   ├── signals.py               # SignalEngine — strategy signal generation
+│   │   ├── signal_ranking.py        # ML + outcome-weighted shortlist ranking
+│   │   ├── sizing.py                # Risk-based position sizing (Kelly-aware)
+│   │   └── stock_discovery.py       # Dynamic symbol discovery
+│   ├── execution/                 # ⚡ Order execution
+│   │   ├── service.py               # ExecutionService — idempotent, mode-switched
+│   │   ├── live_executor.py         # Live fill-lifecycle + broker reconciliation
+│   │   ├── paper_engine.py          # Local paper trading (costs, shorts, atomic state)
+│   │   ├── costs.py                 # Slippage + NSE-style fee model
+│   │   ├── exit_manager.py          # Trailing / time / partial exits
+│   │   ├── signal_log.py            # Durable signal-history audit trail
+│   │   └── journal.py               # Durable trade history
+│   ├── finops/                    # 💰 Cost tracking, budgets, alerts
+│   │   ├── cost_tracker.py          # Per-agent, per-day Groq token/cost accounting
+│   │   └── alerts.py                # Budget + risk alerting (logs + Telegram)
+│   ├── profit/                    # 🎯 Profit-target goal engine
+│   │   └── goal_engine.py           # Risk-bounded plan + on/off-pace tracker
+│   ├── backtesting/                # 📈 Strategy testing
+│   │   ├── engine.py                # Backtest runner + compare_results scorecard
+│   │   ├── walk_forward.py          # OOS validation → VALIDATED / NOT VALIDATED verdict
+│   │   └── strategies.py            # RealSignalStrategy (uses the live engine) + others
+│   ├── signal_discovery/           # 🔬 Quantitative signal-discovery workflow
+│   │   ├── workflow.py              # Signal / Code / Eval agent orchestration
+│   │   ├── operators.py             # Allowlisted formula compiler (restricted AST, no exec)
+│   │   ├── evaluator.py             # Cross-sectional Rank-IC evaluation
+│   │   └── live.py                  # Applies accepted formulas as a bounded tilt
+│   ├── memory/                     # 📚 Learn-from-losses feedback loop
+│   │   ├── analyzer.py              # TradeOutcomeAnalyzer
+│   │   ├── classifier.py            # MistakeClassifier
+│   │   ├── injection.py             # MemoryInjector — feeds lessons back into state
+│   │   └── feedback.py              # Closes the loop at trade close
+│   ├── utils/                      # 🔧 Utilities
+│   │   ├── rate_limiter.py          # Token-bucket Groq rate limiting
+│   │   ├── circuit_breaker.py       # Trips on repeated LLM failures
+│   │   ├── market_time.py           # IST (UTC+05:30) market-time helpers
+│   │   └── cache.py                 # TTL cache for news / quotes / sentiment
+│   ├── notifications/               # 📱 Alerts
+│   │   └── telegram.py              # Trade & risk notifications
+│   ├── observability/               # 🔍 Optional tracing
+│   │   └── tracing.py               # Langfuse spans per agent + per cycle
+│   ├── webui/                       # 🖥️ Web dashboard backend
+│   │   ├── server.py                # FastAPI app + WebSocket broadcast hub
+│   │   ├── auth.py                  # Signed-session dashboard login
+│   │   └── candles.py               # OHLCV endpoint for the Charts tab
+│   ├── api/                         # ✅ Health checks
+│   │   └── health.py                # Per-service status for the System Status tab
+│   ├── db/                          # 🗄️ Persistence
+│   │   └── base.py                  # SQLAlchemy engine/session + column migrations
+│   ├── dashboard/                   # 📊 Shared stats model
+│   │   └── stats.py                 # TradingStats dataclass consumed by the web backend
+│   └── config/                      # ⚙️ Configuration
+│       └── settings.py              # pydantic-settings — fails closed on unsafe combos
+├── web/                        # Next.js dashboard frontend
+│   ├── app/page.tsx               # Tab layout (Overview, Charts, Signals, ...)
+│   ├── components/                 # PipelinePanel, TradeChartsPanel, SignalHistoryPanel, ...
+│   └── lib/                        # WebSocket hooks, API client, IST-aware formatting
+├── scripts/                    # 🏃 Entry points — see Scripts Reference above
+│   ├── setup.py                   # Guided one-command setup
+│   ├── run_live_trading.py        # Main application — trading loop + dashboard
+│   ├── validate_strategy.py       # OOS / walk-forward edge validation (H-8 gate)
+│   ├── check_config.py            # Config validator
+│   ├── diagnose_risk.py           # Replays a signal through the risk engine to debug rejections
+│   └── start_all.sh / stop_all.sh # VPS start/stop for backend + frontend
+├── tests/                      # 🧪 pytest suite
+├── docs/                       # 📖 Architecture and design documentation
+└── .env.example                # Full, documented configuration reference
 ```
 
 ## Configuration Notes
