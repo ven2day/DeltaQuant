@@ -47,6 +47,10 @@ does not promise returns, and live order routing is disabled by default (see
 - **Walk-forward strategy admission (H-8 gate)** — a strategy only trades live once it
   clears an out-of-sample, cost-aware `VALIDATED` verdict; unvalidated strategies are
   blocked at both signal validation and the risk engine.
+- **First-class scalping horizon** — a parallel, independently-governed 5m/15m pipeline
+  (multi-timeframe confirmation, deterministic entry-quality checks, its own ranking and
+  risk sizing) that shares the swing path's agent graph and H-8 gate rather than
+  duplicating or loosening it. Off by default; see [Scalping](#scalping-5m15m-trade-horizon).
 - **Self-improving memory** — a closed learn-from-losses loop classifies closed trades into
   lessons and tracks whether acting on them actually helped.
 - **FinOps** — per-agent, per-day Groq token/cost accounting with soft/hard budgets and a
@@ -362,6 +366,115 @@ risk controls. `risk_compliance` is a rules engine, not an LLM, and has final sa
 entry — an LLM response can be unavailable, rate-limited, or malformed, and the graph must
 never crash or silently approve a trade when that happens.
 
+## Scalping (5m/15m Trade Horizon)
+
+Alongside the swing pipeline above (which trades on `15m`–`4h` evidence), DeltaQuant has a
+second, **independently-governed** trade horizon purpose-built for 5-15 minute NSE scalps.
+It is off by default (`SCALP_ENABLED=false`) and, when off, changes nothing about swing
+behavior — every module involved is either new or an additive extension of an existing one.
+
+### Why a separate pipeline, not a flag on the existing one
+
+Scalp and swing candidates need different evidence. Entry timing quality and multi-timeframe
+alignment matter far more on a 5-minute chart than they do for a multi-hour position, while a
+single strategy's long-run historical win rate matters less (regimes shift faster, sample
+sizes are smaller). Rather than bolt a `horizon` parameter onto the existing ranking formula
+and risk rules, scalping gets its **own** ranker, its **own** deterministic entry-quality
+evaluator, and its **own** admission grain in the H-8 registry — while reusing the *same*
+LangGraph agent nodes, the *same* risk-compliance checks, and the *same* execution/journal/
+exit-manager stack the swing path already relies on.
+
+### Pipeline
+
+```mermaid
+flowchart TB
+    SCAN["Scan 5m/15m/30m/1h/4h<br/>(second SignalEngine, tighter stops)"]
+    CONSOL["Consolidate agreeing strategies<br/>per symbol+timeframe+direction"]
+    MATRIX["Assessment matrix<br/>(BUY/WAIT/REJECT per timeframe,<br/>each cell's OWN locally-inferred regime)"]
+    CONFIRM["Multi-timeframe confirmation<br/>(5m=execution 15m=primary 30m=directional<br/>1h=context 4h=optional macro)"]
+    QUALITY["Entry-quality evaluator<br/>(VWAP/EMA9/ATR-extension/<br/>swing S-R/breakout-retest/volume/wicks)"]
+    OPP["ScalpOpportunity"]
+    REGIME_FILTER["Regime pre-filter<br/>(cost filter only, pre-LLM)"]
+    RANK["Scalp ranker<br/>(separate weighted formula)"]
+    GRAPH["Same LangGraph pipeline<br/>trade_horizon=SCALP"]
+    H8{{"H-8 admission<br/>(strategy+timeframe+horizon+regime)"}}
+    RISK["risk_compliance<br/>(scalp position-size cap)"]
+    EXEC["ExecutionService / journal / exit_manager<br/>(unmodified, horizon-tagged idempotency key)"]
+
+    SCAN --> CONSOL --> MATRIX --> CONFIRM --> QUALITY --> OPP
+    OPP --> REGIME_FILTER --> RANK --> GRAPH
+    GRAPH --> H8
+    H8 -->|"no artifact -> REJECT"| END1((End))
+    H8 -->|"admitted"| RISK --> EXEC
+```
+
+Every stage is visible in `dashboard.stats.scalp_funnel` each cycle — raw triggers →
+consolidated → mtf-confirmed → entry-quality-passed → regime-compatible → H-8 admitted →
+sent to AI → AI approved → execution accepted — so "why didn't this symbol trade" is always
+answerable from the dashboard, not a log dive. The web UI's **Scalp Decisions** tab renders
+the live per-symbol 5m/15m/30m/1h matrix, score, entry quality, preferred entry range, stop,
+target, expected R, and final decision.
+
+### H-8 stays fail-closed — extended, never bypassed
+
+The strategy-admission registry's grain grew from just a strategy name to
+**strategy + timeframe + trade_horizon + regime + version**. Every artifact registered before
+this existed defaults to `trade_horizon="SWING"` and an unpinned timeframe, so it keeps
+admitting exactly what it always did — and can **never** match a `SCALP` request. A strategy
+only becomes eligible for live scalp trades once someone deliberately runs:
+
+```bash
+uv run python scripts/validate_strategy.py --interval 5m --trade-horizon SCALP
+```
+
+This walk-forward-validates the strategy on **real 5-minute bars** (previously, the
+validation path silently fetched and labeled everything as daily bars regardless of what was
+requested — fixed alongside this feature) and registers a version admissible only to matching
+`trade_horizon=SCALP` requests. Until that command has been run for a given strategy, every
+scalp candidate for it is rejected at H-8 with an explicit "no current VALIDATED registry
+artifact" reason — that's the gate working correctly, not a bug, and it's the same
+fail-closed backstop check #14 in `risk_compliance` enforces independently of
+`strategy_selection`'s own gate.
+
+### What is and isn't horizon-specific
+
+| Shared with swing, unchanged | Scalp-specific |
+| --- | --- |
+| LangGraph nodes (regime/strategy/validation/risk) | A second ranking formula (`scalp_ranking.py`) |
+| `ExecutionService`, `sizing.py`, journal, exit manager | A deterministic entry-quality evaluator |
+| Kill switch, FinOps budget (shared pool by design) | Tighter position-size cap & stop/target defaults |
+| Idempotency store, lifecycle recovery | A namespaced `scalp::<strategy>` performance-history key |
+
+### Key settings
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `SCALP_ENABLED` | `false` | Master switch for the entire scalp scan/rank/gate pipeline. |
+| `SIGNAL_TIMEFRAMES` | `15m,30m,1h,4h` | Add `5m` here too if you want swing's own scan to also consider 5-minute signals. |
+| `SCALP_CONFIRMATION_TIMEFRAMES` | `5m,15m,30m,1h,4h` | Full role set the assessment matrix is built over. |
+| `SCALP_REQUIRED_MTF_ALIGNMENT` | `3` | Minimum confirming timeframes before a candidate proceeds. |
+| `SCALP_MACRO_FILTER_ENABLED` | `true` | Whether the optional 4h macro-context role participates. |
+| `SCALP_RISK_PER_TRADE` / `SCALP_MAX_POSITION_PCT` | `0.01` / `0.05` | Tighter than swing's `0.02` / `0.10`, matching a 5-15m holding period. |
+| `SCALP_MIN_RR` / `SCALP_MIN_CONFIDENCE` | `1.5` / `0.6` | Fallback-validation bar — shipped equal to swing's hardcoded bar, never silently lower. |
+| `SCALP_MAX_ACTIVE_SYMBOLS` | `5` | Scalp analogue of `MAX_ACTIVE_STOCKS`. |
+
+See `.env.example` for the complete list, including the entry-quality thresholds
+(`SCALP_VWAP_MAX_DISTANCE_PCT`, `SCALP_ATR_EXTENSION_MAX_MULTIPLE`, `SCALP_WICK_RATIO_MAX`, …)
+and the six `SCALP_RANKING_WEIGHT_*` fields (validated at startup to sum to ~1.0).
+
+### Try it
+
+```bash
+# 1. Validate at least one strategy for the SCALP horizon (hits the real Dhan API).
+uv run python scripts/validate_strategy.py --interval 5m --trade-horizon SCALP
+
+# 2. Enable it and run.
+SCALP_ENABLED=true uv run --extra web python scripts/run_live_trading.py
+```
+
+Watch the activity log for `Scalp funnel: ...` lines each cycle, and open the **Scalp
+Decisions** tab in the web dashboard for the live decision table.
+
 ## Quantitative Signal Discovery
 
 An LLM-driven alpha-research loop (Signal / Code / Eval agents, in the spirit of NVIDIA's
@@ -448,6 +561,8 @@ WebSocket + REST API. The Next.js web UI shows:
   activity, and session cost.
 - **Charts** — real NSE candlesticks (IST-aware) with entry/SL/TP overlays and OHLCV.
 - **Sector Movers** / **Scalping Candidates** — cross-sectional screens outside the main loop.
+- **Scalp Decisions** — the live 5m/15m/30m/1h assessment matrix, entry quality, and final
+  decision for every ranked scalp candidate (see [Scalping](#scalping-5m15m-trade-horizon)).
 - **Signal History** — every signal's final disposition (approved / rejected-at-validation /
   rejected-at-risk), with the actual reason, not just a pass/fail flag.
 - **Trade History** — closed paper trades and realized P&L.
@@ -513,9 +628,18 @@ DeltaQuant/
 │   │   ├── websocket_feed.py        # DhanHQ live WebSocket client
 │   │   ├── simulated_data.py        # Deterministic market simulator (after-hours)
 │   │   ├── signals.py               # SignalEngine — strategy signal generation
-│   │   ├── signal_ranking.py        # ML + outcome-weighted shortlist ranking
+│   │   ├── signal_ranking.py        # ML + outcome-weighted shortlist ranking (swing)
 │   │   ├── sizing.py                # Risk-based position sizing (Kelly-aware)
-│   │   └── stock_discovery.py       # Dynamic symbol discovery
+│   │   ├── stock_discovery.py       # Dynamic symbol discovery
+│   │   ├── signal_consolidation.py  # Scalp: merge agreeing strategies per symbol/timeframe
+│   │   ├── assessment_matrix.py     # Scalp: per-timeframe BUY/WAIT/REJECT matrix
+│   │   ├── regime_compatibility.py  # Scalp: deterministic pre-LLM compatibility filter
+│   │   ├── entry_quality.py         # Scalp: deterministic EntryQualityEvaluator
+│   │   ├── scalp_confirmation.py    # Scalp: multi-timeframe confirmation (5m-4h roles)
+│   │   ├── scalp_opportunity.py     # Scalp: ScalpOpportunity canonical domain object
+│   │   ├── scalp_ranking.py         # Scalp: separate weighted ranking formula
+│   │   ├── scalp_scan.py            # Scalp: orchestrates one cycle's full scan->rank pass
+│   │   └── price_geometry.py        # Shared EMA/VWAP/ATR/wick/zigzag-pivot helpers
 │   ├── execution/                 # ⚡ Order execution
 │   │   ├── service.py               # ExecutionService — idempotent, mode-switched
 │   │   ├── live_executor.py         # Live fill-lifecycle + broker reconciliation
