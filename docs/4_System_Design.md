@@ -118,3 +118,38 @@ the agent graph, nothing more. Neither `risk_compliance.py`'s checks nor
 formula has no path to change a stop-loss, a position size, or a risk-gate
 outcome. This is a hard boundary, not a convention — treat any change that
 threads a discovery-derived value into either of those two as a regression.
+
+## Scalp Horizon: A Separate Pipeline, Not A Flag
+
+Scalp (5m/15m) and swing (15m-4h) candidates need different evidence. Entry timing quality
+and multi-timeframe alignment matter far more on a 5-minute chart than a multi-hour one,
+while a single strategy's long-run historical win rate matters less — scalp regimes shift
+faster and sample sizes are smaller. Rather than add a `horizon` parameter to the existing
+`rank_signals()` formula and risk thresholds, scalping gets its own ranker
+(`scalp_ranking.py`), its own deterministic entry-timing evaluator (`entry_quality.py`), and
+its own weighted formula — while reusing the *same* LangGraph nodes, the *same*
+`risk_compliance` checks, and the *same* execution/journal/exit-manager stack swing already
+relies on. A candidate that reaches the agent graph looks like an ordinary signal dict either
+way; only a `trade_horizon` tag distinguishes which ruleset governs it.
+
+This has a direct consequence for the H-8 admission gate: **the registry's grain had to grow
+with it.** Before this feature, `StrategyVersion` was keyed on strategy name alone (plus an
+unused `approved_regimes` field) — one `trend_following` artifact covered every timeframe
+indiscriminately, and (a separate, pre-existing gap this work also fixed) every artifact was
+honestly validated only on daily bars regardless of what interval a caller nominally
+requested. The registry now carries `timeframe` and `trade_horizon` alongside `strategy_name`
+and `regime`. Every artifact registered before this field existed defaults to
+`trade_horizon="SWING"` with an unpinned timeframe — it keeps admitting exactly what it
+always did, and structurally cannot match a `SCALP` request. The strategy-admission check
+(H-8, `risk_compliance.py`'s check #14) and `strategy_selection.py`'s own gate both now read
+the signal's `timeframe`/`trade_horizon` before consulting the registry, so a strategy proven
+only on swing/daily data can never silently admit a 5m scalp trade just because the strategy
+name matches.
+
+**Regime pre-filtering is a cost optimization, never an admission decision.** A deterministic
+strategy/regime compatibility table filters obviously-mismatched candidates (e.g. a
+mean-reversion strategy in a strongly trending regime) before spending an LLM call reviewing
+them. That module has no import of `StrategyRegistry` at all — it structurally cannot be
+"optimized" into replacing H-8, because it has no path to the registry to begin with. A
+regime-compatible candidate still has to independently clear admission and every
+`risk_compliance` check exactly like any other signal.

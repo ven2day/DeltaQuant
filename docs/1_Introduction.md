@@ -81,3 +81,9 @@ The system supports data ingestion, technical signals, bounded LLM review,
 local paper execution, a web dashboard, learning from closed trades, and
 operational controls. It does not guarantee signal quality, execution quality,
 or investment performance.
+
+A second, independently-governed 5m/15m scalping horizon runs alongside the swing
+workflow described above, off by default (`SCALP_ENABLED=false`) and sharing the same
+fail-closed admission and risk boundaries — see [High-Level
+Design](2_High_Level_Design.md#scalp-horizon-parallel-pipeline) and [System Design
+Decisions](4_System_Design.md#scalp-horizon-a-separate-pipeline-not-a-flag).

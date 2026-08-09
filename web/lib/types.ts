@@ -1,5 +1,5 @@
 // Mirrors `stats_to_dict()` (src/webui/schema.py) which serializes
-// `TradingStats` (src/dashboard/cli.py) 1:1, plus its three computed properties.
+// `TradingStats` (src/dashboard/stats.py) 1:1, plus its three computed properties.
 
 export interface Position {
   symbol: string;

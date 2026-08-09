@@ -14,6 +14,14 @@ The loop is split into two concerns:
 - **Startup:** instrument-master resolution, historical cache loading, durable
   state recovery, optional web server, sector movers, and scalping screener.
 
+When `SCALP_ENABLED=true`, each cycle also runs a second, self-contained scan/rank/gate/
+execute pass for the scalp horizon (`src/market/scalp_scan.py`'s `run_scalp_scan()`, called
+from the cycle body rather than being inline in this file, specifically so it's unit-testable
+without the whole live-session object graph). It shares the swing scan's quote/history
+plumbing but instantiates its own `SignalEngine` (tighter stops/targets) and invokes the same
+LangGraph pipeline a **second** time per cycle with `trade_horizon="SCALP"` — see [High-Level
+Design](2_High_Level_Design.md#scalp-horizon-parallel-pipeline).
+
 ## Core Contracts
 
 ### Market quote
@@ -82,6 +90,7 @@ per symbol. Unchanged ranked signal sets skip duplicate Groq/news review.
 | `validated_signals`, `rejected_signals` | Validation agent | Risk agent and signal log |
 | `approved_trades`, `risk_rejected` | Risk engine | Execution and audit |
 | `errors` | Any graph stage | Fail-closed execution guard |
+| `trade_horizon` | Runtime loop (`"SWING"` default, `"SCALP"` for the second per-cycle invocation) | Strategy-selection's H-8 gate, risk_compliance's admission check and position-size cap |
 
 `run_trading_cycle()` coerces values to native Python types before checkpointing
 so pandas and NumPy scalar values do not cross the msgpack boundary.
@@ -133,6 +142,10 @@ considered signal and the reason it was rejected or approved.
 | Risk | long-only, position size, daily loss, drawdown, sector exposure |
 | Execution | trading mode, execution mode, live-order opt-in |
 | Operations | web host/port, CORS, Telegram, Langfuse tracing |
+| Scalp horizon | `SCALP_ENABLED`, confirmation timeframes/alignment, scalp-specific risk sizing and entry-quality thresholds, ranker weights |
 
 Configuration validation emits warnings for unsafe combinations; it does not
-silently change an execution mode.
+silently change an execution mode. The scalp ranker weights are one such
+warned-not-failed check: `validate_configuration()` warns if the six
+`SCALP_RANKING_WEIGHT_*` fields don't sum to ~1.0, the same severity as its other
+benign cross-field sanity checks.

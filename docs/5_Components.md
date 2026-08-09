@@ -23,6 +23,15 @@
 | `sector_movers.py` | Background sector mover scan. |
 | `scalping_screener.py` | Background swing-pattern scan; informational, separate from investment entries. |
 | `stock_discovery.py` | Loads the configured CSV universe (`discovery.universe`); the news/mover-based `discover()` narrowing is no longer called from the live loop, kept for `scripts/backfill_signal_history.py` and `scripts/validate_strategy.py`. |
+| `price_geometry.py` | Shared EMA/session-VWAP/ATR%/wick-ratio/zigzag-pivot helpers used by the scalp entry-quality evaluator, kept separate from `candidate_policy.py` so the swing evaluation path is never touched. |
+| `signal_consolidation.py` | **Scalp.** Merges multiple strategies agreeing on the same symbol+timeframe+direction into one confidence-boosted `ConsolidatedSignal`, gated by `ENABLE_SIGNAL_CONSOLIDATION`. |
+| `assessment_matrix.py` | **Scalp.** Builds one BUY/WAIT/REJECT `TimeframeAssessment` per symbol/timeframe, using that timeframe's own locally-inferred regime (not one label collapsed across the cycle). |
+| `regime_compatibility.py` | **Scalp.** Deterministic strategy/regime compatibility table + pre-LLM cost filter — never a substitute for the H-8 admission gate. |
+| `entry_quality.py` | **Scalp.** `EntryQualityEvaluator` — deterministic VWAP/EMA9/ATR-extension/swing-support-resistance/breakout-retest/volume/wick checks; returns ENTER_NOW/WAIT_PULLBACK/WAIT_BREAKOUT/REJECT plus a preferred entry range. |
+| `scalp_confirmation.py` | **Scalp.** Multi-timeframe confirmation across the 5m=execution/15m=primary/30m=directional/1h=context/4h=optional-macro roles. |
+| `scalp_opportunity.py` | **Scalp.** `ScalpOpportunity` — the canonical domain object carried scanner → ranker → agents → UI → execution. |
+| `scalp_ranking.py` | **Scalp.** A separate weighted ranking formula from `signal_ranking.py`'s (entry quality, MTF alignment, volume, regime, `scalp::`-namespaced historical expectancy, ML probability). |
+| `scalp_scan.py` | **Scalp.** Orchestrates one cycle's full scan → consolidate → matrix → confirm → entry-quality → rank pass; extracted standalone (not inline in `run_live_trading.py`) so it's unit-testable without the whole live-session object graph. |
 
 ## `src/signal_discovery`
 

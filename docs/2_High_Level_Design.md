@@ -139,11 +139,40 @@ degraded agent result is logged and prevents new paper or broker entries.
 `ALLOW_LIVE_ORDERS=false` is a master safety gate. A setting that names a live
 mode is insufficient on its own to submit broker orders.
 
+## Scalp Horizon (Parallel Pipeline)
+
+A second, independently-governed 5m/15m pipeline runs alongside the swing pipeline above,
+gated behind `SCALP_ENABLED` (default off). It reuses the same LangGraph nodes and the same
+execution/journal/exit-manager stack, but has its own scan, its own ranking formula, and its
+own deterministic entry-timing evaluator:
+
+```mermaid
+flowchart LR
+    A2[All configured symbols] --> B2[Scan 5m, 15m, 30m, 1h, 4h]
+    B2 --> C2[Consolidate agreeing strategies]
+    C2 --> D2[Per-timeframe BUY/WAIT/REJECT matrix]
+    D2 --> E2[Multi-timeframe confirmation]
+    E2 --> F2[Deterministic entry-quality evaluator]
+    F2 --> G2[ScalpOpportunity]
+    G2 --> H2[Regime pre-filter, cost only]
+    H2 --> I2[Scalp ranker]
+    I2 --> J[Same agent graph, trade_horizon=SCALP]
+    J --> K[H-8 admission: strategy+timeframe+horizon+regime]
+    K --> L[Same risk and execution gates]
+```
+
+The H-8 strategy-admission registry gained real grain for this — **strategy + timeframe +
+trade_horizon + regime + version** instead of just a strategy name — so a strategy validated
+only on swing/daily bars can never silently admit a scalp trade. No `SCALP`-horizon artifact
+exists until `scripts/validate_strategy.py --interval 5m --trade-horizon SCALP` is run
+deliberately; until then every scalp candidate fails closed at admission.
+
 ## Operations
 
 The FastAPI backend publishes current dashboard state and durable history. The
 Next.js frontend renders account state, positions, signal history, trade
-history, sector movers, scalping candidates, activity, and system health.
+history, sector movers, scalping candidates, the scalp decision matrix,
+activity, and system health.
 
 Langfuse tracing is optional. An observability outage is an observability
 issue, not a reason to fabricate data or bypass execution safety.
