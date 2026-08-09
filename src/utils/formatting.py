@@ -30,3 +30,23 @@ def fmt_optional(value: Any, spec: str = "", default: str = "N/A") -> str:
         return format(value, spec)
     except (TypeError, ValueError):
         return default
+
+
+def plain_english_fallback_cause(error_msg: str) -> str:
+    """Translate a raw agent-fallback exception string into a one-line, human-readable
+    reason an LLM node was skipped this cycle.
+
+    Shared by every place that surfaces *why* a node degraded to its rule-based/
+    heuristic fallback (signal_validation.py's rejection reasons, the dashboard's
+    agent_fallback_notice) -- previously each showed the raw exception (or nothing at
+    all), which read as an unexplained error even though the cause is fully knowable
+    from the message text (a Groq daily quota, an open circuit breaker, etc.).
+    """
+    lower = error_msg.lower()
+    if "circuit breaker" in lower or "unavailable" in lower:
+        return "the AI reviewer is temporarily paused after repeated failures"
+    if "rate_limit" in lower or "429" in lower or "quota" in lower:
+        return "the AI reviewer hit its daily usage limit"
+    if "disabled via settings" in lower:
+        return "AI review is turned off in settings"
+    return "the AI reviewer failed unexpectedly"

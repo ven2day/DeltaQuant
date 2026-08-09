@@ -48,8 +48,11 @@ from src.execution.signal_log import SignalLogger, SignalRecord
 from src.finops import get_alert_manager, get_cost_tracker
 from src.market.candidate_policy import CandidateAction, evaluate_long_candidate
 from src.market.history_manager import HistoryManager
-from src.market.indicators import Timeframe, get_indicator_cache
+from src.market.indicators import IndicatorResult, Timeframe, get_indicator_cache
 from src.market.manager import MarketDataManager, is_market_open
+from src.market.scalp_ranking import scalp_performance_key
+from src.market.scalp_scan import run_scalp_scan
+from src.market.signal_consolidation import consolidate_signals
 from src.market.signal_ranking import rank_signals, select_diversified_signals
 from src.market.signals import SignalEngine
 from src.market.sizing import calculate_position_size
@@ -70,7 +73,7 @@ from src.signal_discovery.live import DiscoveredSignalScorer
 from src.signal_discovery.operators import build_ohlcv_panel
 from src.signal_discovery.scheduler import AutomaticDiscoveryScheduler
 from src.signal_discovery.store import DiscoveredSignalStore
-from src.utils.formatting import fmt_optional
+from src.utils.formatting import fmt_optional, plain_english_fallback_cause
 from src.utils.market_time import is_trading_window
 
 console = Console()
@@ -342,6 +345,22 @@ async def run_live_trading():
         mean_reversion_stop_loss_pct=settings.mean_reversion_stop_loss_pct,
         mean_reversion_target_pct=settings.mean_reversion_target_pct,
     )
+    # A SEPARATE SignalEngine instance for the scalp horizon (settings.scalp_enabled) --
+    # tighter stop/target sizing than swing, matching a 5-15m holding period. The swing
+    # `signal_engine` above is never touched or shared; this exists purely additively.
+    scalp_signal_engine = SignalEngine(
+        default_stop_loss_pct=settings.scalp_stop_loss_pct,
+        default_target_pct=settings.scalp_target_pct,
+        mean_reversion_stop_loss_pct=settings.mean_reversion_stop_loss_pct,
+        mean_reversion_target_pct=settings.mean_reversion_target_pct,
+    )
+    # Full role set the scalp assessment matrix/confirmation is built over (req 10:
+    # 5m=execution, 15m=primary, 30m=directional, 1h=context, 4h=optional macro).
+    scalp_confirmation_timeframes = parse_signal_timeframes(settings.scalp_confirmation_timeframes)
+    # Subset eligible to actually originate/anchor a new ScalpOpportunity (typically
+    # just 5m -- the execution timeframe); the rest of scalp_confirmation_timeframes
+    # only contributes confirmation context, never originates a candidate on its own.
+    scalp_origin_timeframes = parse_signal_timeframes(settings.scalp_signal_timeframes)
     prediction_agent = PredictionAgent()
     discovery_timeframes = parse_signal_timeframes(settings.signal_discovery_timeframes)
     discovered_signal_scorers: dict[Timeframe, DiscoveredSignalScorer] = {}
@@ -827,6 +846,9 @@ async def run_live_trading():
         """
         nonlocal last_review_fingerprint
 
+        dashboard.set_cycle_stage("exits", "Checking exits on open positions", cycle=cycle)
+        await refresh_dashboard()
+
         # Advance one authoritative 5-minute event before any exit, signal, or chart
         # reads simulated state. Quotes and all aggregate timeframes stay synchronized.
         if not is_live:
@@ -976,6 +998,7 @@ async def run_live_trading():
         # ── Step 1: Refresh market data ────────────────────────
         # Pull fresh quotes for the active source every cycle. (Previously yfinance was
         # fetched once at startup and frozen; only the websocket push updated live.)
+        dashboard.set_cycle_stage("market_data", "Refreshing market quotes")
         quotes = market_manager.get_all_quotes()
         dashboard.update_market_data({s: q.to_dict() for s, q in quotes.items()})
 
@@ -1009,6 +1032,9 @@ async def run_live_trading():
                     f"Stale data ({freshest_age:.0f}s old) — skipping trading this cycle",
                     "WARNING",
                 )
+                dashboard.set_cycle_stage(
+                    "stale_data", f"Skipping cycle — data is {freshest_age:.0f}s stale"
+                )
                 for _ in range(15):
                     await asyncio.sleep(1)
                     await refresh_dashboard()
@@ -1018,6 +1044,7 @@ async def run_live_trading():
         # Run every configured strategy/timeframe across every quoted universe symbol.
         # This is local computation plus broker history; no LLM tokens are spent here.
         scan_symbols = [symbol for symbol in trading_symbols if symbol in quotes]
+        dashboard.set_cycle_stage("scanning", f"Scanning {len(scan_symbols)} symbols for signals")
         indicators_by_symbol: dict[str, dict[Timeframe, Any]] = {}
         raw_signals = []
         for index, symbol in enumerate(scan_symbols, start=1):
@@ -1051,6 +1078,380 @@ async def run_live_trading():
                     f"{len(raw_signals)} raw signals",
                     "INFO",
                 )
+                dashboard.set_cycle_stage(
+                    "scanning",
+                    f"Scanning symbols ({index}/{len(scan_symbols)}) — "
+                    f"{len(raw_signals)} raw signals so far",
+                )
+                await refresh_dashboard()
+
+        # ── Step 2b: Scalp horizon scan (VISIBILITY ONLY) ──────
+        # Gated entirely by settings.scalp_enabled (default False). Produces
+        # dashboard.stats.scalp_opportunities/scalp_funnel for observability; the
+        # actual scan/rank logic lives in src/market/scalp_scan.py (kept out of this
+        # closure so it's unit-testable without the whole live-session object
+        # graph). Never invokes the agent graph and never calls execution_service --
+        # structurally cannot place a trade. H-8 admission and execution are wired
+        # in later stages (see CLAUDE.md "Scalp horizon"). The swing scan above
+        # (signal_engine, raw_signals, indicators_by_symbol) is completely
+        # untouched by this block.
+        if settings.scalp_enabled:
+            dashboard.set_cycle_stage(
+                "scalp_scanning", f"Scalp scan: {len(scan_symbols)} symbols"
+            )
+            # Last cycle's LLM-classified regime (this cycle's own classification
+            # doesn't exist yet -- the agent graph hasn't run). Used only for the
+            # assessment matrix's divergence note and as filter_regime_compatible's
+            # log label; the actual per-cell compatibility gate always uses that
+            # cell's OWN locally-inferred regime (see assessment_matrix.py), never
+            # this one. "unknown" on a cold start is handled permissively by
+            # is_regime_compatible.
+            scalp_cycle_regime = getattr(dashboard.stats, "current_regime", "") or "unknown"
+
+            async def _fetch_scalp_indicators(
+                symbol: str, tf: Timeframe
+            ) -> IndicatorResult | None:
+                # Relies on HistoryManager's/get_indicator_cache()'s existing TTL
+                # caching: every timeframe here except 5m is also fetched by the
+                # swing scan above in the same cycle, so this is a cache hit, not a
+                # duplicate Dhan call, for 15m/30m/1h/4h.
+                return await asyncio.to_thread(
+                    calculate_real_indicators, history_manager, symbol, tf
+                )
+
+            async def _fetch_scalp_5m_frame(symbol: str) -> Any:
+                return await asyncio.to_thread(
+                    history_manager.get_multi_timeframe_history, symbol, Timeframe.M5, 240
+                )
+
+            scalp_opportunities, scalp_funnel = await run_scalp_scan(
+                scan_symbols,
+                settings=settings,
+                scalp_signal_engine=scalp_signal_engine,
+                scalp_confirmation_timeframes=scalp_confirmation_timeframes,
+                scalp_origin_timeframes=scalp_origin_timeframes,
+                scalp_cycle_regime=scalp_cycle_regime,
+                performance_tracker=perf_tracker,
+                fetch_indicators=_fetch_scalp_indicators,
+                fetch_5m_frame=_fetch_scalp_5m_frame,
+            )
+            dashboard.stats.scalp_funnel = scalp_funnel
+            dashboard.stats.scalp_opportunities = [o.to_dict() for o in scalp_opportunities]
+            dashboard.stats.log_activity(
+                "Scalp funnel: "
+                f"{scalp_funnel['raw_triggers']} raw triggers -> "
+                f"{scalp_funnel['consolidated']} consolidated -> "
+                f"{scalp_funnel['mtf_candidates']} mtf-confirmed -> "
+                f"{scalp_funnel['entry_quality_passed']} entry-quality-passed -> "
+                f"{scalp_funnel['regime_compatible']} regime-compatible "
+                f"({len(scalp_opportunities)} ranked, top {settings.scalp_max_active_symbols})",
+                "SUCCESS",
+            )
+            await refresh_dashboard()
+
+        # ── Step 2c: Scalp horizon agent review ────────────────
+        # First point a scalp trade could actually be approved -- still NOT
+        # executed here (see Stage 12/CLAUDE.md "Scalp horizon"). Reuses the exact
+        # same LangGraph pipeline as swing (strategy_selection_node/
+        # signal_validation_node/risk_compliance_node), invoked a SECOND time this
+        # cycle with trade_horizon="SCALP" threaded through state so H-8 admission
+        # (Stage 2) and risk limits (Stage 11) use the SCALP grain, never the
+        # swing one. Shares the same FinOps daily budget pool as swing, by design
+        # (see FinOps spend gate below) -- a busy scalp cycle can exhaust today's
+        # LLM budget faster than swing alone; that's a product tradeoff, not a
+        # missing gate.
+        if settings.scalp_enabled and scalp_opportunities:
+            scalp_cost_tracker = get_cost_tracker()
+            if scalp_cost_tracker.is_over_hard_budget():
+                dashboard.stats.log_activity(
+                    "FinOps HARD budget reached — skipping scalp agent review this cycle",
+                    "WARNING",
+                )
+            else:
+                scalp_signal_payloads = [o.to_signal_dict() for o in scalp_opportunities]
+                dashboard.stats.scalp_funnel["sent_to_ai"] = len(scalp_signal_payloads)
+
+                scalp_symbols = {o.symbol for o in scalp_opportunities}
+                scalp_market_data = {
+                    s: quotes[s].to_dict() for s in scalp_symbols if s in quotes
+                }
+                scalp_workflow_id = (
+                    f"LIVE-{datetime.now().strftime('%Y%m%d%H%M%S')}-{cycle}-scalp"
+                )
+                scalp_portfolio = {
+                    "capital": paper_engine.get_balance(),
+                    "positions": [p.to_dict() for p in paper_engine.get_positions()],
+                }
+                scalp_daily_stats = daily_risk_store.get_today()
+                scalp_daily_stats["simulation_mode"] = (
+                    simulated_session or market_manager.data_source == "simulated"
+                )
+
+                dashboard.set_cycle_stage(
+                    "scalp_ai_review",
+                    f"Scalp AI review: {len(scalp_signal_payloads)} candidate(s)",
+                )
+                await refresh_dashboard()
+
+                scalp_final_state = await run_trading_cycle(
+                    graph=graph,
+                    market_data=scalp_market_data,
+                    indicators={},
+                    signals=scalp_signal_payloads,
+                    memory_lessons=[],
+                    portfolio=scalp_portfolio,
+                    daily_stats=scalp_daily_stats,
+                    thread_id=scalp_workflow_id,
+                    data_namespace=data_namespace,
+                    trade_horizon="SCALP",
+                )
+
+                scalp_validated = scalp_final_state.get("validated_signals", [])
+                scalp_approved = scalp_final_state.get("approved_trades", [])
+                scalp_risk_rejected = scalp_final_state.get("risk_rejected", [])
+                dashboard.stats.scalp_funnel["ai_approved"] = len(scalp_approved)
+                for rejected_scalp_signal in scalp_risk_rejected:
+                    failures = rejected_scalp_signal.get("risk_result", {}).get("failures", [])
+                    reason = failures[0].get("message") if failures else "risk rules"
+                    dashboard.stats.log_activity(
+                        f"SCALP RISK BLOCKED: {rejected_scalp_signal.get('symbol')} "
+                        f"[{rejected_scalp_signal.get('timeframe', 'N/A')}] — {reason}",
+                        "WARNING",
+                    )
+                dashboard.stats.log_activity(
+                    f"Scalp AI review: {len(scalp_validated)} validated, "
+                    f"{len(scalp_approved)} approved, {len(scalp_risk_rejected)} risk-rejected",
+                    "SUCCESS" if scalp_approved else "INFO",
+                )
+                await refresh_dashboard()
+
+                # ── Step 2d: Execute AI-approved scalp trades ──────
+                # Reuses the exact same execution_service/lifecycle_store/
+                # exit_manager/journal call sites swing's Step 7 uses below,
+                # unmodified -- only the idempotency key, position sizing
+                # (scalp_risk_per_trade/scalp_max_position_pct), and a
+                # `trade_horizon` tag differ. Portfolio-wide aggregate limits
+                # (max_total_exposure_pct, max_concurrent_positions, the daily
+                # entry cap) are the SAME shared settings swing uses -- only the
+                # per-trade risk sizing is horizon-specific; scalp trades count
+                # against the same daily cap and exposure budget as swing, they
+                # don't get a separate, additive risk allowance.
+                scalp_reservations = PaperRiskReservations()
+                for trade in scalp_approved:
+                    symbol = trade.get("symbol", "N/A")
+                    side = trade.get("signal_type", "BUY").upper()
+
+                    if settings.long_only and side == "SELL":
+                        dashboard.stats.log_activity(
+                            f"LONG-ONLY: ignoring new scalp SELL signal for {symbol}", "INFO"
+                        )
+                        continue
+
+                    if settings.circuit_guard_enabled:
+                        q = quotes.get(symbol)
+                        if q is not None and is_circuit_locked(
+                            q.change_percent, settings.default_circuit_band_pct
+                        ):
+                            dashboard.stats.log_activity(
+                                f"CIRCUIT LOCKED: skipping scalp {symbol} "
+                                f"({q.change_percent:+.1f}%)",
+                                "WARNING",
+                            )
+                            continue
+
+                    quoted_price = float(market_prices.get(symbol, 0.0) or 0.0)
+                    reviewed_entry = float(trade.get("entry_price", 0.0) or 0.0)
+                    stop_loss = float(trade.get("stop_loss", 0.0) or 0.0)
+                    target_price = float(trade.get("target_price", 0.0) or 0.0)
+                    strategy = str(trade.get("strategy", "unknown"))
+                    if reviewed_entry <= 0 or quoted_price <= 0:
+                        dashboard.stats.log_activity(
+                            f"WAIT: scalp {symbol} has no exact reviewed/current price",
+                            "WARNING",
+                        )
+                        continue
+                    if abs(quoted_price - reviewed_entry) / reviewed_entry > 0.001:
+                        dashboard.stats.log_activity(
+                            f"WAIT: scalp {symbol} moved after review; exact approval is stale",
+                            "WARNING",
+                        )
+                        continue
+                    requested_price = reviewed_entry
+                    expected_fill = paper_engine.cost_model.fill_price(requested_price, side)
+
+                    if expected_fill > 0 and 0 < stop_loss < expected_fill < target_price:
+                        win_rate = perf_tracker.get_strategy_performance(
+                            scalp_performance_key(strategy), scalp_cycle_regime
+                        ).win_rate
+                        sizing = calculate_position_size(
+                            capital=paper_engine.get_total_value(),
+                            entry_price=expected_fill,
+                            stop_loss=stop_loss,
+                            target_price=target_price,
+                            risk_per_trade=settings.scalp_risk_per_trade,
+                            max_position_pct=settings.scalp_max_position_pct,
+                            win_rate=win_rate,
+                        )
+                        quantity = sizing.shares
+                    else:
+                        quantity = 0
+
+                    scalp_final_order = FinalPaperOrder(
+                        symbol=symbol,
+                        side=side,
+                        quantity=quantity,
+                        entry_price=expected_fill,
+                        stop_loss=stop_loss,
+                        target_price=target_price,
+                        strategy=strategy,
+                    )
+                    current_daily = daily_risk_store.get_today()
+                    scalp_final_risk = scalp_reservations.evaluate(
+                        scalp_final_order,
+                        positions=paper_engine.get_positions(),
+                        equity=paper_engine.get_total_value(),
+                        entries_today=int(current_daily["trades_count"]),
+                        daily_entry_cap=min(
+                            settings.max_daily_trades, settings.paper_daily_entry_cap
+                        ),
+                        max_positions=settings.max_concurrent_positions,
+                        max_position_pct=settings.scalp_max_position_pct,
+                        max_total_exposure_pct=settings.max_total_exposure_pct,
+                        risk_per_trade=settings.scalp_risk_per_trade,
+                        max_total_risk=settings.max_total_risk,
+                    )
+                    if not scalp_final_risk.approved:
+                        dashboard.stats.log_activity(
+                            f"FINAL RISK BLOCKED: scalp {symbol} — {scalp_final_risk.reasons[0]}",
+                            "WARNING",
+                        )
+                        continue
+                    scalp_reservations.reserve(scalp_final_order)
+
+                    scalp_signal_id = str(trade.get("signal_id", ""))
+                    # "scalp" in the key (plus the already-scalp-suffixed
+                    # scalp_workflow_id) guarantees this can never collide with a
+                    # same-cycle, same-symbol SWING entry's idempotency key --
+                    # the two horizons are always distinguishable, never silently
+                    # deduplicated against each other.
+                    scalp_idempotency_key = (
+                        f"{data_namespace}:{scalp_workflow_id}:{scalp_signal_id}:"
+                        f"{symbol}:scalp:entry"
+                    )
+                    scalp_trade_id = lifecycle_store.new_trade_id()
+                    lifecycle_store.create_intent(
+                        namespace=data_namespace,
+                        run_id=run_id,
+                        workflow_id=scalp_workflow_id,
+                        idempotency_key=scalp_idempotency_key,
+                        signal_id=scalp_signal_id,
+                        symbol=symbol,
+                        side=side,
+                        strategy=strategy,
+                        timeframe=str(trade.get("timeframe", "")),
+                        quantity=quantity,
+                        entry_price=expected_fill,
+                        stop_loss=stop_loss,
+                        target_price=target_price,
+                        rationale=list(trade.get("reasons", [])),
+                        context={
+                            "trade_horizon": "SCALP",
+                            "regime": scalp_final_state.get("regime", "unknown"),
+                            "regime_confidence": scalp_final_state.get("regime_confidence", 0),
+                            "validation": trade.get("validation", {}),
+                            "risk_result": trade.get("risk_result", {}),
+                        },
+                        active_lessons=[],
+                        trade_id=scalp_trade_id,
+                    )
+
+                    result = await execution_service.submit_async(
+                        symbol=symbol,
+                        side=side,
+                        quantity=quantity,
+                        price=requested_price,
+                        idempotency_key=scalp_idempotency_key,
+                        trade_id=scalp_trade_id,
+                        position_id=scalp_trade_id,
+                        stop_loss=stop_loss,
+                        target_price=target_price,
+                        strategy=strategy,
+                        reason="entry",
+                        entry_data_source=(
+                            "simulated" if market_manager.data_source == "simulated" else "real"
+                        ),
+                    )
+                    scalp_reservations.release(scalp_final_order)
+
+                    if result.is_duplicate:
+                        dashboard.stats.log_activity(
+                            f"DUPLICATE suppressed: scalp {side} {symbol}", "INFO"
+                        )
+                        continue
+
+                    if result.filled:
+                        dashboard.stats.scalp_funnel["execution_accepted"] += 1
+                        dashboard.stats.log_activity(
+                            f"SCALP PAPER FILL: {side} {quantity} {symbol} @ "
+                            f"Rs.{result.fill_price:,.2f} [{trade.get('timeframe', 'N/A')}]",
+                            "TRADE",
+                        )
+                        dashboard.stats.current_balance = paper_engine.get_balance()
+                        lifecycle_store.mark_open(
+                            scalp_trade_id,
+                            order_id=result.order_id,
+                            position_id=scalp_trade_id,
+                            quantity=quantity,
+                            fill_price=result.fill_price,
+                            entry_charges=result.entry_charges,
+                        )
+                        daily_risk_store.record_entry()
+
+                        exit_manager.register_position(
+                            position_id=scalp_trade_id,
+                            symbol=symbol,
+                            side=side,
+                            quantity=quantity,
+                            entry_price=result.fill_price,
+                            stop_loss=stop_loss,
+                            target_price=target_price,
+                            strategy=strategy,
+                            regime=scalp_final_state.get("regime", "unknown"),
+                            timeframe=str(trade.get("timeframe", "")),
+                        )
+                        try:
+                            scalp_trade_record = {
+                                **trade,
+                                "quantity": quantity,
+                                "entry_price": result.fill_price,
+                                "stop_loss": stop_loss,
+                                "target_price": target_price,
+                                "candidate_decision": {},
+                            }
+                            journal.record_trade(
+                                scalp_trade_record,
+                                scalp_workflow_id,
+                                scalp_final_state,
+                                trade_id=scalp_trade_id,
+                                run_id=run_id,
+                            )
+                        except Exception as e:
+                            logger.warning("Journal record_trade failed (scalp): %s", e)
+                        _publish_chart(
+                            symbol,
+                            entry=result.fill_price,
+                            current=result.fill_price,
+                            target=target_price,
+                            stop=stop_loss,
+                            status="OPEN",
+                        )
+                    else:
+                        lifecycle_store.mark_rejected(scalp_trade_id, result.message or result.status)
+                        dashboard.stats.log_activity(
+                            f"SCALP ORDER {result.status}: {symbol} — {result.message}",
+                            "WARNING",
+                        )
+
                 await refresh_dashboard()
 
         if discovery_scheduler is not None and discovery_scheduler.maybe_start(
@@ -1066,10 +1467,15 @@ async def run_live_trading():
                 f"Full-universe scan: {len(scan_symbols)} symbols, no strategy signals",
                 "INFO",
             )
+            dashboard.set_cycle_stage("no_signals", "No strategy signals this cycle")
             for _ in range(15):
                 await asyncio.sleep(1)
                 await refresh_dashboard()
             return
+
+        dashboard.set_cycle_stage(
+            "ranking", f"Ranking {len(raw_signals)} raw signals (local ML + outcome evidence)"
+        )
 
         # The sklearn ensemble is CPU-only and runs only on symbol/timeframe pairs where
         # a deterministic strategy fired. Its confidence is directional agreement, not
@@ -1132,8 +1538,22 @@ async def run_live_trading():
             for (symbol, timeframe), pred in predictions.items()
         }
 
+        # Off by default (settings.enable_signal_consolidation) so the existing swing
+        # candidate mix is provably unchanged unless explicitly enabled: multiple
+        # strategies agreeing on the same symbol+timeframe+direction become one
+        # stronger candidate instead of N independent near-duplicate ones.
+        signals_for_ranking = raw_signals
+        if settings.enable_signal_consolidation:
+            consolidated = consolidate_signals(raw_signals)
+            signals_for_ranking = [c.representative_signal for c in consolidated]
+            dashboard.stats.log_activity(
+                f"Consolidated {len(raw_signals)} raw signals into "
+                f"{len(signals_for_ranking)} opportunities (strategy agreement)",
+                "INFO",
+            )
+
         ranked = rank_signals(
-            raw_signals,
+            signals_for_ranking,
             predictions,
             perf_tracker,
             discovered_signal_tilts=discovered_tilts,
@@ -1334,6 +1754,7 @@ async def run_live_trading():
                 "no trade was forced",
                 "INFO",
             )
+            dashboard.set_cycle_stage("no_candidates", "No qualifying candidates after ranking")
             for _ in range(15):
                 await asyncio.sleep(1)
                 await refresh_dashboard()
@@ -1372,6 +1793,7 @@ async def run_live_trading():
             dashboard.stats.log_activity(
                 "FinOps HARD budget reached — skipping agent pipeline this cycle", "WARNING"
             )
+            dashboard.set_cycle_stage("budget_paused", "Daily LLM budget exhausted — paused")
             for _ in range(15):
                 await asyncio.sleep(1)
                 await refresh_dashboard()
@@ -1462,6 +1884,13 @@ async def run_live_trading():
             payload["higher_timeframes_aligned"] = decision.higher_timeframes_aligned
             signal_payloads.append(payload)
 
+        dashboard.set_cycle_stage(
+            "ai_review",
+            f"AI review: {len(signal_payloads)} candidate(s) "
+            "(News/Sentiment/ML → Regime → Strategy → Validation → Risk)",
+        )
+        await refresh_dashboard()
+
         final_state = await run_trading_cycle(
             graph=graph,
             market_data=market_data,
@@ -1476,6 +1905,8 @@ async def run_live_trading():
         )
         last_review_fingerprint = review_fingerprint
 
+        dashboard.set_cycle_stage("processing", "Processing AI review results")
+
         # ── Step 6: Process results ────────────────────────────
         regime = final_state.get("regime", "unknown")
         confidence = final_state.get("regime_confidence", 0)
@@ -1483,6 +1914,31 @@ async def run_live_trading():
         dashboard.update_regime(regime, confidence, strategies)
         if hasattr(dashboard.stats, "current_regime"):
             dashboard.stats.current_regime = regime
+
+        # What each agent actually decided this cycle -- populated every cycle
+        # (independent of whether a trade results), so "nothing happened" is never a
+        # mystery on the dashboard.
+        dashboard.stats.regime_reasoning = final_state.get("regime_reasoning", "")
+        dashboard.stats.strategy_reasoning = final_state.get("strategy_reasoning", "")
+        dashboard.stats.news_headlines = final_state.get("news_headlines", [])
+        dashboard.stats.news_sentiment = float(
+            (final_state.get("news_sentiment") or {}).get("avg_sentiment", 0.0)
+        )
+        dashboard.stats.market_mood = final_state.get("market_mood", {})
+        dashboard.stats.prediction_signals = final_state.get("prediction_signals", [])
+
+        cycle_fallbacks = [
+            str(e) for e in final_state.get("errors", []) if "fallback" in str(e).lower()
+        ]
+        if cycle_fallbacks:
+            agent_label, _, cause_msg = cycle_fallbacks[0].partition(":")
+            agent_label = agent_label.strip().removesuffix(" fallback")
+            dashboard.stats.agent_fallback_notice = (
+                f"{agent_label}: {plain_english_fallback_cause(cause_msg)}"
+            )
+        else:
+            dashboard.stats.agent_fallback_notice = ""
+
         await refresh_dashboard()
 
         validated = final_state.get("validated_signals", [])
@@ -1916,6 +2372,7 @@ async def run_live_trading():
         # Wait before next cycle
         wait_time = settings.trading_cycle_seconds
         dashboard.stats.log_activity(f"Next cycle in {wait_time}s...", "INFO")
+        dashboard.set_next_cycle_countdown(wait_time)
         await refresh_dashboard()
 
         for _ in range(wait_time):
@@ -1938,6 +2395,7 @@ async def run_live_trading():
                         "INFO",
                     )
                     market_pause_announced = True
+                dashboard.set_cycle_stage("market_closed", "Market closed — cycles paused")
                 await refresh_dashboard()
                 await asyncio.sleep(60)
                 continue
@@ -1945,6 +2403,7 @@ async def run_live_trading():
             market_pause_announced = False
             cycle += 1
             dashboard.stats.log_activity(f"=== Trading Cycle #{cycle} ===", "INFO")
+            dashboard.set_cycle_stage("starting", f"Cycle #{cycle}: starting", cycle=cycle)
             await refresh_dashboard()
 
             try:
@@ -1961,6 +2420,9 @@ async def run_live_trading():
                     f"Cycle #{cycle} ERROR (failure #{consecutive_errors}): {e} "
                     f"— recovering in {backoff}s",
                     "ERROR",
+                )
+                dashboard.set_cycle_stage(
+                    "error", f"Cycle #{cycle} failed — recovering in {backoff}s"
                 )
                 if consecutive_errors >= 5:
                     dashboard.stats.log_activity(

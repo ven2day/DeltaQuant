@@ -21,12 +21,14 @@ from src.agents.llm_factory import (
     current_provider,
     get_llm_circuit_breaker,
     get_llm_limiter,
+    invoke_with_fallback,
     primary_and_fallback_models,
 )
 from src.config import get_settings
 from src.finops import record_llm_response
 from src.utils.circuit_breaker import CircuitBreakerOpenError
 from src.utils.errors import RateLimitError
+from src.utils.formatting import plain_english_fallback_cause
 
 from .state import MarketRegime, TradingState
 
@@ -120,51 +122,26 @@ def market_regime_node(state: TradingState) -> dict[str, Any]:
         if settings.enable_rate_limiting:
             rate_limiter.acquire_sync()
 
-        # Try primary model first, fallback on rate limit
-        models_to_try = list(primary_and_fallback_models())
+        # Try primary model first, then the fallback model, on rate limit (see
+        # llm_factory.invoke_with_fallback -- shared by every LLM node so this
+        # resilience can't be silently omitted in a new/edited agent).
+        model_used = primary_and_fallback_models()[0]
 
-        response = None
-        last_error = None
+        def _record_model_used(name: str) -> None:
+            nonlocal model_used
+            model_used = name
 
-        for model_name in models_to_try:
-            try:
-
-                def invoke_llm(model_name=model_name):
-                    agent = create_chat_model(
-                        model_name, temperature=settings.groq_temperature, max_tokens=1024
-                    )
-                    return agent.invoke(messages)
-
-                # Use circuit breaker for the LLM call
-                response = circuit_breaker.call(invoke_llm)
-                logger.info(f"Regime agent using model: {model_name}")
-                break
-
-            except Exception as model_error:
-                last_error = model_error
-                error_str = str(model_error).lower()
-
-                if "rate_limit" in error_str or "429" in error_str:
-                    logger.warning(f"Rate limit on {model_name}, trying fallback...")
-                    # Wait a bit before trying fallback
-                    if settings.enable_rate_limiting:
-                        import time
-
-                        time.sleep(2)
-                    continue
-                elif isinstance(model_error, CircuitBreakerOpenError):
-                    raise
-                else:
-                    logger.error(f"LLM error on {model_name}: {model_error}")
-                    continue
-
-        if response is None:
-            if last_error:
-                raise last_error
-            raise RateLimitError("groq", retry_after=60.0)
+        response = invoke_with_fallback(
+            messages,
+            circuit_breaker=circuit_breaker,
+            temperature=settings.groq_temperature,
+            max_tokens=1024,
+            on_model_selected=_record_model_used,
+        )
+        logger.info(f"Regime agent using model: {model_used}")
 
         # Record token usage / cost for FinOps (never raises).
-        record_llm_response("market_regime", response, model=model_name)
+        record_llm_response("market_regime", response, model=model_used)
 
         # Parse response
         result = _parse_regime_response(response.content)
@@ -229,7 +206,10 @@ def _fallback_regime_classification(state: TradingState, error_msg: str) -> dict
     return {
         "regime": regime,
         "regime_confidence": confidence,
-        "regime_reasoning": f"Fallback: Inferred from average market change ({avg_change:.2f}%). Error: {error_msg}",
+        "regime_reasoning": (
+            f"AI review skipped because {plain_english_fallback_cause(error_msg)}. "
+            f"Backup rule inferred '{regime}' from average market change ({avg_change:+.2f}%)."
+        ),
         "errors": state.get("errors", []) + [f"Regime Agent fallback: {error_msg}"],
     }
 
@@ -380,6 +360,16 @@ def _parse_regime_response(content: str) -> dict[str, Any]:
             start = content.find("```") + 3
             end = content.find("```", start)
             content = content[start:end].strip()
+        elif "{" in content and not content.startswith("{"):
+            # Some models (observed: Qwen) prepend a markdown heading like
+            # "## Market Regime Classification" before a bare JSON object, with no
+            # code fence for the earlier branches to strip. Take the JSON object
+            # itself (first "{" to matching last "}") instead of failing to parse the
+            # whole string, whose leading prose isn't valid JSON.
+            start = content.find("{")
+            end = content.rfind("}")
+            if end > start:
+                content = content[start : end + 1]
 
         result = json.loads(content)
 
@@ -399,9 +389,17 @@ def _parse_regime_response(content: str) -> dict[str, Any]:
         return result
 
     except json.JSONDecodeError as e:
-        logger.warning(f"Failed to parse regime response as JSON: {e}")
+        # Log the raw content for debugging, but never show it to the user as
+        # "reasoning" -- a truncated, mid-sentence dump of the model's own output
+        # (previously shown verbatim here) reads as corrupted data, not an explanation.
+        logger.warning(
+            f"Failed to parse regime response as JSON: {e}. Raw content: {content[:200]}"
+        )
         return {
             "regime": MarketRegime.UNKNOWN.value,
             "confidence": 0.0,
-            "reasoning": f"Failed to parse response: {content[:200]}",
+            "reasoning": (
+                "The AI's regime classification could not be read (malformed response) "
+                "-- treated as low-confidence/unknown this cycle rather than guessing."
+            ),
         }

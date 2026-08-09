@@ -68,16 +68,32 @@ class RiskLimits:
     max_pairwise_correlation: float = 0.80
 
     @classmethod
-    def from_settings(cls) -> "RiskLimits":
-        """Create risk limits from application settings."""
+    def from_settings(cls, *, trade_horizon: str = "SWING") -> "RiskLimits":
+        """Create risk limits from application settings.
+
+        ``trade_horizon="SCALP"`` selects the tighter ``settings.scalp_max_position_pct``
+        in place of swing's ``max_position_pct`` for check #3 (position_size) -- every
+        other limit (exposure, daily caps, drawdown, trading hours, sector/correlation
+        caps, and the H-8 admission check in ``_run_risk_checks``) is unchanged
+        regardless of horizon. A single ``risk_compliance_node`` invocation processes
+        one horizon's signals at a time (the scalp and swing batches go through
+        separate graph invocations, see ``scripts/run_live_trading.py``), so building
+        one ``RiskLimits`` per call here matches that existing one-call-per-invocation
+        shape rather than needing per-signal limits.
+        """
         settings = get_settings()
         configured_daily = getattr(settings, "max_daily_trades", 50)
         configured_daily = configured_daily if isinstance(configured_daily, int) else 50
         paper_cap = getattr(settings, "paper_daily_entry_cap", configured_daily)
         paper_cap = paper_cap if isinstance(paper_cap, int) else configured_daily
+        position_pct = (
+            settings.scalp_max_position_pct
+            if trade_horizon == "SCALP"
+            else settings.max_position_pct
+        )
         return cls(
             # Convert fractions to percentages (0.10 -> 10.0%)
-            max_position_size_pct=settings.max_position_pct * 100,
+            max_position_size_pct=position_pct * 100,
             max_total_exposure_pct=settings.max_total_exposure_pct,
             max_positions=settings.max_concurrent_positions,
             max_daily_trades=min(configured_daily, paper_cap),
@@ -140,8 +156,8 @@ def risk_compliance_node(state: TradingState) -> dict[str, Any]:
     daily_stats = state.get("daily_stats", {})
     regime = state.get("regime", "unknown")
 
-    # Get risk limits
-    limits = RiskLimits.from_settings()
+    # Get risk limits (horizon-aware position-size cap; see from_settings docstring)
+    limits = RiskLimits.from_settings(trade_horizon=state.get("trade_horizon", "SWING"))
 
     approved = []
     rejected = []
@@ -438,14 +454,22 @@ def _run_risk_checks(
     if strategy_name in _GOVERNED_STRATEGY_NAMES:
         settings = get_settings()
         registry_dir = getattr(settings, "strategy_registry_dir", "data/strategy_registry")
-        admitted = StrategyRegistry(str(registry_dir)).is_admitted(strategy_name, regime=regime)
+        signal_timeframe = signal.get("timeframe")
+        signal_trade_horizon = signal.get("trade_horizon", "SWING")
+        admitted = StrategyRegistry(str(registry_dir)).is_admitted(
+            strategy_name,
+            regime=regime,
+            timeframe=signal_timeframe,
+            trade_horizon=signal_trade_horizon,
+        )
         checks.append(
             RiskCheckResult(
                 passed=admitted,
                 rule="strategy_admission",
                 message=(
                     f"Strategy '{strategy_name}' has no current VALIDATED registry artifact "
-                    f"for regime '{regime}' (H-8 strategy admission gate)"
+                    f"for regime '{regime}', timeframe '{signal_timeframe}', trade_horizon "
+                    f"'{signal_trade_horizon}' (H-8 strategy admission gate)"
                 ),
                 severity="block",
             )

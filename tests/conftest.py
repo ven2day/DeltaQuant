@@ -20,6 +20,7 @@ import src.market.dhan_historical_feed as dhan_historical_feed_module
 import src.market.dhan_quotes_feed as dhan_quotes_feed_module
 import src.market.live_data as live_data_module
 import src.market.websocket_feed as websocket_feed_module
+from src.utils.circuit_breaker import reset_all_circuit_breakers
 
 
 @pytest.fixture(autouse=True, scope="session")
@@ -61,3 +62,22 @@ def _prevent_real_dhan_auth():
     adapter_module.get_valid_access_token = _fake_token
     dhan_historical_feed_module.get_valid_access_token = _fake_token
     dhan_quotes_feed_module.get_valid_access_token = _fake_token
+
+
+@pytest.fixture(autouse=True)
+def _reset_circuit_breakers():
+    """Every LLM-backed agent node shares one module-level circuit breaker per
+    provider (get_llm_provider_circuit_breaker), keyed off the REAL configured
+    LLM_PROVIDER from .env -- get_llm_circuit_breaker()'s own get_settings() call
+    isn't touched by a test's `@patch("src.agents.X.get_settings")` (that only patches
+    the name as imported into module X, not llm_factory's own reference). So a test
+    that deliberately simulates a genuine (non-rate-limit) LLM failure trips the real
+    shared breaker, and without a reset that failure count leaks into whichever
+    unrelated test runs next in the same session -- confirmed to actually happen:
+    genuine-failure tests here previously caused later, unrelated tests to fail with
+    "circuit breaker open" for a breaker they never touched. Reset before AND after
+    each test so failures from setup/teardown can't leak either direction.
+    """
+    reset_all_circuit_breakers()
+    yield
+    reset_all_circuit_breakers()

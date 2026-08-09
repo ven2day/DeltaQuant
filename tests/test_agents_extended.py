@@ -307,6 +307,25 @@ def test_should_continue_after_validation():
     assert should_continue_after_validation(state) == "risk_compliance"
 
 
+def test_conditional_edges_are_horizon_agnostic():
+    """Neither conditional predicate reads trade_horizon at all -- a SCALP-tagged
+    cycle must route identically to a SWING one given the same regime_confidence/
+    validated_signals. Locks in that these gates are horizon-independent by
+    design, not by accident."""
+    scalp_state = create_initial_state(trade_horizon="SCALP")
+    swing_state = create_initial_state(trade_horizon="SWING")
+
+    with patch("src.agents.graph.check_kill_switch", return_value=False):
+        for state in (scalp_state, swing_state):
+            state["regime_confidence"] = 0.8
+            assert should_continue_after_regime(state) == "strategy_selection"
+
+    scalp_state["validated_signals"] = [{"id": 1}]
+    swing_state["validated_signals"] = [{"id": 1}]
+    assert should_continue_after_validation(scalp_state) == "risk_compliance"
+    assert should_continue_after_validation(swing_state) == "risk_compliance"
+
+
 def test_create_trading_graph():
     graph = create_trading_graph(with_memory=False)
     assert graph is not None

@@ -23,6 +23,25 @@ def test_trading_stats_pnl(stats):
     assert stats.pnl_percent == 0.015
 
 
+def test_trading_stats_scalp_fields_default_empty(stats):
+    # Mirrors candidate_decisions/scalping_candidates' existing default-empty
+    # convention -- a fresh TradingStats (scalp_enabled=False) must show an empty
+    # funnel/opportunity list, not a missing attribute.
+    assert stats.scalp_opportunities == []
+    assert stats.scalp_funnel == {}
+
+
+def test_trading_stats_scalp_fields_are_independent_instances():
+    # Dataclass mutable-default footgun regression: two TradingStats instances must
+    # not share the same underlying list/dict object.
+    a, b = TradingStats(), TradingStats()
+    a.scalp_opportunities.append({"symbol": "RELIANCE"})
+    a.scalp_funnel["raw_triggers"] = 5
+
+    assert b.scalp_opportunities == []
+    assert b.scalp_funnel == {}
+
+
 def test_trading_stats_log_activity(stats):
     stats.log_activity("Test message", "INFO")
     assert len(stats.activity_log) == 1
@@ -248,3 +267,57 @@ def test_dashboard_close_trade(dashboard):
 def test_dashboard_increment_cycle(dashboard):
     dashboard.increment_cycle()
     assert dashboard.stats.cycles_run == 1
+
+
+def test_set_cycle_stage_updates_label_and_number(dashboard):
+    dashboard.set_cycle_stage("scanning", "Scanning 50 symbols", cycle=7)
+
+    assert dashboard.stats.cycle_stage == "scanning"
+    assert dashboard.stats.cycle_stage_label == "Scanning 50 symbols"
+    assert dashboard.stats.current_cycle_number == 7
+    assert dashboard.stats.cycle_stage_started_at != ""
+
+
+def test_set_cycle_stage_clears_next_cycle_countdown_when_not_waiting(dashboard):
+    dashboard.set_next_cycle_countdown(120)
+    assert dashboard.stats.next_cycle_at != ""
+
+    dashboard.set_cycle_stage("scanning", "Scanning symbols")
+    assert dashboard.stats.next_cycle_at == ""
+
+
+def test_set_next_cycle_countdown_sets_waiting_stage(dashboard):
+    dashboard.set_next_cycle_countdown(90)
+
+    assert dashboard.stats.cycle_stage == "waiting"
+    assert dashboard.stats.cycle_stage_label == "Next cycle in 90s"
+    assert dashboard.stats.next_cycle_at != ""
+
+
+def test_trading_stats_per_cycle_agent_detail_defaults(stats):
+    """New fields (what each agent decided this cycle) must default to empty/falsy so
+    a fresh session renders as 'nothing yet', not a crash or stale placeholder."""
+    assert stats.regime_reasoning == ""
+    assert stats.strategy_reasoning == ""
+    assert stats.news_headlines == []
+    assert stats.news_sentiment == 0.0
+    assert stats.market_mood == {}
+    assert stats.prediction_signals == []
+    assert stats.agent_fallback_notice == ""
+
+
+def test_stats_to_dict_serializes_per_cycle_agent_detail():
+    from src.webui.schema import stats_to_dict
+
+    stats = TradingStats()
+    stats.regime_reasoning = "Trending up on strong breadth"
+    stats.news_headlines = [{"title": "Sensex rallies", "sentiment": "positive"}]
+    stats.market_mood = {"mood_index": 72, "mood_label": "greed"}
+    stats.agent_fallback_notice = "Signal Validation: the AI reviewer hit its daily usage limit"
+
+    data = stats_to_dict(stats)
+
+    assert data["regime_reasoning"] == "Trending up on strong breadth"
+    assert data["news_headlines"] == [{"title": "Sensex rallies", "sentiment": "positive"}]
+    assert data["market_mood"]["mood_index"] == 72
+    assert "daily usage limit" in data["agent_fallback_notice"]

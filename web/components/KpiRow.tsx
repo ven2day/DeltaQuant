@@ -18,7 +18,7 @@ export function KpiRow({ stats, history }: { stats: TradingStats; history: Histo
   const pnlPositive = stats.total_pnl >= 0;
 
   return (
-    <div className="col-span-full grid grid-cols-2 gap-3 lg:grid-cols-4">
+    <div className="col-span-full flex flex-col divide-y divide-border rounded-xl border border-border bg-surface shadow-card sm:flex-row sm:divide-x sm:divide-y-0">
       <StatTile
         label="Balance"
         icon={Wallet}

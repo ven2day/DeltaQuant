@@ -189,10 +189,18 @@ class TradingState(TypedDict):
     # for the same symbol/timeframe; empty dict when the caller has none to share.
     precomputed_predictions: dict[str, dict[str, Any]]
 
+    # Which trade horizon this cycle's batch of `signals` belongs to: "SWING" (default,
+    # every pre-existing caller) or "SCALP". Read by strategy_selection's H-8 gate and
+    # risk_compliance's admission check/RiskLimits so a strategy validated only on one
+    # horizon can never silently admit trades on the other -- see
+    # src/backtesting/strategy_registry.py and DeltaQuant-Quant-Risk-Review.md H-8.
+    trade_horizon: str
+
 
 def create_initial_state(
     workflow_id: str | None = None,
     data_namespace: str = "paper_market_data",
+    trade_horizon: str = "SWING",
 ) -> TradingState:
     """
     Create an initial empty trading state.
@@ -202,6 +210,8 @@ def create_initial_state(
         data_namespace: Namespace of the current run's data (see the field docstring
             on TradingState.data_namespace); defaults to the live-data-paper namespace,
             matching PerformanceTracker's/AgentMemoryDB's own default.
+        trade_horizon: "SWING" (default, matches every pre-existing caller) or "SCALP" —
+            see the field docstring on TradingState.trade_horizon.
 
     Returns:
         Initialized TradingState with default values
@@ -251,4 +261,5 @@ def create_initial_state(
         market_mood={},
         prediction_signals=[],
         precomputed_predictions={},
+        trade_horizon=trade_horizon,
     )

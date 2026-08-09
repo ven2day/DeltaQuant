@@ -21,6 +21,7 @@ expired strategy version cannot produce an approved (live-paper) trade.
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock, patch
 
@@ -299,6 +300,136 @@ def test_gate_active_strategies_strips_unadmitted(tmp_path):
     with patch("src.agents.strategy_selection.get_settings", return_value=settings_mock):
         admitted = _gate_active_strategies(["momentum", "breakout"], "trending_up")
     assert admitted == ["momentum"]  # breakout has no registry entry -> stripped
+
+
+# ---------------------------------------------------------------------------
+# H-8 registry grain: strategy + timeframe + trade_horizon + regime + version.
+# A SWING-validated artifact (every artifact ever registered before this grain
+# existed) must never silently admit a SCALP request, and vice versa.
+# ---------------------------------------------------------------------------
+
+
+def test_legacy_artifact_without_grain_keys_still_loads_and_admits_swing(tmp_path):
+    """An on-disk JSON file written before timeframe/trade_horizon existed (i.e. no
+    such keys at all) must still deserialize and keep admitting exactly what it always
+    admitted -- SWING, unpinned to any timeframe. This is the backward-compatibility
+    guarantee the whole registry-grain change depends on."""
+    legacy_path = tmp_path / "momentum__legacy.json"
+    legacy_payload = {
+        "strategy_name": "momentum",
+        "version": "legacy",
+        "owner": "test",
+        "parameters": {},
+        "approved_universe": [],
+        "approved_regimes": [],
+        "dataset_id": "legacy-dataset",
+        "validated_at": datetime.now(UTC).isoformat(),
+        "expires_at": (datetime.now(UTC) + timedelta(days=30)).isoformat(),
+        "verdict": "VALIDATED",
+        "reasons": [],
+        "oos_trades": 100,
+        "oos_expectancy": 2.0,
+        "oos_return_pct": 10.0,
+        "fold_consistency": 0.8,
+        # deliberately NO "timeframe"/"trade_horizon" keys
+    }
+    legacy_path.write_text(json.dumps(legacy_payload), encoding="utf-8")
+
+    registry = StrategyRegistry(tmp_path)
+    version = registry.latest("momentum")
+    assert version is not None
+    assert version.timeframe == ""
+    assert version.trade_horizon == "SWING"
+    assert registry.is_admitted("momentum") is True  # default trade_horizon="SWING"
+    assert registry.is_admitted("momentum", timeframe="15m") is True  # unpinned matches any
+
+
+def test_legacy_swing_artifact_never_admits_a_scalp_request(tmp_path):
+    """The central risk this stage exists to prevent: a strategy validated only on
+    daily/swing bars must not silently cover a 5m scalp trade just because the
+    strategy name matches."""
+    _validated_version(tmp_path, strategy_name="momentum")  # trade_horizon defaults SWING
+
+    registry = StrategyRegistry(tmp_path)
+    assert registry.is_admitted("momentum", trade_horizon="SWING") is True
+    assert registry.is_admitted("momentum", trade_horizon="SCALP") is False
+    assert registry.is_admitted("momentum", timeframe="5m", trade_horizon="SCALP") is False
+
+
+def test_fresh_scalp_artifact_admits_only_matching_horizon_and_timeframe(tmp_path):
+    scalp_version = build_strategy_version(
+        "momentum",
+        owner="test",
+        parameters={},
+        approved_universe=[],
+        approved_regimes=[],
+        dataset_id="test-dataset-5m",
+        oos_trades=100,
+        oos_expectancy=2.0,
+        oos_return_pct=10.0,
+        fold_consistency=0.8,
+        validity_days=30,
+        timeframe="5m",
+        trade_horizon="SCALP",
+    )
+    registry = StrategyRegistry(tmp_path)
+    registry.register(scalp_version)
+
+    # Matches: SCALP horizon, either unpinned-timeframe request or the exact 5m pin.
+    assert registry.is_admitted("momentum", trade_horizon="SCALP") is True
+    assert registry.is_admitted("momentum", timeframe="5m", trade_horizon="SCALP") is True
+    # Does not match: wrong horizon, or a different pinned timeframe.
+    assert registry.is_admitted("momentum", trade_horizon="SWING") is False
+    assert registry.is_admitted("momentum", timeframe="15m", trade_horizon="SCALP") is False
+
+
+def test_gate_active_strategies_is_horizon_aware(tmp_path):
+    _validated_version(tmp_path, strategy_name="momentum")  # SWING only
+    settings_mock = type("S", (), {"strategy_registry_dir": str(tmp_path)})()
+    with patch("src.agents.strategy_selection.get_settings", return_value=settings_mock):
+        admitted_swing = _gate_active_strategies(
+            ["momentum"], "trending_up", trade_horizon="SWING"
+        )
+        admitted_scalp = _gate_active_strategies(
+            ["momentum"], "trending_up", trade_horizon="SCALP"
+        )
+    assert admitted_swing == ["momentum"]
+    assert admitted_scalp == []  # no SCALP-horizon artifact exists -> fails closed
+
+
+def test_scalp_horizon_signal_blocked_at_risk_compliance_despite_valid_swing_artifact(tmp_path):
+    """Full-pipeline H-8 acceptance test for the new grain: even with a current
+    VALIDATED SWING artifact for 'momentum', a signal tagged trade_horizon=SCALP must
+    still be blocked at risk_compliance's check #14 -- proving the grain is enforced
+    end-to-end, not just at the registry's own unit level."""
+    _validated_version(tmp_path, strategy_name="momentum")  # SWING only
+
+    state = create_initial_state()
+    state["regime"] = "trending_up"
+    state["trade_horizon"] = "SCALP"
+    state["validated_signals"] = [
+        {
+            "symbol": "A",
+            "strategy": "momentum",
+            "timeframe": "5m",
+            "trade_horizon": "SCALP",
+            "confidence": 0.8,
+            "risk_reward_ratio": 2.0,
+        }
+    ]
+
+    settings_mock = type("S", (), {"strategy_registry_dir": str(tmp_path)})()
+    with (
+        patch("src.agents.risk_compliance.now_ist") as mock_now,
+        patch("src.agents.risk_compliance.RiskLimits.from_settings", return_value=RiskLimits()),
+        patch("src.agents.risk_compliance.get_settings", return_value=settings_mock),
+    ):
+        mock_now.return_value.strftime.return_value = "12:00"
+        result = risk_compliance_node(state)
+
+    assert result["approved_trades"] == []
+    failures = result["risk_rejected"][0]["risk_result"]["failures"]
+    assert any(f["rule"] == "strategy_admission" for f in failures)
 
 
 def test_expired_strategy_cannot_produce_an_approved_trade(tmp_path):

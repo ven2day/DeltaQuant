@@ -64,6 +64,16 @@ class StrategyVersion:
     oos_return_pct: float
     fold_consistency: float
 
+    # Registry grain (added for the SCALP trade horizon; trailing defaults so every
+    # pre-existing on-disk artifact -- none of which have these keys -- loads unchanged
+    # via from_dict()). timeframe="" means "not pinned to one timeframe" (the honest
+    # label for every artifact validated before this field existed, since
+    # scripts/validate_strategy.py historically always fetched daily bars regardless of
+    # what interval was nominally requested -- see DeltaQuant-Quant-Risk-Review.md H-8).
+    # trade_horizon defaults to "SWING", matching every artifact ever registered so far.
+    timeframe: str = ""
+    trade_horizon: str = "SWING"
+
     @property
     def status(self) -> str:
         """Current admission status: VALIDATED, NOT_VALIDATED, or EXPIRED."""
@@ -73,9 +83,27 @@ class StrategyVersion:
             return "EXPIRED"
         return "VALIDATED"
 
-    def is_admissible(self, *, regime: str | None = None, symbol: str | None = None) -> bool:
-        """Fail-closed admissibility check for one candidate trade context."""
+    def is_admissible(
+        self,
+        *,
+        regime: str | None = None,
+        symbol: str | None = None,
+        timeframe: str | None = None,
+        trade_horizon: str = "SWING",
+    ) -> bool:
+        """Fail-closed admissibility check for one candidate trade context.
+
+        ``trade_horizon`` must match exactly -- a SWING-validated artifact can never
+        admit a SCALP request and vice versa, regardless of strategy name/regime match.
+        ``timeframe`` matches only when this artifact was validated pinned to one
+        (``self.timeframe`` non-empty); an unpinned artifact (the default/legacy state)
+        matches any requested timeframe, preserving pre-existing behavior exactly.
+        """
         if self.status != "VALIDATED":
+            return False
+        if self.trade_horizon != trade_horizon:
+            return False
+        if timeframe is not None and self.timeframe and self.timeframe != timeframe:
             return False
         if regime is not None and self.approved_regimes and regime not in self.approved_regimes:
             return False
@@ -101,6 +129,8 @@ class StrategyVersion:
             "oos_return_pct": self.oos_return_pct,
             "fold_consistency": self.fold_consistency,
             "status": self.status,
+            "timeframe": self.timeframe,
+            "trade_horizon": self.trade_horizon,
         }
 
     @classmethod
@@ -121,6 +151,8 @@ class StrategyVersion:
             oos_expectancy=float(d.get("oos_expectancy", 0.0)),
             oos_return_pct=float(d.get("oos_return_pct", 0.0)),
             fold_consistency=float(d.get("fold_consistency", 0.0)),
+            timeframe=str(d.get("timeframe", "")),
+            trade_horizon=str(d.get("trade_horizon", "SWING")),
         )
 
 
@@ -139,6 +171,8 @@ def build_strategy_version(
     validity_days: int = 30,
     version: str | None = None,
     now: datetime | None = None,
+    timeframe: str = "",
+    trade_horizon: str = "SWING",
 ) -> StrategyVersion:
     """Build a ``StrategyVersion`` whose verdict comes directly from ``edge_verdict()``.
 
@@ -163,6 +197,8 @@ def build_strategy_version(
         oos_expectancy=oos_expectancy,
         oos_return_pct=oos_return_pct,
         fold_consistency=fold_consistency,
+        timeframe=timeframe,
+        trade_horizon=trade_horizon,
     )
 
 
@@ -203,30 +239,65 @@ class StrategyRegistry:
                 logger.warning(f"Skipping unreadable strategy registry entry {path}: {e}")
         return versions
 
-    def latest(self, strategy_name: str) -> StrategyVersion | None:
-        """Most-recently-validated on-file version for this strategy, or None."""
-        candidates = [v for v in self.load_all() if v.strategy_name == strategy_name]
+    def latest(
+        self,
+        strategy_name: str,
+        *,
+        timeframe: str | None = None,
+        trade_horizon: str = "SWING",
+    ) -> StrategyVersion | None:
+        """Most-recently-validated on-file version for this strategy + horizon, or None.
+
+        Filters to ``trade_horizon`` first (exact match only), then -- when
+        ``timeframe`` is given -- to versions that are either unpinned (``timeframe==
+        ""``, matches any) or pinned to that exact timeframe. This mirrors
+        ``StrategyVersion.is_admissible``'s matching rules so ``latest()`` never
+        returns a version that ``is_admitted()`` would then reject anyway.
+        """
+        candidates = [
+            v
+            for v in self.load_all()
+            if v.strategy_name == strategy_name
+            and v.trade_horizon == trade_horizon
+            and (timeframe is None or not v.timeframe or v.timeframe == timeframe)
+        ]
         if not candidates:
             return None
         return max(candidates, key=lambda v: v.validated_at)
 
     def is_admitted(
-        self, strategy_name: str, *, regime: str | None = None, symbol: str | None = None
+        self,
+        strategy_name: str,
+        *,
+        regime: str | None = None,
+        symbol: str | None = None,
+        timeframe: str | None = None,
+        trade_horizon: str = "SWING",
     ) -> bool:
-        """Fail-closed: True only if a current, non-expired VALIDATED version exists."""
-        version = self.latest(strategy_name)
+        """Fail-closed: True only if a current, non-expired VALIDATED version exists
+        for this exact strategy + trade_horizon (+ matching timeframe, if pinned)."""
+        version = self.latest(strategy_name, timeframe=timeframe, trade_horizon=trade_horizon)
         if version is None:
             return False
-        return version.is_admissible(regime=regime, symbol=symbol)
+        return version.is_admissible(
+            regime=regime, symbol=symbol, timeframe=timeframe, trade_horizon=trade_horizon
+        )
 
     def filter_admitted(
-        self, strategy_names: list[str], *, regime: str | None = None
+        self,
+        strategy_names: list[str],
+        *,
+        regime: str | None = None,
+        timeframe: str | None = None,
+        trade_horizon: str = "SWING",
     ) -> tuple[list[str], list[str]]:
         """Split ``strategy_names`` into (admitted, stripped) -- fail closed on each name."""
         admitted: list[str] = []
         stripped: list[str] = []
         for name in strategy_names:
-            if self.is_admitted(name, regime=regime):
+            if self.is_admitted(
+                name, regime=regime, timeframe=timeframe, trade_horizon=trade_horizon
+            ):
                 admitted.append(name)
             else:
                 stripped.append(name)

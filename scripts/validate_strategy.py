@@ -21,6 +21,7 @@ NOTE: uses a FIXED, explicit universe (not the live StockDiscovery output, which
 look-ahead/selection bias). See the survivorship caveat printed at the end.
 """
 
+import argparse
 import sys
 from pathlib import Path
 
@@ -32,6 +33,7 @@ from src.backtesting.walk_forward import aggregate_reports, run_walk_forward
 from src.config import get_settings
 from src.execution.costs import CostModel
 from src.market.historical_feed import HistoricalDataFeed
+from src.market.indicators import Timeframe
 from src.market.signals import StrategyType
 
 # A fixed large-cap universe. Deliberately NOT StockDiscovery (which picks today's movers and
@@ -49,34 +51,49 @@ def register_strategy_versions(
     warmup: int,
     test: int,
     cost_model: CostModel,
+    interval: str = "1d",
+    trade_horizon: str = "SWING",
 ) -> None:
     """Walk-forward-validate each named strategy individually and register the verdict
     (H-8). This is the ONLY place that writes to the admission registry; it always
     sources the verdict from ``edge_verdict()`` via ``build_strategy_version``, never a
     parallel pass/fail decision.
+
+    ``interval``/``trade_horizon`` default to ``"1d"``/``"SWING"`` -- today's exact
+    behavior (interval was previously never passed at all, so ``get_historical``
+    silently defaulted to daily bars regardless of what a caller might have assumed).
+    Passing e.g. ``interval="5m", trade_horizon="SCALP"`` registers a version honestly
+    labeled with the timeframe it was actually validated on, admissible only to
+    matching SCALP-horizon requests (see StrategyVersion.is_admissible).
     """
     settings = get_settings()
     registry = StrategyRegistry(settings.strategy_registry_dir)
     feed = HistoricalDataFeed(symbols=symbols)
-    dataset_id = f"historical_feed:{period}:{','.join(sorted(symbols))}"
+    dataset_id = f"historical_feed:{period}:{interval}:{','.join(sorted(symbols))}"
 
     print(LINE)
-    print(" Per-strategy walk-forward validation for the H-8 admission registry")
+    print(
+        f" Per-strategy walk-forward validation for the H-8 admission registry "
+        f"(interval={interval}, trade_horizon={trade_horizon})"
+    )
     print(LINE)
 
     for strategy_type in StrategyType:
         reports = []
         for sym in symbols:
-            df = feed.get_historical(sym, period=period)
+            df = feed.get_historical(sym, period=period, interval=interval)
             if df is None or df.empty or len(df) < warmup + test:
                 continue
             report = run_walk_forward(
                 df,
-                lambda s=sym, st=strategy_type: RealSignalStrategy(symbol=s, strategy_types=[st]),
+                lambda s=sym, st=strategy_type: RealSignalStrategy(
+                    symbol=s, strategy_types=[st], timeframe=Timeframe(interval)
+                ),
                 symbol=sym,
                 warmup_bars=warmup,
                 test_bars=test,
                 cost_model=cost_model,
+                interval=interval,
             )
             reports.append(report)
 
@@ -84,7 +101,12 @@ def register_strategy_versions(
         version = build_strategy_version(
             strategy_type.value,
             owner="scripts/validate_strategy.py",
-            parameters={"warmup_bars": warmup, "test_bars": test, "period": period},
+            parameters={
+                "warmup_bars": warmup,
+                "test_bars": test,
+                "period": period,
+                "interval": interval,
+            },
             approved_universe=symbols,
             approved_regimes=[],  # no per-regime OOS split yet; admitted for any regime
             dataset_id=dataset_id,
@@ -93,6 +115,8 @@ def register_strategy_versions(
             oos_return_pct=agg["summed_oos_return_pct"],
             fold_consistency=agg["avg_fold_consistency"],
             validity_days=settings.strategy_registry_validity_days,
+            timeframe=interval,
+            trade_horizon=trade_horizon,
         )
         path = registry.register(version)
         print(
@@ -102,7 +126,14 @@ def register_strategy_versions(
     print(LINE)
 
 
-def main(symbols: list[str] | None = None, period: str = "2y", warmup: int = 120, test: int = 40) -> None:
+def main(
+    symbols: list[str] | None = None,
+    period: str = "2y",
+    warmup: int = 120,
+    test: int = 40,
+    interval: str = "1d",
+    trade_horizon: str = "SWING",
+) -> None:
     symbols = symbols or DEFAULT_UNIVERSE
     cost_model = CostModel.from_settings()
     feed = HistoricalDataFeed(symbols=symbols)
@@ -111,7 +142,10 @@ def main(symbols: list[str] | None = None, period: str = "2y", warmup: int = 120
     print(LINE)
     print(" Out-of-Sample / Walk-Forward Validation  (net of realistic costs)")
     print(LINE)
-    print(f" Universe: {len(symbols)} symbols | period={period} | warmup={warmup} test={test} bars")
+    print(
+        f" Universe: {len(symbols)} symbols | period={period} | interval={interval} | "
+        f"warmup={warmup} test={test} bars | trade_horizon={trade_horizon}"
+    )
     print(
         f" Costs: slippage {cost_model.slippage_bps}bps | brokerage {cost_model.brokerage_bps}bps"
         f" (cap Rs.{cost_model.brokerage_max:.0f}) | statutory {cost_model.statutory_bps}bps"
@@ -123,17 +157,18 @@ def main(symbols: list[str] | None = None, period: str = "2y", warmup: int = 120
     print("-" * len(header))
 
     for sym in symbols:
-        df = feed.get_historical(sym, period=period)
+        df = feed.get_historical(sym, period=period, interval=interval)
         if df is None or df.empty or len(df) < warmup + test:
             print(f"{sym:<12}{'(insufficient data)':>30}")
             continue
         report = run_walk_forward(
             df,
-            lambda s=sym: RealSignalStrategy(symbol=s),
+            lambda s=sym: RealSignalStrategy(symbol=s, timeframe=Timeframe(interval)),
             symbol=sym,
             warmup_bars=warmup,
             test_bars=test,
             cost_model=cost_model,
+            interval=interval,
         )
         reports.append(report)
         pf = "inf" if report.oos_profit_factor == float("inf") else f"{report.oos_profit_factor:.2f}"
@@ -163,8 +198,30 @@ def main(symbols: list[str] | None = None, period: str = "2y", warmup: int = 120
     print(" a historical bar backtest cannot fully capture.")
     print(LINE)
 
-    register_strategy_versions(symbols, period, warmup, test, cost_model)
+    register_strategy_versions(
+        symbols, period, warmup, test, cost_model, interval=interval, trade_horizon=trade_horizon
+    )
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--interval",
+        default="1d",
+        help="Candle interval to validate against, e.g. 1d (default, current behavior), "
+        "5m, 15m. Must be an interval the configured historical feed actually supports.",
+    )
+    parser.add_argument(
+        "--trade-horizon",
+        default="SWING",
+        choices=["SWING", "SCALP"],
+        help="Which H-8 registry grain to register the resulting artifacts under. A "
+        "SWING-validated artifact never admits a SCALP request and vice versa "
+        "(src/backtesting/strategy_registry.py StrategyVersion.is_admissible).",
+    )
+    return parser.parse_args()
 
 
 if __name__ == "__main__":
-    main()
+    _args = _parse_args()
+    main(interval=_args.interval, trade_horizon=_args.trade_horizon)

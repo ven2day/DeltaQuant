@@ -1,11 +1,17 @@
 "use client";
 
-import { LogOut, ShieldCheck } from "lucide-react";
+import { ArrowLeftRight, IndianRupee, LogOut, ShieldCheck } from "lucide-react";
 import { useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 import { logout } from "@/lib/api";
 import type { TradingStats } from "@/lib/types";
 import { Badge } from "./ui/Badge";
+import { Tabs } from "./ui/Tabs";
+
+const MARKETS = [
+  { id: "nse", label: "NSE", icon: IndianRupee },
+  { id: "forex", label: "Forex", icon: ArrowLeftRight },
+];
 
 // Just a ticking IST clock for display — whether new entries are actually allowed
 // comes from the backend (stats.market_open), which is the same is_trading_window()/
@@ -29,9 +35,13 @@ function useISTClock(): string {
 export function Header({
   stats,
   connected,
+  activeMarket,
+  onMarketChange,
 }: {
   stats: TradingStats | null;
   connected: boolean;
+  activeMarket: string;
+  onMarketChange: (id: string) => void;
 }) {
   const clock = useISTClock();
   const router = useRouter();
@@ -47,7 +57,7 @@ export function Header({
   const forced = stats?.force_trading_window ?? false;
 
   return (
-    <div className="col-span-full flex flex-col gap-3 border-b border-border pb-4 sm:flex-row sm:items-center sm:justify-between">
+    <div className="col-span-full grid grid-cols-1 gap-3 border-b border-border pb-4 sm:grid-cols-[auto_1fr_auto] sm:items-center">
       <div className="flex items-center gap-2.5">
         <ShieldCheck size={22} className="text-cat-1" strokeWidth={2} />
         <div>
@@ -58,7 +68,11 @@ export function Header({
         </div>
       </div>
 
-      <div className="flex flex-wrap items-center gap-2">
+      <div className="flex justify-center">
+        <Tabs tabs={MARKETS} active={activeMarket} onChange={onMarketChange} />
+      </div>
+
+      <div className="flex flex-wrap items-center justify-end gap-2">
         <Badge label={mode.toUpperCase()} tone={mode === "paper" ? "good" : "critical"} />
         <Badge label={dataSource.toUpperCase()} tone="neutral" dot />
         <Badge

@@ -123,8 +123,16 @@ def run_walk_forward(
     test_bars: int = 40,
     cost_model: Any = None,
     initial_capital: float = 100_000.0,
+    interval: str = "1d",
 ) -> WalkForwardReport:
-    """Evaluate a strategy out-of-sample on rolling folds, net of `cost_model` costs."""
+    """Evaluate a strategy out-of-sample on rolling folds, net of `cost_model` costs.
+
+    ``interval`` (default "1d", matching every pre-existing caller) is passed
+    through to ``BacktestEngine.run`` purely so its Sharpe annualization is correct
+    for intraday data (see engine.py's ``_annualization_factor``); it has no effect
+    on the OOS trade/expectancy/consistency metrics this report's VALIDATED verdict
+    (``edge_verdict``) actually depends on.
+    """
     n = len(data)
     folds = generate_test_folds(n, warmup_bars, test_bars)
 
@@ -143,7 +151,7 @@ def run_walk_forward(
 
     # Run once over the full series; warm-up bars are excluded from evaluation below.
     engine = BacktestEngine(initial_capital=initial_capital, cost_model=cost_model)
-    result = engine.run(strategy_factory(), data, symbol=symbol)
+    result = engine.run(strategy_factory(), data, symbol=symbol, interval=interval)
 
     # Bucket each trade into the fold its ENTRY falls in (OOS attribution).
     fold_pnls: dict[int, list[float]] = {i: [] for i in range(len(folds))}

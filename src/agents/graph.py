@@ -227,6 +227,7 @@ async def run_trading_cycle(
     thread_id: str = "default",
     precomputed_predictions: dict[str, dict[str, Any]] | None = None,
     data_namespace: str = "paper_market_data",
+    trade_horizon: str = "SWING",
 ) -> TradingState:
     """
     Run a complete trading cycle through the agent graph.
@@ -248,6 +249,12 @@ async def run_trading_cycle(
             PAPER_DATA_NAMESPACE) -- threaded into TradingState so nodes reading
             historical performance/lesson data query the caller's actual namespace
             instead of always defaulting to paper_market_data (see H-9).
+        trade_horizon: "SWING" (default, matches every pre-existing caller) or
+            "SCALP" -- threaded into TradingState so strategy_selection's H-8 gate
+            and risk_compliance's admission check/position sizing use the matching
+            registry grain and limits (see src/backtesting/strategy_registry.py).
+            One invocation handles one horizon's signals; a cycle that runs both
+            calls this twice (see scripts/run_live_trading.py).
 
     Returns:
         Final trading state with decisions
@@ -256,7 +263,7 @@ async def run_trading_cycle(
     # Create initial state with inputs. Coerce every input to native Python types: quotes,
     # indicators and P&L-derived stats can carry numpy scalars, which crash the msgpack
     # checkpoint boundary (see to_native / #18).
-    state = create_initial_state(data_namespace=data_namespace)
+    state = create_initial_state(data_namespace=data_namespace, trade_horizon=trade_horizon)
     state["market_data"] = to_native(market_data)
     state["indicators"] = to_native(indicators)
     state["signals"] = to_native(
@@ -279,6 +286,7 @@ async def run_trading_cycle(
         "metadata": {
             "workflow_type": "trading_cycle",
             "signals_count": len(signals),
+            "trade_horizon": trade_horizon,
         },
     }
     langfuse_callback = get_langfuse_callback()

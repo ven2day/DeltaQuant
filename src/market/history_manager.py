@@ -44,6 +44,7 @@ INTRADAY_YF_PARAMS: dict[Timeframe, tuple[str, str]] = {
 # Minimum seconds between re-fetches of each intraday timeframe, so a signal cycle that
 # runs every few seconds doesn't hammer Yahoo with a fresh request per symbol per cycle.
 INTRADAY_REFRESH_SECONDS: dict[Timeframe, int] = {
+    Timeframe.M5: 5 * 60,
     Timeframe.M15: 5 * 60,
     Timeframe.M30: 10 * 60,
     Timeframe.H1: 20 * 60,

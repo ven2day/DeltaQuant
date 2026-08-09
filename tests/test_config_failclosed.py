@@ -176,6 +176,52 @@ def test_benign_warnings_still_only_warn_not_raise():
     assert any("risk_per_trade" in w for w in s.config_warnings)
 
 
+def test_scalp_defaults_construct_without_raising_and_are_inert():
+    # Stage 1: the whole scalp settings block must be a no-op when scalp_enabled is
+    # left at its default (False) -- byte-identical behavior to before the feature.
+    s = Settings(**_base_kwargs())
+    assert s.scalp_enabled is False
+    assert s.enable_signal_consolidation is False
+    assert s.config_warnings == []
+
+
+def test_scalp_defaults_are_tighter_than_swing_defaults():
+    # Regression guard: scalp's default risk knobs must stay tighter than swing's,
+    # matching the 5-15m horizon they're sized for -- never accidentally equal/looser.
+    s = Settings(**_base_kwargs())
+    assert s.scalp_risk_per_trade < s.risk_per_trade
+    assert s.scalp_max_position_pct < s.max_position_pct
+    assert s.scalp_target_pct < s.paper_target_pct
+
+
+def test_scalp_fallback_thresholds_default_equal_to_swing_hardcoded_bar():
+    # Stage 11 will make signal_validation's fallback rr/confidence bar
+    # horizon-selectable; it must ship numerically equal to swing's existing
+    # hardcoded 1.5 / 0.6 so this stage never silently lowers the bar for scalp.
+    s = Settings(**_base_kwargs())
+    assert s.scalp_min_rr == 1.5
+    assert s.scalp_min_confidence == 0.6
+
+
+def test_scalp_ranking_weight_sum_mismatch_only_warns():
+    s = Settings(**_base_kwargs(scalp_ranking_weight_entry_quality=0.9))
+    assert any("scalp_ranking_weight_" in w for w in s.config_warnings)
+
+
+def test_scalp_ranking_weight_defaults_sum_to_one():
+    s = Settings(**_base_kwargs())
+    total = (
+        s.scalp_ranking_weight_entry_quality
+        + s.scalp_ranking_weight_mtf_alignment
+        + s.scalp_ranking_weight_volume_liquidity
+        + s.scalp_ranking_weight_regime
+        + s.scalp_ranking_weight_historical_expectancy
+        + s.scalp_ranking_weight_ml_probability
+    )
+    assert abs(total - 1.0) < 0.01
+    assert not any("scalp_ranking_weight_" in w for w in s.config_warnings)
+
+
 # ---------------------------------------------------------------------------
 # The legacy execute_trades() adapter-selection path (src/execution/adapter.py) must
 # also be unable to construct a real broker-capable adapter under the C-2 combination --

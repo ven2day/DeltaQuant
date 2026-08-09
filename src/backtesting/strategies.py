@@ -51,6 +51,7 @@ class RealSignalStrategy(Strategy):
         symbol: str = "UNKNOWN",
         min_bars: int = 50,
         strategy_types: list[StrategyType] | None = None,
+        timeframe: Timeframe = Timeframe.D1,
     ):
         """
         Args:
@@ -60,10 +61,19 @@ class RealSignalStrategy(Strategy):
                 four if None). Used by scripts/validate_strategy.py to walk-forward
                 validate ONE named strategy at a time for the H-8 admission registry,
                 instead of only the mixed "best signal of any strategy" default.
+            timeframe: The actual bar frequency of the data this strategy is fed
+                (default D1, matching every pre-existing caller). Previously
+                hardcoded regardless of what interval the caller actually passed in
+                -- meaning every H-8 registry artifact registered before this field
+                existed was labeled D1 even if (hypothetically) intraday data had
+                been fed in. Passing the real timeframe here is what makes an
+                honestly-labeled SCALP/5m artifact possible (see
+                scripts/validate_strategy.py's --interval flag).
         """
         self.symbol = symbol
         self.min_bars = min_bars
         self.strategy_types = strategy_types
+        self.timeframe = timeframe
         self._engine = SignalEngine()
 
     def on_bar(self, row: pd.Series, history: pd.DataFrame) -> str | None:
@@ -72,7 +82,7 @@ class RealSignalStrategy(Strategy):
         # The live indicators expect lowercase OHLCV column names.
         df = history.rename(columns=str.lower)
         try:
-            indicators = calculate_indicators(df, self.symbol, timeframe=Timeframe.D1)
+            indicators = calculate_indicators(df, self.symbol, timeframe=self.timeframe)
             signals = self._engine.generate_signals(
                 indicators, active_strategies=self.strategy_types
             )

@@ -68,6 +68,46 @@ def test_intraday_refetches_after_ttl_expires(hm):
         assert mock_fetch.call_count == 2
 
 
+def test_m5_intraday_timeframe_fetches_and_caches(hm):
+    """M5 is a native, directly-fetched timeframe (not resampled from anything) --
+    same fetch/cache contract as M15, just its own native interval string."""
+    fetched = _ohlcv(100, "5min")
+    with patch.object(hm._feed, "get_historical", return_value=fetched) as mock_fetch:
+        result = hm.get_multi_timeframe_history("TEST", Timeframe.M5, bars=50)
+        assert result is not None
+        assert len(result) == 50
+        assert list(result.columns) == ["open", "high", "low", "close", "volume"]
+        mock_fetch.assert_called_once_with("TEST", period="60d", interval="5m")
+
+        # Second call within the TTL window must not re-fetch.
+        hm.get_multi_timeframe_history("TEST", Timeframe.M5)
+        assert mock_fetch.call_count == 1
+
+
+def test_m5_refetches_after_ttl_expires(hm):
+    fetched = _ohlcv(50, "5min")
+    with patch.object(hm._feed, "get_historical", return_value=fetched) as mock_fetch:
+        hm.get_multi_timeframe_history("TEST", Timeframe.M5)
+        assert mock_fetch.call_count == 1
+
+        # Force the cached fetch to look stale.
+        key = ("TEST", Timeframe.M5)
+        hm._intraday_last_fetch[key] = datetime.now() - timedelta(hours=1)
+
+        hm.get_multi_timeframe_history("TEST", Timeframe.M5)
+        assert mock_fetch.call_count == 2
+
+
+def test_m5_has_an_explicit_refresh_ttl_not_the_implicit_default():
+    """Stage 10 scans M5 for every symbol every cycle (not just candidate-eval as
+    before), so the TTL should be a deliberate, named value rather than silently
+    inherited from INTRADAY_REFRESH_SECONDS.get(tf, 300)'s fallback."""
+    from src.market.history_manager import INTRADAY_REFRESH_SECONDS
+
+    assert Timeframe.M5 in INTRADAY_REFRESH_SECONDS
+    assert INTRADAY_REFRESH_SECONDS[Timeframe.M5] == 5 * 60
+
+
 def test_m30_resamples_from_m15_without_a_second_fetch(hm):
     fetched = _ohlcv(200, "15min")
     with patch.object(hm._feed, "get_historical", return_value=fetched) as mock_fetch:

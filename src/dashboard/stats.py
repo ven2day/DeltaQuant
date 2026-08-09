@@ -8,7 +8,7 @@ of truth for session stats — the web UI serializes it directly
 
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from src.utils.market_time import now_ist
 
@@ -86,6 +86,25 @@ class TradingStats:
     regime_confidence: float = 0.0
     active_strategies: list = field(default_factory=list)
 
+    # What each agent actually did/decided on the most recently completed cycle --
+    # not just the aggregate counters above. Populated every cycle regardless of
+    # whether it produced a trade, so "nothing happened" is never a mystery.
+    regime_reasoning: str = ""
+    strategy_reasoning: str = ""
+    # News headlines Google-RSS'd + Groq-scored this cycle: [{"title", "sentiment"}].
+    news_headlines: list = field(default_factory=list)
+    news_sentiment: float = 0.0  # -1 (bearish) to +1 (bullish), avg of the headlines
+    # SentimentSignal.to_dict(): mood_index (0-100), mood_label, news_score,
+    # volatility_score, breadth_score.
+    market_mood: dict = field(default_factory=dict)
+    # PredictionSignal.to_dict() list -- the ML ensemble's direction call per symbol
+    # reviewed this cycle (up to 3), including abstains.
+    prediction_signals: list = field(default_factory=list)
+    # Set when an LLM node degraded to its rule-based/heuristic fallback this cycle
+    # (Groq rate limit, circuit breaker open, disabled, or an outright error) -- plain
+    # English, e.g. "Signal Validation: the AI reviewer hit its daily usage limit".
+    agent_fallback_notice: str = ""
+
     # FinOps (LLM cost tracking, today / IST)
     llm_calls: int = 0
     llm_tokens: int = 0
@@ -118,6 +137,20 @@ class TradingStats:
     last_decision_reason: str = ""
     current_signal: dict = field(default_factory=dict)
     candidate_decisions: list = field(default_factory=list)
+
+    # Scalp horizon: top-ranked ScalpOpportunity.to_dict() dicts, refreshed every
+    # cycle the same way candidate_decisions is (see scripts/run_live_trading.py) --
+    # empty unless settings.scalp_enabled=True. Serialized automatically by
+    # stats_to_dict()'s dataclasses.asdict(), no webui backend change needed.
+    scalp_opportunities: list = field(default_factory=list)
+    # Funnel counters for one cycle's scalp pipeline (req 13): raw strategy triggers
+    # -> consolidated symbol/timeframe decisions -> multi-timeframe scalp candidates
+    # -> entry-quality passed -> regime-compatible -> H-8 admitted -> sent to AI ->
+    # AI approved -> execution accepted. Reset to zero at the start of each cycle's
+    # scalp scan so a cycle with scalp_enabled=False just shows an all-zero funnel
+    # rather than stale counts from a previous cycle.
+    scalp_funnel: dict = field(default_factory=dict)
+
     chart_symbol: str = ""
     chart_timeframes: dict = field(default_factory=dict)
     simulation_event_time: str = ""
@@ -126,6 +159,18 @@ class TradingStats:
 
     # Recent activity log
     activity_log: list = field(default_factory=list)
+
+    # Live cycle lifecycle -- which step the *in-progress* cycle is currently on, so
+    # the dashboard can show "what's happening right now" without reading raw logs.
+    # cycle_stage is a stable machine key for styling; cycle_stage_label is the
+    # human-readable text.
+    current_cycle_number: int = 0
+    cycle_stage: str = "idle"
+    cycle_stage_label: str = "Waiting for the next cycle"
+    cycle_stage_started_at: str = ""
+    # Only set while cycle_stage == "waiting" -- ISO timestamp of when the next cycle
+    # starts, for a countdown; "" the rest of the time.
+    next_cycle_at: str = ""
 
     @property
     def win_rate(self) -> float:
@@ -178,6 +223,27 @@ class TradingDashboard:
         self.stats.log_activity("Session started", "INFO")
         self.stats.log_activity(f"Mode: {mode.upper()}", "INFO")
         self.stats.log_activity(f"Data: {data_source.upper()}", "INFO")
+
+    def set_cycle_stage(self, stage: str, label: str, *, cycle: int | None = None) -> None:
+        """Record which step the in-progress cycle is currently on.
+
+        Called at every major step boundary in the live loop (Step 0-7 in
+        run_live_trading.py) so the dashboard always reflects "what's happening right
+        now" -- previously the only way to know this was reading raw backend logs.
+        """
+        self.stats.cycle_stage = stage
+        self.stats.cycle_stage_label = label
+        self.stats.cycle_stage_started_at = now_ist().isoformat()
+        if cycle is not None:
+            self.stats.current_cycle_number = cycle
+        if stage != "waiting":
+            self.stats.next_cycle_at = ""
+
+    def set_next_cycle_countdown(self, wait_seconds: int) -> None:
+        """Mark the cycle as idle/waiting and record when the next one starts."""
+        next_at = now_ist() + timedelta(seconds=wait_seconds)
+        self.stats.next_cycle_at = next_at.isoformat()
+        self.set_cycle_stage("waiting", f"Next cycle in {wait_seconds}s")
 
     def update_regime(self, regime: str, confidence: float, strategies: list):
         """Update market regime info."""

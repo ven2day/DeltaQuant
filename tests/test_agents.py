@@ -32,6 +32,18 @@ class TestTradingState:
 
         assert state["workflow_id"] == "TEST-123"
 
+    def test_create_initial_state_defaults_to_swing_horizon(self):
+        """Every pre-existing caller (which never passes trade_horizon) must keep
+        getting SWING, so the new field can't silently change existing behavior."""
+        state = create_initial_state()
+
+        assert state["trade_horizon"] == "SWING"
+
+    def test_create_initial_state_accepts_scalp_horizon(self):
+        state = create_initial_state(trade_horizon="SCALP")
+
+        assert state["trade_horizon"] == "SCALP"
+
 
 class TestRiskCompliance:
     """Tests for the risk compliance agent."""
