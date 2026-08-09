@@ -53,6 +53,7 @@ print(f"Effective Mode:   {effective_execution_mode}  (after C-2 safety resoluti
 print(f"REAL ORDERS:      {'[YES] -- genuine broker orders CAN be placed' if real_orders else '[NO]'}")
 print(f"Paper Wallet:     Rs.{s.paper_wallet_balance:,.0f}")
 print(f"News Analysis:    {'[Enabled]' if s.enable_news_analysis else '[Disabled]'}")
+print(f"Scalping:         {'[Enabled]' if s.scalp_enabled else '[Disabled]'}")
 
 # Telegram
 telegram_ok = bool(getattr(s, "telegram_bot_token", None) and getattr(s, "telegram_chat_id", None))
