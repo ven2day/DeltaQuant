@@ -278,9 +278,12 @@ uv run python scripts/check_config.py            # validate config first
 uv run --extra web python scripts/run_live_trading.py
 ```
 
-The backend dashboard API is served at `http://127.0.0.1:8010` once `ENABLE_WEB_UI=true` is
-set in `.env` (generate the login with `scripts/set_dashboard_password.py` first — see
-[Scripts Reference](#scripts-reference)).
+The backend (trading loop + FastAPI/WebSocket dashboard API) runs in the foreground here —
+`Ctrl+C` stops it. It serves at `http://<WEB_UI_HOST>:<WEB_UI_PORT>` (default
+`127.0.0.1:8000`) once `ENABLE_WEB_UI=true` is set in `.env` (generate the login with
+`scripts/set_dashboard_password.py` first — see [Scripts Reference](#scripts-reference)).
+Omit `--extra web` to run the trading loop with no dashboard backend at all — useful for a
+minimal headless install with no Node/FastAPI dependency surface.
 
 ### 4. Start the web dashboard (optional)
 
@@ -291,14 +294,50 @@ cp .env.local.example .env.local   # set NEXT_PUBLIC_WS_URL if the backend isn't
 npm run dev
 ```
 
-Open `http://localhost:3000`.
+Open `http://localhost:3000`. `npm run dev` also runs in the foreground; `Ctrl+C` stops it.
+For a production run (faster, no hot-reload overhead), build once and start the compiled
+server instead: `npm run build && npm run start`.
 
-### Running everything on a VPS
+### Starting and stopping in the background (VPS / long-running)
+
+The trading loop and the dashboard are two independent processes — start, stop, or restart
+either one without touching the other.
+
+| Action | Backend only | Frontend only | Both together |
+| --- | --- | --- | --- |
+| **Start** | `nohup uv run --extra web python scripts/run_live_trading.py > logs/backend.log 2>&1 &` | `cd web && nohup npm run dev > ../logs/frontend.log 2>&1 &` | `./scripts/start_all.sh` |
+| **Stop** | `kill $(cat run/backend.pid)` | `kill $(cat run/frontend.pid)` | `./scripts/stop_all.sh` |
+| **Status** | `kill -0 $(cat run/backend.pid) && echo running` | `kill -0 $(cat run/frontend.pid) && echo running` | same, for each PID file |
+| **Logs** | `tail -f logs/backend.log` | `tail -f logs/frontend.log` | both of the above |
+
+`scripts/start_all.sh` runs the same two commands as the "Backend only"/"Frontend only" start
+column, records each PID under `run/*.pid`, and is a no-op (prints "already running") if a
+PID file already points at a live process — safe to re-run. `scripts/stop_all.sh` reads those
+same PID files, sends `SIGTERM`, and removes the file; it prints "not running" (and cleans up
+harmlessly) if a process already died some other way. If you ever start the backend or
+frontend manually (bypassing `start_all.sh`, e.g. by copy-pasting the "Backend only" command
+above), write the PID yourself so `stop_all.sh` can still find it later:
+`echo $! > run/backend.pid` (or `run/frontend.pid`) right after backgrounding it.
+
+To pick up a code change, restart rather than reload — neither process watches for edits to
+`src/`/`scripts/` in a background run (the frontend's `npm run dev` does hot-reload its own
+`web/` sources, but not the Python backend):
 
 ```bash
-./scripts/start_all.sh   # backend + frontend, backgrounded with PID files under run/
-./scripts/stop_all.sh    # stop both cleanly
+./scripts/stop_all.sh && ./scripts/start_all.sh
 ```
+
+**Common environment overrides at start time** (prepend to any of the start commands above,
+or set permanently in `.env`):
+
+| Override | Effect |
+| --- | --- |
+| `SCALP_ENABLED=true` | Turns on the [scalping](#scalping-5m15m-trade-horizon) pipeline for this run. |
+| `SIGNAL_TIMEFRAMES=5m,15m,30m,1h,4h` | Adds `5m` to the swing scan's own timeframes too. |
+| `FORCE_TRADING_WINDOW=true` | Bypasses the market-hours/weekday gate — **testing only**, see the loud warning it logs on startup. |
+| `TRADING_CYCLE_SECONDS=60` | Shortens the interval between agent-review cycles for faster iteration while developing. |
+
+Example: `SCALP_ENABLED=true SIGNAL_TIMEFRAMES=5m,15m,30m,1h,4h nohup uv run --extra web python scripts/run_live_trading.py > logs/backend.log 2>&1 &`
 
 ### Validate before you trade real money
 
