@@ -817,8 +817,8 @@ class Settings(BaseSettings):
         default="data/strategy_registry",
         description="Directory of immutable StrategyVersion validation artifacts, sourced "
         "from walk_forward.edge_verdict(). strategy_selection_node and risk_compliance's "
-        "strategy-admission check both read from here; a named strategy "
-        "(momentum/mean_reversion/breakout/trend_following) with no current, non-expired "
+        "strategy-admission check both read from here; a named strategy (any "
+        "src.market.signals.StrategyType member) with no current, non-expired "
         "VALIDATED artifact here is stripped from the active-strategy list and blocked at "
         "the risk gate -- fail closed, not a warning. Populate by running "
         "`uv run python scripts/validate_strategy.py`, which registers a version per "

@@ -26,11 +26,17 @@ from src.agents.llm_factory import (
 from src.backtesting.strategy_registry import StrategyRegistry
 from src.config import get_settings
 from src.finops import record_llm_response
+from src.market.signals import StrategyType
 from src.utils.circuit_breaker import CircuitBreakerOpenError
 
 from .state import TradingState
 
 logger = logging.getLogger(__name__)
+
+# Every strategy name the LLM is allowed to select, derived from the same enum the
+# signal engine and the H-8 admission gate use -- one source of truth instead of a
+# hardcoded list that could silently drift out of sync when a strategy is added.
+_VALID_STRATEGY_NAMES = [member.value for member in StrategyType]
 
 
 def _gate_active_strategies(strategies: list[str], regime: str) -> list[str]:
@@ -70,6 +76,9 @@ Available strategies:
 - mean_reversion: Best in ranging markets with clear support/resistance
 - breakout: Best when volatility is low and a breakout is anticipated
 - trend_following: Best in established trends with high ADX
+- ema_heiken_ashi_rsi: Best in established trends; explicitly sits out sideways markets
+- ema_psar: Best in trending markets with sustained directional moves; avoid in choppy/sideways conditions
+- ema_cci: Best when a long-term (EMA200) trend has strong momentum confirmation
 
 Consider:
 - Avoid strategies that historically underperformed in the current regime
@@ -189,8 +198,14 @@ def _fallback_strategy_selection(
     """
     # Default strategies per regime
     regime_strategies = {
-        "trending_up": ["momentum", "trend_following"],
-        "trending_down": ["trend_following"],
+        "trending_up": [
+            "momentum",
+            "trend_following",
+            "ema_heiken_ashi_rsi",
+            "ema_psar",
+            "ema_cci",
+        ],
+        "trending_down": ["trend_following", "ema_heiken_ashi_rsi", "ema_psar", "ema_cci"],
         "ranging": ["mean_reversion"],
         "volatile": ["breakout"],
     }
@@ -306,9 +321,8 @@ def _parse_strategy_response(content: str) -> dict[str, Any]:
         result = json.loads(content)
 
         # Validate strategies
-        valid_strategies = ["momentum", "mean_reversion", "breakout", "trend_following"]
         result["active_strategies"] = [
-            s for s in result.get("active_strategies", []) if s in valid_strategies
+            s for s in result.get("active_strategies", []) if s in _VALID_STRATEGY_NAMES
         ]
 
         if not result["active_strategies"]:

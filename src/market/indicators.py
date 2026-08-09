@@ -13,7 +13,7 @@ from typing import Any
 
 import pandas as pd
 from ta.momentum import RSIIndicator, StochasticOscillator
-from ta.trend import MACD, ADXIndicator, EMAIndicator, SMAIndicator
+from ta.trend import MACD, ADXIndicator, CCIIndicator, EMAIndicator, PSARIndicator, SMAIndicator
 from ta.volatility import AverageTrueRange, BollingerBands
 from ta.volume import VolumeWeightedAveragePrice
 
@@ -74,11 +74,19 @@ class IndicatorConfig:
     bb_period: int = 20
     bb_std: int = 2
 
+    # Additional trend/momentum indicators (EMA-CCI, EMA-Heiken-Ashi-RSI, EMA-PSAR
+    # strategies)
+    cci_period: int = 14
+    psar_step: float = 0.02
+    psar_max_step: float = 0.2
+
     def __post_init__(self):
         if self.sma_periods is None:
             self.sma_periods = [20, 50, 200]
         if self.ema_periods is None:
-            self.ema_periods = [9, 21, 55]
+            # 20/40 (EMA-PSAR crossover) and 200 (EMA-CCI trend filter) added alongside
+            # the original 9/21/55 -- purely additive, existing consumers (ema[21]) unaffected.
+            self.ema_periods = [9, 20, 21, 40, 55, 200]
 
 
 @dataclass
@@ -122,6 +130,19 @@ class IndicatorResult:
     # VWAP
     vwap: float = None
 
+    # Commodity Channel Index (EMA-CCI strategy)
+    cci: float = None
+
+    # Parabolic SAR (EMA-Parabolic-SAR strategy). `psar_bullish=True` means the dot is
+    # below price (uptrend); False means above price (downtrend).
+    psar: float = None
+    psar_bullish: bool = None
+
+    # Heiken Ashi candle color, current bar and the one before it (EMA-Heiken-Ashi-RSI
+    # strategy needs the flip from the previous bar, not just the current color).
+    ha_bullish: bool = None
+    ha_prev_bullish: bool = None
+
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for serialization."""
         return {
@@ -159,7 +180,44 @@ class IndicatorResult:
                 "bb_percent": self.bb_percent,
             },
             "vwap": self.vwap,
+            "cci": self.cci,
+            "psar": self.psar,
+            "psar_bullish": self.psar_bullish,
+            "ha_bullish": self.ha_bullish,
+            "ha_prev_bullish": self.ha_prev_bullish,
         }
+
+
+def _heiken_ashi_bullish_flags(df: pd.DataFrame) -> tuple[bool | None, bool | None]:
+    """Return (current_bullish, previous_bullish) Heiken Ashi candle color.
+
+    HA_close = (O+H+L+C)/4; HA_open = midpoint of the *previous* HA candle's
+    open/close (first bar: midpoint of its own O/C) -- each HA bar depends on the one
+    before it, so this is computed with a running loop rather than vectorized. Only the
+    last two bars are needed by the EMA-Heiken-Ashi-RSI strategy (to detect a color
+    flip), so nothing beyond that is retained.
+    """
+    if len(df) < 2:
+        return None, None
+
+    ha_open_prev: float | None = None
+    ha_close_prev: float | None = None
+    bullish_flags: list[bool] = []
+    for _, row in df.iloc[-30:].iterrows():
+        o, h, low, c = (
+            float(row["open"]),
+            float(row["high"]),
+            float(row["low"]),
+            float(row["close"]),
+        )
+        ha_close = (o + h + low + c) / 4
+        ha_open = (o + c) / 2 if ha_open_prev is None else (ha_open_prev + ha_close_prev) / 2
+        bullish_flags.append(ha_close > ha_open)
+        ha_open_prev, ha_close_prev = ha_open, ha_close
+
+    if len(bullish_flags) < 2:
+        return bullish_flags[-1], None
+    return bullish_flags[-1], bullish_flags[-2]
 
 
 def calculate_indicators(
@@ -289,6 +347,34 @@ def calculate_indicators(
         )
         vwap = _safe_float(vwap_indicator.volume_weighted_average_price().iloc[-1])
 
+    # Calculate CCI (EMA-CCI strategy)
+    cci = None
+    if len(df) >= config.cci_period:
+        cci_indicator = CCIIndicator(
+            df["high"],
+            df["low"],
+            df["close"],
+            window=config.cci_period,
+        )
+        cci = _safe_float(cci_indicator.cci().iloc[-1])
+
+    # Calculate Parabolic SAR (EMA-Parabolic-SAR strategy)
+    psar, psar_bullish = None, None
+    if len(df) >= 2:
+        psar_indicator = PSARIndicator(
+            df["high"],
+            df["low"],
+            df["close"],
+            step=config.psar_step,
+            max_step=config.psar_max_step,
+        )
+        psar = _safe_float(psar_indicator.psar().iloc[-1])
+        if psar is not None:
+            psar_bullish = psar < float(latest["close"])
+
+    # Heiken Ashi candle color, current + previous bar (EMA-Heiken-Ashi-RSI strategy)
+    ha_bullish, ha_prev_bullish = _heiken_ashi_bullish_flags(df)
+
     return IndicatorResult(
         symbol=symbol,
         timeframe=timeframe,
@@ -314,6 +400,11 @@ def calculate_indicators(
         bb_lower=bb_lower,
         bb_percent=bb_percent,
         vwap=vwap,
+        cci=cci,
+        psar=psar,
+        psar_bullish=psar_bullish,
+        ha_bullish=ha_bullish,
+        ha_prev_bullish=ha_prev_bullish,
     )
 
 

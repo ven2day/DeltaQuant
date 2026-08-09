@@ -39,6 +39,14 @@ class StrategyType(Enum):
     MEAN_REVERSION = "mean_reversion"
     BREAKOUT = "breakout"
     TREND_FOLLOWING = "trend_following"
+    # Adapted from a Traderversity.com strategy guide (EMA-Heiken-Ashi-RSI, EMA-Parabolic
+    # SAR, EMA-CCI): standard, well-documented indicator combinations, not proprietary
+    # black-box logic. Like every other strategy here, none of these three admit live
+    # trades until they clear scripts/validate_strategy.py's walk-forward gate (H-8) --
+    # the source guide ships no backtested evidence, just one narrated example chart.
+    EMA_HEIKEN_ASHI_RSI = "ema_heiken_ashi_rsi"
+    EMA_PSAR = "ema_psar"
+    EMA_CCI = "ema_cci"
 
 
 @dataclass
@@ -161,6 +169,12 @@ class SignalEngine:
             return self._breakout_strategy(indicators)
         elif strategy == StrategyType.TREND_FOLLOWING:
             return self._trend_following_strategy(indicators)
+        elif strategy == StrategyType.EMA_HEIKEN_ASHI_RSI:
+            return self._ema_heiken_ashi_rsi_strategy(indicators)
+        elif strategy == StrategyType.EMA_PSAR:
+            return self._ema_psar_strategy(indicators)
+        elif strategy == StrategyType.EMA_CCI:
+            return self._ema_cci_strategy(indicators)
 
         return None
 
@@ -368,6 +382,166 @@ class SignalEngine:
 
         return self._create_signal(
             ind, signal_type, strength, StrategyType.TREND_FOLLOWING, confidence, reasons
+        )
+
+    def _ema_heiken_ashi_rsi_strategy(self, ind: IndicatorResult) -> TradingSignal | None:
+        """
+        EMA + Heiken Ashi + RSI strategy (Traderversity.com guide, adapted).
+
+        The source material's entry rule is: no trade in a sideways market; confirm trend
+        direction; confirm momentum with RSI vs the 50 level; enter on a Heiken Ashi
+        candle color flip in the confirmed direction. Two of those four steps reference
+        things the guide only shows as hand-drawn chart annotations, not a defined
+        formula ("flat support/resistance zones" for the sideways filter, "zones tilt" for
+        trend direction) -- there's nothing precise to port for either, so this uses the
+        indicators already computed here for the same job: ADX for trend-vs-sideways
+        (matches the existing trend_following strategy's use of the same threshold), and
+        price-vs-EMA21 for trend direction.
+
+        BUY: trending (ADX above threshold) + price above EMA21 (uptrend) + RSI > 50
+             (bullish momentum) + Heiken Ashi just flipped red -> green (entry trigger)
+        SELL: trending + price below EMA21 (downtrend) + RSI < 50 (bearish momentum) +
+              Heiken Ashi just flipped green -> red
+        """
+        if (
+            ind.adx is None
+            or ind.rsi is None
+            or ind.ha_bullish is None
+            or ind.ha_prev_bullish is None
+        ):
+            return None
+        if not ind.ema or 21 not in ind.ema:
+            return None
+
+        reasons = []
+        signal_type = SignalType.HOLD
+        strength = SignalStrength.WEAK
+        confidence = 0.0
+
+        ema_21 = ind.ema[21]
+        is_trending = ind.adx > self.adx_trend_threshold
+        ha_flipped_bullish = ind.ha_bullish and not ind.ha_prev_bullish
+        ha_flipped_bearish = (not ind.ha_bullish) and ind.ha_prev_bullish
+
+        if not is_trending:
+            reasons.append(f"ADX at {ind.adx:.1f} -- sideways market, no trade")
+        elif ind.close > ema_21 and ind.rsi > 50 and ha_flipped_bullish:
+            signal_type = SignalType.BUY
+            reasons.append(f"Uptrend: ADX {ind.adx:.1f}, price above EMA21 ({ema_21:.2f})")
+            reasons.append(f"RSI at {ind.rsi:.1f} confirms bullish momentum")
+            reasons.append("Heiken Ashi flipped red to green (entry trigger)")
+            strong = ind.rsi > 60 and ind.adx > 40
+            strength = SignalStrength.STRONG if strong else SignalStrength.MODERATE
+            confidence = 0.75 if strong else 0.6
+
+        elif ind.close < ema_21 and ind.rsi < 50 and ha_flipped_bearish:
+            signal_type = SignalType.SELL
+            reasons.append(f"Downtrend: ADX {ind.adx:.1f}, price below EMA21 ({ema_21:.2f})")
+            reasons.append(f"RSI at {ind.rsi:.1f} confirms bearish momentum")
+            reasons.append("Heiken Ashi flipped green to red (entry trigger)")
+            strong = ind.rsi < 40 and ind.adx > 40
+            strength = SignalStrength.STRONG if strong else SignalStrength.MODERATE
+            confidence = 0.75 if strong else 0.6
+
+        if signal_type == SignalType.HOLD:
+            return None
+
+        return self._create_signal(
+            ind, signal_type, strength, StrategyType.EMA_HEIKEN_ASHI_RSI, confidence, reasons
+        )
+
+    def _ema_psar_strategy(self, ind: IndicatorResult) -> TradingSignal | None:
+        """
+        EMA(20/40) + Parabolic SAR strategy (Traderversity.com guide, adapted).
+
+        BUY: 20 EMA crosses above 40 EMA (uptrend) AND the Parabolic SAR dot is below
+             price (bullish reversal/continuation confirmation)
+        SELL: 20 EMA below 40 EMA (downtrend) AND the PSAR dot is above price
+
+        The source guide enters on the *next* candle after both conditions align; this
+        engine (like every other strategy here) evaluates and signals on the current bar
+        instead of queuing a deferred entry -- consistent with how momentum/breakout/
+        trend_following already work in this codebase.
+        """
+        if ind.psar_bullish is None:
+            return None
+        if not ind.ema or 20 not in ind.ema or 40 not in ind.ema:
+            return None
+
+        reasons = []
+        signal_type = SignalType.HOLD
+        strength = SignalStrength.WEAK
+        confidence = 0.0
+
+        ema_20, ema_40 = ind.ema[20], ind.ema[40]
+        ema_gap_pct = abs(ema_20 - ema_40) / ema_40 * 100 if ema_40 else 0.0
+
+        if ema_20 > ema_40 and ind.psar_bullish:
+            signal_type = SignalType.BUY
+            reasons.append(f"EMA20 ({ema_20:.2f}) above EMA40 ({ema_40:.2f})")
+            reasons.append(f"Parabolic SAR dot below price at {ind.psar:.2f}")
+            strong = ema_gap_pct > 1.0
+            strength = SignalStrength.STRONG if strong else SignalStrength.MODERATE
+            confidence = 0.7 if strong else 0.55
+
+        elif ema_20 < ema_40 and not ind.psar_bullish:
+            signal_type = SignalType.SELL
+            reasons.append(f"EMA20 ({ema_20:.2f}) below EMA40 ({ema_40:.2f})")
+            reasons.append(f"Parabolic SAR dot above price at {ind.psar:.2f}")
+            strong = ema_gap_pct > 1.0
+            strength = SignalStrength.STRONG if strong else SignalStrength.MODERATE
+            confidence = 0.7 if strong else 0.55
+
+        if signal_type == SignalType.HOLD:
+            return None
+
+        return self._create_signal(
+            ind, signal_type, strength, StrategyType.EMA_PSAR, confidence, reasons
+        )
+
+    def _ema_cci_strategy(self, ind: IndicatorResult) -> TradingSignal | None:
+        """
+        EMA(200) + CCI(14) strategy, from TraderVersity-EMACCI.tpl (a MetaTrader chart
+        template naming exactly these two standard, well-documented indicators and their
+        parameters -- 200-period EMA trend filter, 14-period CCI with the standard +-100
+        levels).
+
+        BUY: price above EMA200 (long-term uptrend) AND CCI above +100 (strong bullish
+             momentum breakout)
+        SELL: price below EMA200 (long-term downtrend) AND CCI below -100 (strong
+              bearish momentum breakout)
+        """
+        if ind.cci is None or not ind.ema or 200 not in ind.ema:
+            return None
+
+        reasons = []
+        signal_type = SignalType.HOLD
+        strength = SignalStrength.WEAK
+        confidence = 0.0
+
+        ema_200 = ind.ema[200]
+
+        if ind.close > ema_200 and ind.cci > 100:
+            signal_type = SignalType.BUY
+            reasons.append(f"Price above EMA200 ({ema_200:.2f}) -- long-term uptrend")
+            reasons.append(f"CCI at {ind.cci:.1f} confirms bullish momentum breakout")
+            strong = ind.cci > 150
+            strength = SignalStrength.STRONG if strong else SignalStrength.MODERATE
+            confidence = 0.7 if strong else 0.55
+
+        elif ind.close < ema_200 and ind.cci < -100:
+            signal_type = SignalType.SELL
+            reasons.append(f"Price below EMA200 ({ema_200:.2f}) -- long-term downtrend")
+            reasons.append(f"CCI at {ind.cci:.1f} confirms bearish momentum breakout")
+            strong = ind.cci < -150
+            strength = SignalStrength.STRONG if strong else SignalStrength.MODERATE
+            confidence = 0.7 if strong else 0.55
+
+        if signal_type == SignalType.HOLD:
+            return None
+
+        return self._create_signal(
+            ind, signal_type, strength, StrategyType.EMA_CCI, confidence, reasons
         )
 
     def _directional_confidence(self, ind: IndicatorResult, signal_type: SignalType) -> float:

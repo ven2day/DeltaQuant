@@ -25,7 +25,7 @@ from .state import TradingState
 
 logger = logging.getLogger(__name__)
 
-# The four governed strategy names (src.market.signals.StrategyType) that the H-8
+# The governed strategy names (src.market.signals.StrategyType) that the H-8
 # admission registry knows how to validate. A signal tagged with one of these must have
 # a current VALIDATED registry artifact to be approved here -- fail closed. Signals that
 # don't carry one of these names (e.g. hand-built fixtures, other non-governed entry

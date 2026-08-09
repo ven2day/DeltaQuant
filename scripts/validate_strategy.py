@@ -9,7 +9,7 @@ the gate.
     uv run python scripts/validate_strategy.py
 
 In addition to the mixed-strategy universe report, this ALSO walk-forward-validates each named
-strategy (momentum/mean_reversion/breakout/trend_following) individually and registers the
+strategy (every src.market.signals.StrategyType member) individually and registers the
 result in the H-8 strategy admission registry (``settings.strategy_registry_dir``,
 DeltaQuant-Quant-Risk-Review.md) via ``StrategyRegistry``/``build_strategy_version``. Runtime
 strategy selection (``src/agents/strategy_selection.py``) and the risk-compliance final gate

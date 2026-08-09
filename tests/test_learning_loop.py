@@ -147,6 +147,31 @@ def test_perf_tracker_persists_across_restart(tmp_path):
     assert perf.win_rate == 0.5
 
 
+def test_get_all_strategy_performance_includes_ema_strategies(tmp_path):
+    """The three ema_* strategies (Traderversity-derived) must appear in every regime's
+    performance dict with their unproven-but-not-zero prior, same as any other strategy
+    with no trade history yet -- get_all_strategy_performance derives its strategy list
+    from StrategyType directly, so a new enum member can't be silently missed here."""
+    t = PerformanceTracker(database_url=f"sqlite:///{tmp_path}/p.db")
+
+    perf = t.get_all_strategy_performance("trending_up")
+    assert set(perf.keys()) == {
+        "momentum",
+        "mean_reversion",
+        "breakout",
+        "trend_following",
+        "ema_heiken_ashi_rsi",
+        "ema_psar",
+        "ema_cci",
+    }
+    assert perf["ema_heiken_ashi_rsi"] == 0.45
+    assert perf["ema_psar"] == 0.45
+    assert perf["ema_cci"] == 0.45
+
+    ranging_perf = t.get_all_strategy_performance("ranging")
+    assert ranging_perf["ema_cci"] == 0.30
+
+
 def test_get_summary_by_strategy_is_well_formed(tmp_path):
     t = PerformanceTracker(database_url=f"sqlite:///{tmp_path}/p.db")
     t.record_trade("momentum", "trending_up", 100, 1.0)

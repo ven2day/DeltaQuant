@@ -1389,7 +1389,13 @@ async def run_live_trading():
         )
         memory_lessons = memory_db.get_top_lessons_for_context(
             regime="trending_up" if market_breadth >= 0.5 else "trending_down",
-            strategies=["momentum", "trend_following"],
+            strategies=[
+                "momentum",
+                "trend_following",
+                "ema_heiken_ashi_rsi",
+                "ema_psar",
+                "ema_cci",
+            ],
             n=5,
         )
 

@@ -347,6 +347,19 @@ def test_parse_strategy_response():
     assert "trend_following" in res["active_strategies"]
 
 
+def test_parse_strategy_response_accepts_ema_strategies():
+    """The three Traderversity-derived strategies (ema_heiken_ashi_rsi, ema_psar,
+    ema_cci) must pass the same allowlist as the original four -- the LLM can select
+    them, but (like every strategy) they still need a current VALIDATED registry entry
+    to actually trade, enforced downstream by strategy_selection_node's H-8 gate."""
+    content = (
+        '{"active_strategies": ["ema_heiken_ashi_rsi", "ema_psar", "ema_cci"], '
+        '"reasoning": "trending market"}'
+    )
+    res = _parse_strategy_response(content)
+    assert res["active_strategies"] == ["ema_heiken_ashi_rsi", "ema_psar", "ema_cci"]
+
+
 @patch("src.agents.strategy_selection.create_chat_model")
 @patch("src.agents.strategy_selection.get_settings")
 def test_strategy_selection_node(mock_settings, mock_llm_cls, tmp_path):

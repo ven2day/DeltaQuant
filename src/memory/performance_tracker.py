@@ -15,6 +15,7 @@ from sqlalchemy import Boolean, Column, DateTime, Float, Integer, String
 from sqlalchemy.orm import Session
 
 from src.db.base import Base, get_session
+from src.market.signals import StrategyType
 
 logger = logging.getLogger(__name__)
 
@@ -79,31 +80,48 @@ class PerformanceTracker:
     cache, keeping the two in sync.
     """
 
-    # Default performance priors (used when no real data available)
+    # Default performance priors (used when no real data available). The three
+    # ema_* strategies are new (no trade history yet) -- their priors are set to a
+    # neutral, unproven 0.45 in trending regimes (same as the pre-existing "no data"
+    # fallback in get_strategy_performance) and a deliberately low 0.30 in
+    # ranging/volatile, matching their source material's own stated rule that they
+    # should not trade sideways/choppy conditions at all.
     DEFAULT_PERFORMANCE = {
         "trending_up": {
             "momentum": 0.60,
             "trend_following": 0.58,
             "breakout": 0.45,
             "mean_reversion": 0.40,
+            "ema_heiken_ashi_rsi": 0.45,
+            "ema_psar": 0.45,
+            "ema_cci": 0.45,
         },
         "trending_down": {
             "momentum": 0.55,
             "trend_following": 0.52,
             "breakout": 0.40,
             "mean_reversion": 0.42,
+            "ema_heiken_ashi_rsi": 0.45,
+            "ema_psar": 0.45,
+            "ema_cci": 0.45,
         },
         "ranging": {
             "mean_reversion": 0.58,
             "breakout": 0.48,
             "momentum": 0.38,
             "trend_following": 0.35,
+            "ema_heiken_ashi_rsi": 0.30,
+            "ema_psar": 0.30,
+            "ema_cci": 0.30,
         },
         "volatile": {
             "breakout": 0.45,
             "momentum": 0.40,
             "mean_reversion": 0.38,
             "trend_following": 0.35,
+            "ema_heiken_ashi_rsi": 0.30,
+            "ema_psar": 0.30,
+            "ema_cci": 0.30,
         },
     }
 
@@ -283,7 +301,7 @@ class PerformanceTracker:
         self, regime: str, lookback_days: int = 30
     ) -> dict[str, float]:
         """Get win rates for all strategies in a given regime (for strategy selection agent)."""
-        strategies = ["momentum", "mean_reversion", "breakout", "trend_following"]
+        strategies = [member.value for member in StrategyType]
         return {
             s: self.get_strategy_performance(s, regime, lookback_days).win_rate for s in strategies
         }
