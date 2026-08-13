@@ -9,13 +9,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from src.execution.costs import CostModel
-from src.execution.paper_engine import LocalPaperEngine
-from src.execution.service import (
+from src.markets.nse.execution.paper_engine import LocalPaperEngine
+from src.markets.nse.execution.service import (
     ExecutionMode,
     ExecutionService,
     IdempotencyStore,
 )
+from src.markets.nse.risk.costs import CostModel
 
 
 def _unique_sqlite_url(tmp_path) -> str:
@@ -67,7 +67,7 @@ def test_dhan_paper_without_opt_in_runs_shadow(engine, tmp_path):
 
 
 def test_c2_hazardous_combination_cannot_reach_real_broker_submission(engine, tmp_path):
-    """Regression test for C-2 (DeltaQuant-Quant-Risk-Review.md).
+    """Regression test for C-2 (docs/audits/DeltaQuant-Quant-Risk-Review.md).
 
     The audited hazard: TRADING_MODE=paper, EXECUTION_MODE=dhan_paper,
     ALLOW_LIVE_ORDERS=true, with valid Dhan credentials, used to resolve to a
@@ -85,7 +85,7 @@ def test_c2_hazardous_combination_cannot_reach_real_broker_submission(engine, tm
     broker_executor = MagicMock()
     broker_executor.place_and_confirm = AsyncMock()
 
-    with patch("src.execution.service.get_settings", return_value=fake_settings):
+    with patch("src.markets.nse.execution.service.get_settings", return_value=fake_settings):
         svc = ExecutionService(
             engine=engine,
             mode=ExecutionMode.DHAN_PAPER,
@@ -119,7 +119,7 @@ def test_live_mode_requires_trading_mode_live_independent_of_allow_live_orders(e
         dhan_client_id="real-client-id",
         dhan_access_token="real-access-token",
     )
-    with patch("src.execution.service.get_settings", return_value=fake_settings):
+    with patch("src.markets.nse.execution.service.get_settings", return_value=fake_settings):
         svc = ExecutionService(
             engine=engine,
             mode=ExecutionMode.LIVE,
@@ -137,7 +137,7 @@ def test_real_orders_active_true_only_for_full_conjunction(engine, tmp_path):
         dhan_access_token="real-access-token",
     )
     broker_executor = MagicMock()
-    with patch("src.execution.service.get_settings", return_value=fake_settings):
+    with patch("src.markets.nse.execution.service.get_settings", return_value=fake_settings):
         svc = ExecutionService(
             engine=engine,
             mode=ExecutionMode.LIVE,
@@ -159,7 +159,7 @@ def test_live_via_sync_submit_rejects_directs_to_async(engine, tmp_path):
     # Live orders are async (broker lifecycle); the sync submit() must refuse, never silently
     # fill the paper wallet. Real live submission goes through submit_async (see live tests).
     fake_settings = MagicMock(dhan_client_id="id", dhan_access_token="tok", trading_mode="live")
-    with patch("src.execution.service.get_settings", return_value=fake_settings):
+    with patch("src.markets.nse.execution.service.get_settings", return_value=fake_settings):
         svc = ExecutionService(
             engine=engine,
             mode=ExecutionMode.LIVE,

@@ -1,4 +1,4 @@
-"""Tests for src/market/dhan_historical_feed.py — DhanHQ candle fetching.
+"""Tests for src/markets/nse/broker/dhan/historical.py — DhanHQ candle fetching.
 
 Response shapes here mirror DhanHQ's documented /charts/intraday and
 /charts/historical schema: an object of parallel arrays keyed by
@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from src.market.dhan_historical_feed import (
+from src.markets.nse.broker.dhan.historical import (
     DhanHistoricalFeed,
     _parse_ohlcv_response,
     _period_to_days,
@@ -22,7 +22,7 @@ def _no_real_rate_limiting():
     # shared process-wide state (see src/utils/rate_limiter.py), and depleting its
     # token bucket across many tests causes genuine sleeps (observed: a 13-test file
     # went from <1s to 4+s before this fixture existed).
-    with patch("src.market.dhan_historical_feed.get_dhan_data_api_limiter") as mock_limiter:
+    with patch("src.markets.nse.broker.dhan.historical.get_dhan_data_api_limiter") as mock_limiter:
         yield mock_limiter
 
 
@@ -34,11 +34,11 @@ def _mock_settings():
 
 def _feed(security_ids=None):
     with (
-        patch("src.market.dhan_historical_feed.get_settings", return_value=_mock_settings()),
-        patch("src.market.dhan_historical_feed.get_valid_access_token", return_value="token"),
-        patch("src.market.dhan_historical_feed.get_dhan_client"),
+        patch("src.markets.nse.broker.dhan.historical.get_settings", return_value=_mock_settings()),
+        patch("src.markets.nse.broker.dhan.historical.get_valid_access_token", return_value="token"),
+        patch("src.markets.nse.broker.dhan.historical.get_dhan_client"),
         patch(
-            "src.market.dhan_historical_feed.fetch_security_id_map",
+            "src.markets.nse.broker.dhan.historical.fetch_security_id_map",
             return_value=security_ids or {"RELIANCE": "2885"},
         ),
     ):
@@ -77,6 +77,12 @@ def test_period_to_days_long_periods_are_not_clamped():
     # periods this long -- the day count itself must stay true, not clamped.
     assert _period_to_days("730d") == 730
     assert _period_to_days("2y") == 730
+
+
+def test_period_to_days_accepts_bounded_incremental_day_windows():
+    assert _period_to_days("3d") == 3
+    assert _period_to_days("0d") == 1
+    assert _period_to_days("99999d") == 5 * 365
 
 
 def test_period_to_days_unknown_period_defaults_to_max():

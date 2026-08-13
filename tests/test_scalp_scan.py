@@ -1,5 +1,5 @@
 """
-Orchestration tests for src/market/scalp_scan.py's run_scalp_scan() -- the
+Orchestration tests for src/markets/nse/strategies/scalp_scan.py's run_scalp_scan() -- the
 extracted, directly-testable core of run_live_trading.py's Stage-10 scalp scan
 branch. Verifies funnel counters and final ranked output using plain async stub
 fetch functions instead of a live HistoryManager/dashboard session.
@@ -12,9 +12,14 @@ from unittest.mock import MagicMock, patch
 import pandas as pd
 import pytest
 
-from src.market.indicators import Timeframe
-from src.market.scalp_scan import empty_funnel, run_scalp_scan
-from src.market.signals import SignalStrength, SignalType, StrategyType, TradingSignal
+from src.agents.prediction import PredictionSignal
+from src.core.candidates import SignalStrength, SignalType, StrategyType, TradingSignal
+from src.core.indicators import Timeframe
+from src.markets.nse.strategies.scalp_scan import (
+    empty_funnel,
+    run_scalp_scan,
+    run_scalp_scan_detailed,
+)
 
 
 @dataclass
@@ -116,10 +121,10 @@ def _patched_settings(settings):
     (`from src.config import get_settings`), so each needs its own patch target."""
     with contextlib.ExitStack() as stack:
         for target in (
-            "src.market.assessment_matrix.get_settings",
-            "src.market.scalp_confirmation.get_settings",
-            "src.market.entry_quality.get_settings",
-            "src.market.scalp_ranking.get_settings",
+            "src.markets.nse.strategies.assessment_matrix.get_settings",
+            "src.markets.nse.strategies.scalp_confirmation.get_settings",
+            "src.markets.nse.strategies.entry_quality.get_settings",
+            "src.markets.nse.strategies.scalp_ranking.get_settings",
         ):
             stack.enter_context(patch(target, return_value=settings))
         yield
@@ -129,9 +134,7 @@ ALL_TIMEFRAMES = [Timeframe.M5, Timeframe.M15, Timeframe.M30, Timeframe.H1, Time
 
 
 def _full_alignment_engine(symbol="RELIANCE") -> _FakeSignalEngine:
-    return _FakeSignalEngine(
-        {tf: [_signal(symbol, timeframe=tf)] for tf in ALL_TIMEFRAMES}
-    )
+    return _FakeSignalEngine({tf: [_signal(symbol, timeframe=tf)] for tf in ALL_TIMEFRAMES})
 
 
 async def _run(
@@ -141,6 +144,8 @@ async def _run(
     settings=None,
     tracker=None,
     frames: dict | None = None,
+    predictions: dict | None = None,
+    detailed: bool = False,
 ):
     settings = settings or _settings_mock()
     tracker = tracker or _Tracker()
@@ -152,8 +157,13 @@ async def _run(
     async def fetch_5m_frame(symbol):
         return frames.get(symbol, _quiet_frame())
 
+    async def fetch_prediction(symbol, timeframe, strategy_version):
+        assert strategy_version in {strategy.value for strategy in StrategyType}
+        return (predictions or {}).get((symbol, timeframe))
+
     with _patched_settings(settings):
-        return await run_scalp_scan(
+        scan = run_scalp_scan_detailed if detailed else run_scalp_scan
+        return await scan(
             scan_symbols,
             settings=settings,
             scalp_signal_engine=engine,
@@ -163,6 +173,7 @@ async def _run(
             performance_tracker=tracker,
             fetch_indicators=fetch_indicators,
             fetch_5m_frame=fetch_5m_frame,
+            fetch_prediction=fetch_prediction if predictions is not None else None,
         )
 
 
@@ -197,6 +208,30 @@ async def test_full_alignment_produces_one_ranked_opportunity():
 
 
 @pytest.mark.asyncio
+async def test_detailed_scan_blends_local_ml_and_returns_it_for_llm_reuse():
+    engine = _full_alignment_engine()
+    prediction = PredictionSignal(
+        symbol="RELIANCE",
+        direction="up",
+        confidence=0.78,
+        predicted_change_pct=0.25,
+        reasoning="walk-forward local history",
+        oos_samples=120,
+    )
+    result = await _run(
+        ["RELIANCE"],
+        engine,
+        predictions={("RELIANCE", timeframe): prediction for timeframe in ALL_TIMEFRAMES},
+        detailed=True,
+    )
+
+    assert result.funnel["ml_scored"] == len(ALL_TIMEFRAMES)
+    assert result.predictions[("RELIANCE", "5m")] is prediction
+    assert result.opportunities[0].ml_probability == pytest.approx(0.78)
+    assert result.symbol_statuses[0].ml_probability == pytest.approx(0.78)
+
+
+@pytest.mark.asyncio
 async def test_insufficient_mtf_alignment_stops_before_entry_quality():
     # Only 5m fires -- 15m/30m/1h/4h have no data at all, required=5 can't be met.
     engine = _FakeSignalEngine({Timeframe.M5: [_signal("RELIANCE", timeframe=Timeframe.M5)]})
@@ -210,6 +245,74 @@ async def test_insufficient_mtf_alignment_stops_before_entry_quality():
 
 
 @pytest.mark.asyncio
+async def test_missing_higher_timeframe_data_is_not_reported_as_market_conflict():
+    settings = _settings_mock()
+
+    async def fetch_indicators(symbol, tf):
+        return _FakeIndicators(timeframe=tf) if tf is Timeframe.M5 else None
+
+    async def fetch_5m_frame(symbol):
+        return _quiet_frame()
+
+    with _patched_settings(settings):
+        result = await run_scalp_scan_detailed(
+            ["RELIANCE"],
+            settings=settings,
+            scalp_signal_engine=_FakeSignalEngine(
+                {Timeframe.M5: [_signal("RELIANCE", timeframe=Timeframe.M5)]}
+            ),
+            scalp_confirmation_timeframes=ALL_TIMEFRAMES,
+            scalp_origin_timeframes=[Timeframe.M5],
+            scalp_cycle_regime="trending_up",
+            performance_tracker=_Tracker(),
+            fetch_indicators=fetch_indicators,
+            fetch_5m_frame=fetch_5m_frame,
+        )
+
+    assert result.funnel["mtf_missing_data"] == 1
+    assert result.funnel["mtf_conflict"] == 0
+    assert result.symbol_statuses[0].stage == "MTF_MISSING_DATA"
+
+
+@pytest.mark.asyncio
+async def test_available_but_opposing_timeframes_are_reported_as_conflict():
+    result = await _run(
+        ["RELIANCE"],
+        _FakeSignalEngine({Timeframe.M5: [_signal("RELIANCE", timeframe=Timeframe.M5)]}),
+        detailed=True,
+    )
+
+    assert result.funnel["mtf_missing_data"] == 0
+    assert result.funnel["mtf_conflict"] == 1
+    assert result.symbol_statuses[0].stage == "MTF_CONFLICT"
+
+
+@pytest.mark.asyncio
+async def test_failed_deterministic_qualification_never_becomes_an_ml_candidate():
+    engine = _FakeSignalEngine({Timeframe.M5: [_signal("RELIANCE", timeframe=Timeframe.M5)]})
+    prediction = PredictionSignal(
+        symbol="RELIANCE",
+        direction="up",
+        confidence=0.99,
+        predicted_change_pct=1.0,
+        reasoning="must never be fetched",
+        oos_samples=500,
+    )
+
+    result = await _run(
+        ["RELIANCE"],
+        engine,
+        predictions={("RELIANCE", timeframe): prediction for timeframe in ALL_TIMEFRAMES},
+        detailed=True,
+    )
+
+    assert result.funnel["technical_setups"] == 1
+    assert result.funnel["ml_candidates"] == 0
+    assert result.funnel["ml_scored"] == 0
+    assert result.predictions == {}
+
+
+@pytest.mark.asyncio
 async def test_entry_quality_reject_produces_no_opportunity():
     engine = _full_alignment_engine()
     # A wide-upper-wick last candle -- entry_quality.py's REJECT trigger.
@@ -219,9 +322,7 @@ async def test_entry_quality_reject_produces_no_opportunity():
         columns=["open", "high", "low", "close", "volume"],
     )
 
-    opportunities, funnel = await _run(
-        ["RELIANCE"], engine, frames={"RELIANCE": rejecting_frame}
-    )
+    opportunities, funnel = await _run(["RELIANCE"], engine, frames={"RELIANCE": rejecting_frame})
 
     assert funnel["mtf_candidates"] == 1  # got past confirmation
     assert funnel["entry_quality_passed"] == 0  # but rejected on entry timing
@@ -272,17 +373,22 @@ async def test_filter_regime_compatible_is_a_defensive_noop_given_matrix_gating(
 @pytest.mark.asyncio
 async def test_long_only_drops_sell_signals_before_consolidation():
     engine = _FakeSignalEngine(
-        {tf: [_signal("RELIANCE", timeframe=tf, signal_type=SignalType.SELL)] for tf in ALL_TIMEFRAMES}
+        {
+            tf: [_signal("RELIANCE", timeframe=tf, signal_type=SignalType.SELL)]
+            for tf in ALL_TIMEFRAMES
+        }
     )
 
-    opportunities, funnel = await _run(["RELIANCE"], engine, settings=_settings_mock(long_only=True))
+    opportunities, funnel = await _run(
+        ["RELIANCE"], engine, settings=_settings_mock(long_only=True)
+    )
 
     assert funnel["raw_triggers"] == 0
     assert opportunities == []
 
 
 @pytest.mark.asyncio
-async def test_results_are_truncated_to_max_active_symbols():
+async def test_valid_results_are_not_truncated_by_review_capacity():
     # run_scalp_scan calls generate_signals(indicators) once per (symbol, timeframe)
     # inside its own per-symbol loop, so a single fixed-per-timeframe engine (not
     # varying by symbol) still produces one independent opportunity per scan symbol
@@ -298,4 +404,64 @@ async def test_results_are_truncated_to_max_active_symbols():
     )
 
     assert funnel["regime_compatible"] == 3  # all 3 symbols qualified
-    assert len(opportunities) == 2  # but truncated to the configured max
+    assert len(opportunities) == 3
+
+
+@pytest.mark.asyncio
+async def test_detailed_scan_keeps_one_status_for_every_symbol():
+    result = await _run(
+        ["RELIANCE", "TCS", "INFY"],
+        _FakeSignalEngine({}),
+        detailed=True,
+    )
+
+    assert result.opportunities == []
+    assert [status.symbol for status in result.symbol_statuses] == ["INFY", "RELIANCE", "TCS"]
+    assert {status.decision for status in result.symbol_statuses} == {"NO_BUY"}
+    assert {status.stage for status in result.symbol_statuses} == {"NO_BUY_TRIGGER"}
+
+
+@pytest.mark.asyncio
+async def test_detailed_scan_keeps_all_buy_setups_even_when_review_capacity_is_lower():
+    result = await _run(
+        ["A", "B", "C"],
+        _full_alignment_engine(),
+        settings=_settings_mock(scalp_max_active_symbols=2),
+        detailed=True,
+    )
+
+    assert len(result.opportunities) == 3
+    assert len(result.symbol_statuses) == 3
+    assert all(status.decision == "BUY" for status in result.symbol_statuses)
+    assert sum(status.selected_for_review for status in result.symbol_statuses) == 3
+
+
+@pytest.mark.asyncio
+async def test_detailed_scan_uses_no_data_only_when_all_timeframes_are_missing():
+    settings = _settings_mock()
+
+    async def fetch_indicators(symbol, tf):
+        if symbol == "MISSING":
+            return None
+        return _FakeIndicators(timeframe=tf)
+
+    async def fetch_5m_frame(symbol):
+        return _quiet_frame()
+
+    with _patched_settings(settings):
+        result = await run_scalp_scan_detailed(
+            ["MISSING", "QUIET"],
+            settings=settings,
+            scalp_signal_engine=_FakeSignalEngine({}),
+            scalp_confirmation_timeframes=ALL_TIMEFRAMES,
+            scalp_origin_timeframes=[Timeframe.M5],
+            scalp_cycle_regime="trending_up",
+            performance_tracker=_Tracker(),
+            fetch_indicators=fetch_indicators,
+            fetch_5m_frame=fetch_5m_frame,
+        )
+
+    by_symbol = {status.symbol: status for status in result.symbol_statuses}
+    assert by_symbol["MISSING"].decision == "NO_DATA"
+    assert by_symbol["MISSING"].stage == "DATA_UNAVAILABLE"
+    assert by_symbol["QUIET"].decision == "NO_BUY"

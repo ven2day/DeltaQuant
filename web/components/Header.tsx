@@ -51,8 +51,13 @@ export function Header({
     router.replace("/login");
   }
 
+  const showNseState = activeMarket === "nse";
   const mode = stats?.trading_mode ?? "paper";
-  const dataSource = stats?.data_source ?? "simulated";
+  const quoteSource = stats?.quote_source ?? stats?.data_source ?? "simulated";
+  const dataLabel = ["dhan", "dhan_rest"].includes(quoteSource)
+    ? "DHAN LIVE"
+    : quoteSource.replaceAll("_", " ").toUpperCase();
+  const brokerOrdersEnabled = stats?.broker_orders_enabled ?? false;
   const marketOpen = stats?.market_open ?? false;
   const forced = stats?.force_trading_window ?? false;
 
@@ -64,7 +69,7 @@ export function Header({
           <div className="text-base font-semibold leading-tight text-ink-primary">
             ₹DeltaQuant
           </div>
-          <div className="text-xs text-ink-muted">Agentic NSE Trading</div>
+          <div className="text-xs text-ink-muted">Multi-market paper trading</div>
         </div>
       </div>
 
@@ -73,20 +78,17 @@ export function Header({
       </div>
 
       <div className="flex flex-wrap items-center justify-end gap-2">
-        <Badge label={mode.toUpperCase()} tone={mode === "paper" ? "good" : "critical"} />
-        <Badge label={dataSource.toUpperCase()} tone="neutral" dot />
+        {showNseState && <Badge label={`EXECUTION: ${mode.toUpperCase()}`} tone={mode === "paper" ? "good" : "critical"} />}
+        {showNseState && <Badge label={`DATA: ${dataLabel}`} tone={quoteSource === "simulated" ? "warning" : "good"} dot />}
+        {showNseState && <Badge label={`BROKER ORDERS: ${brokerOrdersEnabled ? "ON" : "OFF"}`} tone={brokerOrdersEnabled ? "critical" : "good"} />}
+        {showNseState && <Badge label={forced ? "MARKET: FORCED TEST WINDOW" : marketOpen ? "MARKET: OPEN" : "MARKET: CLOSED"} tone={forced ? "critical" : marketOpen ? "good" : "neutral"} dot />}
         <Badge
-          label={forced ? "TRADING (forced, test mode)" : marketOpen ? "NSE OPEN" : "NSE CLOSED"}
-          tone={forced ? "critical" : marketOpen ? "good" : "neutral"}
-          dot
-        />
-        <Badge
-          label={connected ? "Connected" : "Disconnected"}
+          label={connected ? "DASHBOARD: CONNECTED" : "DASHBOARD: DISCONNECTED"}
           tone={connected ? "good" : "critical"}
           dot
           pulse={connected}
         />
-        <span className="tabular text-xs text-ink-muted">{clock}</span>
+        {showNseState && <span className="tabular text-xs text-ink-muted">{clock}</span>}
         <button
           type="button"
           onClick={handleLogout}

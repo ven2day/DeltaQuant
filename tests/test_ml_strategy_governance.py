@@ -1,6 +1,6 @@
 """
-Regression tests for H-7 (prediction train/inference leakage) and H-8 (edge_verdict as a
-runtime strategy admission gate) -- DeltaQuant-Quant-Risk-Review.md / Institutional Audit H-4.
+Regression tests for prediction train/inference leakage and preservation of the legacy
+strict-grain validation records used as migration input.
 
 H-7 (src/agents/prediction.py): the old ``predict()`` withheld only the final five rows of an
 already fully-labeled feature matrix as a "test set", then reused the LAST row of that SAME
@@ -13,10 +13,8 @@ helpers) -- manually verified via ``git stash`` to fail against the pre-fix sour
 code's captured row does not match the true last bar; it's one step behind and has a known
 target) and pass against the fix.
 
-H-8 (src/backtesting/strategy_registry.py + src/agents/strategy_selection.py +
-src/agents/risk_compliance.py): ``edge_verdict()`` was previously consulted only by
-scripts/validate_strategy.py (offline). These tests prove an intentionally NOT VALIDATED or
-expired strategy version cannot produce an approved (live-paper) trade.
+The legacy registry unit tests remain because those JSON records are migration input for
+StrategyEligibilityRegistry; they no longer define runtime admission.
 """
 
 from __future__ import annotations
@@ -42,9 +40,6 @@ with patch("src.config.get_settings") as _mock_get_settings:
     _mock_get_settings.return_value = _mock_settings
 
     from src.agents.prediction import FEATURE_COLS, MIN_LABELED_SAMPLES, PredictionAgent
-    from src.agents.risk_compliance import RiskLimits, risk_compliance_node
-    from src.agents.state import create_initial_state
-    from src.agents.strategy_selection import _gate_active_strategies
     from src.backtesting.strategy_registry import StrategyRegistry, build_strategy_version
 
 # ---------------------------------------------------------------------------
@@ -249,7 +244,7 @@ def test_min_labeled_samples_is_meaningfully_larger_than_old_five_row_holdout():
 
 
 # ---------------------------------------------------------------------------
-# H-8: edge_verdict() as a runtime admission gate
+# Legacy edge_verdict registry behavior retained for migration compatibility
 # ---------------------------------------------------------------------------
 
 
@@ -294,18 +289,9 @@ def test_strategy_registry_rejects_unknown_strategy(tmp_path):
     assert registry.is_admitted("momentum") is False  # no entry at all -> fail closed
 
 
-def test_gate_active_strategies_strips_unadmitted(tmp_path):
-    _validated_version(tmp_path, strategy_name="momentum")
-    settings_mock = type("S", (), {"strategy_registry_dir": str(tmp_path)})()
-    with patch("src.agents.strategy_selection.get_settings", return_value=settings_mock):
-        admitted = _gate_active_strategies(["momentum", "breakout"], "trending_up")
-    assert admitted == ["momentum"]  # breakout has no registry entry -> stripped
-
-
 # ---------------------------------------------------------------------------
-# H-8 registry grain: strategy + timeframe + trade_horizon + regime + version.
-# A SWING-validated artifact (every artifact ever registered before this grain
-# existed) must never silently admit a SCALP request, and vice versa.
+# Legacy-registry compatibility. These records remain readable for conservative
+# migration into StrategyEligibilityRegistry; they are no longer the runtime gate.
 # ---------------------------------------------------------------------------
 
 
@@ -383,167 +369,31 @@ def test_fresh_scalp_artifact_admits_only_matching_horizon_and_timeframe(tmp_pat
     assert registry.is_admitted("momentum", timeframe="15m", trade_horizon="SCALP") is False
 
 
-def test_gate_active_strategies_is_horizon_aware(tmp_path):
-    _validated_version(tmp_path, strategy_name="momentum")  # SWING only
-    settings_mock = type("S", (), {"strategy_registry_dir": str(tmp_path)})()
-    with patch("src.agents.strategy_selection.get_settings", return_value=settings_mock):
-        admitted_swing = _gate_active_strategies(
-            ["momentum"], "trending_up", trade_horizon="SWING"
+def test_registry_keeps_distinct_scalp_timeframe_artifacts(tmp_path):
+    registry = StrategyRegistry(tmp_path)
+    versions = []
+    for timeframe in ("5m", "15m"):
+        version = build_strategy_version(
+            "momentum",
+            owner="test",
+            parameters={},
+            approved_universe=[],
+            approved_regimes=[],
+            dataset_id=f"test-dataset-{timeframe}",
+            oos_trades=100,
+            oos_expectancy=2.0,
+            oos_return_pct=10.0,
+            fold_consistency=0.8,
+            validity_days=30,
+            timeframe=timeframe,
+            trade_horizon="SCALP",
         )
-        admitted_scalp = _gate_active_strategies(
-            ["momentum"], "trending_up", trade_horizon="SCALP"
-        )
-    assert admitted_swing == ["momentum"]
-    assert admitted_scalp == []  # no SCALP-horizon artifact exists -> fails closed
+        registry.register(version)
+        versions.append(version)
 
-
-def test_scalp_horizon_signal_blocked_at_risk_compliance_despite_valid_swing_artifact(tmp_path):
-    """Full-pipeline H-8 acceptance test for the new grain: even with a current
-    VALIDATED SWING artifact for 'momentum', a signal tagged trade_horizon=SCALP must
-    still be blocked at risk_compliance's check #14 -- proving the grain is enforced
-    end-to-end, not just at the registry's own unit level."""
-    _validated_version(tmp_path, strategy_name="momentum")  # SWING only
-
-    state = create_initial_state()
-    state["regime"] = "trending_up"
-    state["trade_horizon"] = "SCALP"
-    state["validated_signals"] = [
-        {
-            "symbol": "A",
-            "strategy": "momentum",
-            "timeframe": "5m",
-            "trade_horizon": "SCALP",
-            "confidence": 0.8,
-            "risk_reward_ratio": 2.0,
-        }
-    ]
-
-    settings_mock = type("S", (), {"strategy_registry_dir": str(tmp_path)})()
-    with (
-        patch("src.agents.risk_compliance.now_ist") as mock_now,
-        patch("src.agents.risk_compliance.RiskLimits.from_settings", return_value=RiskLimits()),
-        patch("src.agents.risk_compliance.get_settings", return_value=settings_mock),
-    ):
-        mock_now.return_value.strftime.return_value = "12:00"
-        result = risk_compliance_node(state)
-
-    assert result["approved_trades"] == []
-    failures = result["risk_rejected"][0]["risk_result"]["failures"]
-    assert any(f["rule"] == "strategy_admission" for f in failures)
-
-
-def test_expired_strategy_cannot_produce_an_approved_trade(tmp_path):
-    """H-8 acceptance test: an intentionally expired strategy version must not produce
-    a live-paper trade -- fail closed at the deterministic risk gate, not a warning."""
-    _validated_version(tmp_path, strategy_name="momentum", expired=True)
-
-    state = create_initial_state()
-    state["regime"] = "trending_up"
-    state["validated_signals"] = [
-        {
-            "symbol": "A",
-            "strategy": "momentum",
-            "confidence": 0.8,
-            "risk_reward_ratio": 2.0,
-        }
-    ]
-
-    settings_mock = type("S", (), {"strategy_registry_dir": str(tmp_path)})()
-    with (
-        patch("src.agents.risk_compliance.now_ist") as mock_now,
-        patch("src.agents.risk_compliance.RiskLimits.from_settings", return_value=RiskLimits()),
-        patch("src.agents.risk_compliance.get_settings", return_value=settings_mock),
-    ):
-        mock_now.return_value.strftime.return_value = "12:00"
-        result = risk_compliance_node(state)
-
-    assert result["approved_trades"] == []
-    assert len(result["risk_rejected"]) == 1
-    failures = result["risk_rejected"][0]["risk_result"]["failures"]
-    assert any(f["rule"] == "strategy_admission" for f in failures)
-
-
-def test_not_validated_strategy_cannot_produce_an_approved_trade(tmp_path):
-    _validated_version(tmp_path, strategy_name="momentum", not_validated=True)
-
-    state = create_initial_state()
-    state["regime"] = "trending_up"
-    state["validated_signals"] = [
-        {"symbol": "A", "strategy": "momentum", "confidence": 0.8, "risk_reward_ratio": 2.0}
-    ]
-
-    settings_mock = type("S", (), {"strategy_registry_dir": str(tmp_path)})()
-    with (
-        patch("src.agents.risk_compliance.now_ist") as mock_now,
-        patch("src.agents.risk_compliance.RiskLimits.from_settings", return_value=RiskLimits()),
-        patch("src.agents.risk_compliance.get_settings", return_value=settings_mock),
-    ):
-        mock_now.return_value.strftime.return_value = "12:00"
-        result = risk_compliance_node(state)
-
-    assert result["approved_trades"] == []
-
-
-def test_unknown_strategy_name_with_no_registry_entry_blocked(tmp_path):
-    """No validate_strategy.py run at all yet (fresh registry dir) -> fail closed, not
-    a silent pass-through."""
-    state = create_initial_state()
-    state["regime"] = "trending_up"
-    state["validated_signals"] = [
-        {"symbol": "A", "strategy": "breakout", "confidence": 0.8, "risk_reward_ratio": 2.0}
-    ]
-
-    settings_mock = type("S", (), {"strategy_registry_dir": str(tmp_path)})()
-    with (
-        patch("src.agents.risk_compliance.now_ist") as mock_now,
-        patch("src.agents.risk_compliance.RiskLimits.from_settings", return_value=RiskLimits()),
-        patch("src.agents.risk_compliance.get_settings", return_value=settings_mock),
-    ):
-        mock_now.return_value.strftime.return_value = "12:00"
-        result = risk_compliance_node(state)
-
-    assert result["approved_trades"] == []
-
-
-def test_current_validated_strategy_is_approved_through_the_registry_gate(tmp_path):
-    """The flip side: a genuinely current, VALIDATED strategy DOES clear the H-8 gate
-    (proves this isn't just a blanket block)."""
-    _validated_version(tmp_path, strategy_name="momentum")
-
-    state = create_initial_state()
-    state["regime"] = "trending_up"
-    state["validated_signals"] = [
-        {"symbol": "A", "strategy": "momentum", "confidence": 0.8, "risk_reward_ratio": 2.0}
-    ]
-
-    settings_mock = type("S", (), {"strategy_registry_dir": str(tmp_path)})()
-    with (
-        patch("src.agents.risk_compliance.now_ist") as mock_now,
-        patch("src.agents.risk_compliance.RiskLimits.from_settings", return_value=RiskLimits()),
-        patch("src.agents.risk_compliance.get_settings", return_value=settings_mock),
-    ):
-        mock_now.return_value.strftime.return_value = "12:00"
-        result = risk_compliance_node(state)
-
-    assert len(result["approved_trades"]) == 1
-    assert result["risk_rejected"] == []
-
-
-def test_signal_without_a_governed_strategy_name_is_unaffected_by_the_gate():
-    """Signals that don't carry one of the four governed strategy names (e.g. other
-    non-governed entry paths, or bare test fixtures) are not touched by the H-8 check --
-    it only governs the four named strategies the registry knows how to validate."""
-    state = create_initial_state()
-    state["validated_signals"] = [{"symbol": "A", "confidence": 0.8, "risk_reward_ratio": 2.0}]
-
-    with (
-        patch("src.agents.risk_compliance.now_ist") as mock_now,
-        patch("src.agents.risk_compliance.RiskLimits.from_settings", return_value=RiskLimits()),
-    ):
-        mock_now.return_value.strftime.return_value = "12:00"
-        result = risk_compliance_node(state)
-
-    assert len(result["approved_trades"]) == 1
+    assert len(list(tmp_path.glob("momentum__scalp__*__*.json"))) == 2
+    assert registry.is_admitted("momentum", timeframe="5m", trade_horizon="SCALP")
+    assert registry.is_admitted("momentum", timeframe="15m", trade_horizon="SCALP")
 
 
 if __name__ == "__main__":

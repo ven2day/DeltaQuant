@@ -112,7 +112,7 @@ Accepted formulas still require subsequent paper and walk-forward validation.
 
 **Isolation from risk and sizing.** The live confidence tilt this loop produces
 only ever adjusts `estimated_win_probability` inside the local ranking step
-(`src/market/signal_ranking.py`) — it decides which signals are worth showing
+(`src/markets/nse/strategies/signal_ranking.py`) — it decides which signals are worth showing
 the agent graph, nothing more. Neither `risk_compliance.py`'s checks nor
 `calculate_position_size` read any signal-discovery field; a discovered
 formula has no path to change a stop-loss, a position size, or a risk-gate
@@ -132,24 +132,16 @@ its own weighted formula — while reusing the *same* LangGraph nodes, the *same
 relies on. A candidate that reaches the agent graph looks like an ordinary signal dict either
 way; only a `trade_horizon` tag distinguishes which ruleset governs it.
 
-This has a direct consequence for the H-8 admission gate: **the registry's grain had to grow
-with it.** Before this feature, `StrategyVersion` was keyed on strategy name alone (plus an
-unused `approved_regimes` field) — one `trend_following` artifact covered every timeframe
-indiscriminately, and (a separate, pre-existing gap this work also fixed) every artifact was
-honestly validated only on daily bars regardless of what interval a caller nominally
-requested. The registry now carries `timeframe` and `trade_horizon` alongside `strategy_name`
-and `regime`. Every artifact registered before this field existed defaults to
-`trade_horizon="SWING"` with an unpinned timeframe — it keeps admitting exactly what it
-always did, and structurally cannot match a `SCALP` request. The strategy-admission check
-(H-8, `risk_compliance.py`'s check #14) and `strategy_selection.py`'s own gate both now read
-the signal's `timeframe`/`trade_horizon` before consulting the registry, so a strategy proven
-only on swing/daily data can never silently admit a 5m scalp trade just because the strategy
-name matches.
+`StrategyEligibilityRegistry` makes the deployable identity explicit without multiplying
+artifacts across contextual dimensions: **strategy name + timeframe + model version**.
+Trade horizon remains in validation and decision lineage, but is not a lookup key. Current
+regime is evaluated independently using record-owned `ALLOW`, `REDUCE_CONFIDENCE`, or `BLOCK`
+policy derived from validation statistics/configuration. A reduction policy applies its
+configured multiplier before the subsequent confidence/ML gates.
 
-**Regime pre-filtering is a cost optimization, never an admission decision.** A deterministic
-strategy/regime compatibility table filters obviously-mismatched candidates (e.g. a
-mean-reversion strategy in a strongly trending regime) before spending an LLM call reviewing
-them. That module has no import of `StrategyRegistry` at all — it structurally cannot be
-"optimized" into replacing H-8, because it has no path to the registry to begin with. A
-regime-compatible candidate still has to independently clear admission and every
-`risk_compliance` check exactly like any other signal.
+Eligibility is also execution-mode aware. Research/backtest and simulated/shadow candidates
+continue for measurement but cannot create executable orders. PAPER accepts only
+`PAPER_APPROVED` or `LIVE_APPROVED`; LIVE accepts only `LIVE_APPROVED` and otherwise fails
+closed. `risk_compliance.py` rechecks eligibility after advisory Qwen processing and remains
+the final deterministic authority. The former strict-grain registry is preserved only as
+migration input; conflicting legacy combinations are downgraded rather than promoted.

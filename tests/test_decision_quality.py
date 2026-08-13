@@ -14,9 +14,9 @@ from src.agents.signal_validation import VALIDATION_SYSTEM_PROMPT
 from src.agents.strategy_selection import STRATEGY_SYSTEM_PROMPT
 from src.backtesting.engine import BacktestResult, compare_results
 from src.backtesting.strategies import RealSignalStrategy
-from src.market.indicators import IndicatorResult, Timeframe
-from src.market.signals import SignalEngine, SignalType
-from src.market.sizing import calculate_position_size
+from src.core.candidates import SignalEngine, SignalType
+from src.core.indicators import IndicatorResult, Timeframe
+from src.markets.nse.risk.sizing import calculate_position_size
 
 
 def _ind(**over):

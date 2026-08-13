@@ -1,8 +1,8 @@
 from unittest.mock import MagicMock, patch
 
-from src.market.assessment_matrix import TimeframeAssessment
-from src.market.indicators import Timeframe
-from src.market.scalp_confirmation import confirm_multi_timeframe
+from src.core.indicators import Timeframe
+from src.markets.nse.strategies.assessment_matrix import TimeframeAssessment
+from src.markets.nse.strategies.scalp_confirmation import confirm_multi_timeframe
 
 
 def _cell(decision: str) -> TimeframeAssessment:
@@ -39,7 +39,7 @@ def _full_matrix(overrides: dict | None = None) -> dict:
 def test_full_alignment_passes():
     matrix = _full_matrix()
     with patch(
-        "src.market.scalp_confirmation.get_settings",
+        "src.markets.nse.strategies.scalp_confirmation.get_settings",
         return_value=_settings_mock(required=5),
     ):
         result = confirm_multi_timeframe(matrix)
@@ -60,7 +60,7 @@ def test_missing_30m_data_fails_closed_never_counted_as_aligned():
     del matrix[Timeframe.M30]  # 30m simply has no entry -- not WAIT, not REJECT, absent
 
     with patch(
-        "src.market.scalp_confirmation.get_settings",
+        "src.markets.nse.strategies.scalp_confirmation.get_settings",
         return_value=_settings_mock(required=5),
     ):
         result = confirm_multi_timeframe(matrix)
@@ -73,7 +73,7 @@ def test_missing_30m_data_fails_closed_never_counted_as_aligned():
 def test_explicit_wait_cell_also_fails_that_role():
     matrix = _full_matrix({Timeframe.M30: _cell("WAIT")})
     with patch(
-        "src.market.scalp_confirmation.get_settings",
+        "src.markets.nse.strategies.scalp_confirmation.get_settings",
         return_value=_settings_mock(required=4),
     ):
         result = confirm_multi_timeframe(matrix)
@@ -88,7 +88,7 @@ def test_below_required_alignment_fails():
         {Timeframe.M30: _cell("REJECT"), Timeframe.H1: _cell("REJECT")}
     )
     with patch(
-        "src.market.scalp_confirmation.get_settings",
+        "src.markets.nse.strategies.scalp_confirmation.get_settings",
         return_value=_settings_mock(required=4),
     ):
         result = confirm_multi_timeframe(matrix)
@@ -100,7 +100,7 @@ def test_below_required_alignment_fails():
 def test_macro_filter_disabled_excludes_4h_from_evaluation_and_denominator():
     matrix = _full_matrix({Timeframe.H4: _cell("REJECT")})  # 4h fails, but disabled
     with patch(
-        "src.market.scalp_confirmation.get_settings",
+        "src.markets.nse.strategies.scalp_confirmation.get_settings",
         return_value=_settings_mock(required=4, macro_enabled=False),
     ):
         result = confirm_multi_timeframe(matrix)
@@ -114,7 +114,7 @@ def test_macro_filter_disabled_excludes_4h_from_evaluation_and_denominator():
 def test_macro_filter_enabled_counts_4h_against_alignment():
     matrix = _full_matrix({Timeframe.H4: _cell("REJECT")})
     with patch(
-        "src.market.scalp_confirmation.get_settings",
+        "src.markets.nse.strategies.scalp_confirmation.get_settings",
         return_value=_settings_mock(required=5, macro_enabled=True),
     ):
         result = confirm_multi_timeframe(matrix)
@@ -126,7 +126,7 @@ def test_macro_filter_enabled_counts_4h_against_alignment():
 
 def test_empty_matrix_fails_every_role_closed():
     with patch(
-        "src.market.scalp_confirmation.get_settings",
+        "src.markets.nse.strategies.scalp_confirmation.get_settings",
         return_value=_settings_mock(required=1),
     ):
         result = confirm_multi_timeframe({})
@@ -139,7 +139,7 @@ def test_empty_matrix_fails_every_role_closed():
 def test_result_is_json_serializable():
     matrix = _full_matrix()
     with patch(
-        "src.market.scalp_confirmation.get_settings",
+        "src.markets.nse.strategies.scalp_confirmation.get_settings",
         return_value=_settings_mock(),
     ):
         result = confirm_multi_timeframe(matrix)

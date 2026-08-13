@@ -1,10 +1,10 @@
 from unittest.mock import MagicMock, patch
 
 from src.agents.prediction import PredictionSignal
-from src.market.assessment_matrix import build_assessment_matrix
-from src.market.indicators import Timeframe
-from src.market.signal_consolidation import consolidate_signals
-from src.market.signals import SignalStrength, SignalType, StrategyType, TradingSignal
+from src.core.aggregation import consolidate_signals
+from src.core.candidates import SignalStrength, SignalType, StrategyType, TradingSignal
+from src.core.indicators import Timeframe
+from src.markets.nse.strategies.assessment_matrix import build_assessment_matrix
 
 
 def _signal(
@@ -43,7 +43,7 @@ def _settings_mock(reject_score=0.35, min_confidence=0.6):
 
 
 def test_missing_timeframe_data_rejects_with_reason_never_crashes():
-    with patch("src.market.assessment_matrix.get_settings", return_value=_settings_mock()):
+    with patch("src.markets.nse.strategies.assessment_matrix.get_settings", return_value=_settings_mock()):
         matrix = build_assessment_matrix(
             "RELIANCE",
             {Timeframe.M15: []},  # no candidates at all for this timeframe
@@ -66,7 +66,7 @@ def test_strong_agreeing_compatible_signal_produces_buy():
     ]
     consolidated = consolidate_signals(signals)
 
-    with patch("src.market.assessment_matrix.get_settings", return_value=_settings_mock()):
+    with patch("src.markets.nse.strategies.assessment_matrix.get_settings", return_value=_settings_mock()):
         matrix = build_assessment_matrix(
             "RELIANCE",
             {Timeframe.M15: consolidated},
@@ -85,7 +85,7 @@ def test_weak_signal_is_rejected():
     signals = [_signal(confidence=0.1, adx=10, plus_di=None, minus_di=None)]
     consolidated = consolidate_signals(signals)
 
-    with patch("src.market.assessment_matrix.get_settings", return_value=_settings_mock()):
+    with patch("src.markets.nse.strategies.assessment_matrix.get_settings", return_value=_settings_mock()):
         matrix = build_assessment_matrix(
             "RELIANCE", {Timeframe.M15: consolidated}, {}, "ranging"
         )
@@ -108,7 +108,7 @@ def test_regime_incompatible_signal_is_capped_below_buy():
     ]
     consolidated = consolidate_signals(signals)
 
-    with patch("src.market.assessment_matrix.get_settings", return_value=_settings_mock()):
+    with patch("src.markets.nse.strategies.assessment_matrix.get_settings", return_value=_settings_mock()):
         matrix = build_assessment_matrix(
             "RELIANCE", {Timeframe.M15: consolidated}, {}, "trending_up"
         )
@@ -129,7 +129,7 @@ def test_ml_probability_blended_into_score():
         reasoning="test",
     )
 
-    with patch("src.market.assessment_matrix.get_settings", return_value=_settings_mock()):
+    with patch("src.markets.nse.strategies.assessment_matrix.get_settings", return_value=_settings_mock()):
         matrix = build_assessment_matrix(
             "RELIANCE",
             {Timeframe.M15: consolidated},
@@ -146,7 +146,7 @@ def test_multiple_timeframes_assessed_independently():
     m15_signals = consolidate_signals([_signal(timeframe=Timeframe.M15, confidence=0.9)])
     h1_signals = consolidate_signals([_signal(timeframe=Timeframe.H1, confidence=0.1, adx=10)])
 
-    with patch("src.market.assessment_matrix.get_settings", return_value=_settings_mock()):
+    with patch("src.markets.nse.strategies.assessment_matrix.get_settings", return_value=_settings_mock()):
         matrix = build_assessment_matrix(
             "RELIANCE",
             {Timeframe.M15: m15_signals, Timeframe.H1: h1_signals},
@@ -176,7 +176,7 @@ def test_sell_dominant_cell_is_never_mislabeled_buy():
     ]
     consolidated = consolidate_signals(signals)
 
-    with patch("src.market.assessment_matrix.get_settings", return_value=_settings_mock()):
+    with patch("src.markets.nse.strategies.assessment_matrix.get_settings", return_value=_settings_mock()):
         matrix = build_assessment_matrix(
             "RELIANCE", {Timeframe.M15: consolidated}, {}, "trending_down"
         )
@@ -193,7 +193,7 @@ def test_local_regime_divergence_from_cycle_regime_is_noted():
     signals = [_signal(strategy=StrategyType.MEAN_REVERSION, confidence=0.9, adx=10)]
     consolidated = consolidate_signals(signals)
 
-    with patch("src.market.assessment_matrix.get_settings", return_value=_settings_mock()):
+    with patch("src.markets.nse.strategies.assessment_matrix.get_settings", return_value=_settings_mock()):
         matrix = build_assessment_matrix(
             "RELIANCE", {Timeframe.M15: consolidated}, {}, "trending_up"
         )

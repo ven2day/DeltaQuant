@@ -1,5 +1,5 @@
 """
-Fail-closed configuration safety tests (DeltaQuant-Quant-Risk-Review.md C-2 / M-5 / H-10).
+Fail-closed configuration safety tests (docs/audits/DeltaQuant-Quant-Risk-Review.md C-2 / M-5 / H-10).
 
 Covers:
 - resolve_effective_execution_mode(): the pure invariant-resolution function shared by
@@ -50,12 +50,8 @@ def test_dhan_paper_never_resolves_live_even_with_trading_mode_live():
 
 def test_live_requires_full_conjunction():
     base = {"trading_mode": "live", "has_dhan_credentials": True}
-    assert (
-        resolve_effective_execution_mode("live", allow_live_orders=True, **base) == "live"
-    )
-    assert (
-        resolve_effective_execution_mode("live", allow_live_orders=False, **base) == "shadow"
-    )
+    assert resolve_effective_execution_mode("live", allow_live_orders=True, **base) == "live"
+    assert resolve_effective_execution_mode("live", allow_live_orders=False, **base) == "shadow"
     assert (
         resolve_effective_execution_mode(
             "live", allow_live_orders=True, trading_mode="paper", has_dhan_credentials=True
@@ -169,11 +165,10 @@ def test_default_staleness_is_positive_and_safe():
     assert s.max_quote_staleness_seconds > 0
 
 
-def test_benign_warnings_still_only_warn_not_raise():
-    # Scope check: risk-param sanity issues are NOT part of the hazardous matrix and
-    # must keep degrading gracefully (existing behavior), not fail closed.
-    s = Settings(**_base_kwargs(risk_per_trade=0.5, max_position_pct=0.1))
-    assert any("risk_per_trade" in w for w in s.config_warnings)
+def test_inconsistent_portfolio_risk_fails_closed():
+    # One trade cannot consume more stop risk than the aggregate portfolio cap.
+    with pytest.raises(ValidationError, match="MAX_TOTAL_RISK"):
+        Settings(**_base_kwargs(risk_per_trade=0.5, max_position_pct=0.1))
 
 
 def test_scalp_defaults_construct_without_raising_and_are_inert():
@@ -236,7 +231,7 @@ def test_execute_trades_never_constructs_real_adapter_under_c2_combination(tmp_p
     by inference from the outcome."""
     import asyncio
 
-    from src.execution.adapter import execute_trades
+    from src.markets.nse.broker.dhan.execution import execute_trades
 
     fake_settings = MagicMock(
         execution_mode="dhan_paper",
@@ -251,8 +246,8 @@ def test_execute_trades_never_constructs_real_adapter_under_c2_combination(tmp_p
     trades = [{"symbol": "RELIANCE", "entry_price": 2500.0, "signal_type": "BUY"}]
 
     with (
-        patch("src.execution.adapter.get_settings", return_value=fake_settings),
-        patch("src.execution.adapter.ExecutionAdapter") as mock_broker_adapter_cls,
+        patch("src.markets.nse.broker.dhan.execution.get_settings", return_value=fake_settings),
+        patch("src.markets.nse.broker.dhan.execution.ExecutionAdapter") as mock_broker_adapter_cls,
     ):
         # adapter=None forces the settings-driven auto-selection branch under test.
         results = asyncio.run(
@@ -270,7 +265,7 @@ def test_execute_trades_constructs_real_adapter_only_for_full_live_conjunction()
     execute_trades is allowed to construct the real broker adapter."""
     import asyncio
 
-    from src.execution.adapter import execute_trades
+    from src.markets.nse.broker.dhan.execution import execute_trades
 
     fake_settings = MagicMock(
         execution_mode="live",
@@ -285,8 +280,8 @@ def test_execute_trades_constructs_real_adapter_only_for_full_live_conjunction()
     trades = [{"symbol": "RELIANCE", "entry_price": 2500.0, "signal_type": "BUY"}]
 
     with (
-        patch("src.execution.adapter.get_settings", return_value=fake_settings),
-        patch("src.execution.adapter.ExecutionAdapter") as mock_broker_adapter_cls,
+        patch("src.markets.nse.broker.dhan.execution.get_settings", return_value=fake_settings),
+        patch("src.markets.nse.broker.dhan.execution.ExecutionAdapter") as mock_broker_adapter_cls,
     ):
         broker_instance = mock_broker_adapter_cls.return_value
         # isinstance(adapter, LocalExecutionAdapter) is checked downstream on whatever

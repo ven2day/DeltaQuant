@@ -8,6 +8,7 @@ Tests for PR-5a — closing the learn-from-losses loop:
 
 from unittest.mock import MagicMock
 
+from src.core.candidates import StrategyType
 from src.memory.analyzer import compute_outcome
 from src.memory.feedback import (
     build_outcome,
@@ -155,15 +156,7 @@ def test_get_all_strategy_performance_includes_ema_strategies(tmp_path):
     t = PerformanceTracker(database_url=f"sqlite:///{tmp_path}/p.db")
 
     perf = t.get_all_strategy_performance("trending_up")
-    assert set(perf.keys()) == {
-        "momentum",
-        "mean_reversion",
-        "breakout",
-        "trend_following",
-        "ema_heiken_ashi_rsi",
-        "ema_psar",
-        "ema_cci",
-    }
+    assert set(perf.keys()) == {strategy.value for strategy in StrategyType}
     assert perf["ema_heiken_ashi_rsi"] == 0.45
     assert perf["ema_psar"] == 0.45
     assert perf["ema_cci"] == 0.45

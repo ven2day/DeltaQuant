@@ -1,0 +1,6 @@
+schema_version: 1
+market: CRYPTO
+quantity_semantics: exchange_units
+market_kill_switch: CRYPTO_KILL_SWITCH
+status: DISABLED_NO_PROVIDER
+

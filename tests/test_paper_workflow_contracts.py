@@ -5,15 +5,15 @@ import pandas as pd
 import pytest
 
 from src.config.settings import Settings
-from src.execution.averaging import CappedAveragingPolicy
-from src.execution.costs import CostModel
-from src.execution.lifecycle import MOCK_NAMESPACE, PaperTradeLifecycleStore
-from src.execution.paper_engine import LocalPaperEngine
-from src.execution.service import ExecutionMode, ExecutionService, IdempotencyStore
-from src.market.candidate_policy import CandidateAction, evaluate_long_candidate
-from src.market.indicators import Timeframe
-from src.market.simulated_data import SimulatedMarketData
-from src.risk.pretrade import FinalPaperOrder, PaperRiskReservations
+from src.core.indicators import Timeframe
+from src.markets.nse.execution.averaging import CappedAveragingPolicy
+from src.markets.nse.execution.lifecycle import MOCK_NAMESPACE, PaperTradeLifecycleStore
+from src.markets.nse.execution.paper_engine import LocalPaperEngine
+from src.markets.nse.execution.service import ExecutionMode, ExecutionService, IdempotencyStore
+from src.markets.nse.market_data.simulated import SimulatedMarketData
+from src.markets.nse.risk.costs import CostModel
+from src.markets.nse.risk.pretrade import FinalPaperOrder, PaperRiskReservations
+from src.markets.nse.strategies.candidate_policy import CandidateAction, evaluate_long_candidate
 
 
 @pytest.fixture(autouse=True)
@@ -26,8 +26,8 @@ def _fake_settings(monkeypatch):
     at the get_settings() call sites instead of at direct Settings() construction.
     """
     settings = Settings(groq_api_key="test-key", _env_file=None)
-    monkeypatch.setattr("src.execution.paper_engine.get_settings", lambda: settings)
-    monkeypatch.setattr("src.execution.service.get_settings", lambda: settings)
+    monkeypatch.setattr("src.markets.nse.execution.paper_engine.get_settings", lambda: settings)
+    monkeypatch.setattr("src.markets.nse.execution.service.get_settings", lambda: settings)
 
 
 def _trend_frame(periods: int, frequency: str, volume_spike: bool = False) -> pd.DataFrame:
@@ -76,8 +76,14 @@ def test_candidate_policy_buy_wait_reject_contract() -> None:
         "stop_loss": 121.0,
     }
     buy = evaluate_long_candidate(signal, histories, {"direction": "up", "confidence": 0.8})
+    pre_ml = evaluate_long_candidate(signal, histories, None, require_ml=False)
+    missing_ml = evaluate_long_candidate(signal, histories, None)
+    ml_required = evaluate_long_candidate(signal, histories, None, require_ml=True)
     wait = evaluate_long_candidate(
-        signal, histories, {"direction": "down", "confidence": 0.8}
+        signal,
+        histories,
+        {"direction": "down", "confidence": 0.8},
+        require_ml=True,
     )
     reject = evaluate_long_candidate(
         {**signal, "signal_type": "SELL"},
@@ -86,6 +92,11 @@ def test_candidate_policy_buy_wait_reject_contract() -> None:
     )
 
     assert buy.action == CandidateAction.BUY
+    assert pre_ml.action == CandidateAction.BUY
+    assert pre_ml.ml_direction == "unknown"
+    assert missing_ml.action == CandidateAction.BUY
+    assert missing_ml.ml_direction == "unknown"
+    assert ml_required.action == CandidateAction.WAIT
     assert buy.target_price == 125.0 * 1.035
     assert wait.action == CandidateAction.WAIT
     assert reject.action == CandidateAction.REJECT

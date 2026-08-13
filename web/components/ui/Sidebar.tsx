@@ -1,20 +1,29 @@
 import type { TabItem } from "./Tabs";
 
-// Renders one vertical nav group (a bordered box of buttons). Positioning
-// (width, stickiness) is the caller's responsibility so multiple groups --
-// e.g. a market switcher stacked above the page-section nav -- can share one
-// sticky column instead of each fighting for its own sticky offset.
+// Renders a bordered navigation group. The default remains vertical for
+// compatibility; workspaces can opt into a single-row, horizontally scrollable
+// section bar when they need the full page width for dashboard content.
 export function Sidebar({
   tabs,
   active,
   onChange,
+  orientation = "vertical",
 }: {
   tabs: TabItem[];
   active: string;
   onChange: (id: string) => void;
+  orientation?: "vertical" | "horizontal";
 }) {
+  const horizontal = orientation === "horizontal";
+
   return (
-    <div className="flex flex-col gap-0.5 rounded-xl border border-border bg-surface p-1.5 shadow-card">
+    <div
+      role="tablist"
+      aria-orientation={orientation}
+      className={`flex gap-0.5 rounded-xl border border-border bg-surface p-1.5 shadow-card ${
+        horizontal ? "flex-row items-center overflow-x-auto" : "flex-col"
+      }`}
+    >
       {tabs.map((tab) => {
         const isActive = tab.id === active;
         const Icon = tab.icon;
@@ -22,8 +31,12 @@ export function Sidebar({
           <button
             key={tab.id}
             type="button"
+            role="tab"
+            aria-selected={isActive}
             onClick={() => onChange(tab.id)}
             className={`flex items-center gap-2.5 rounded-lg px-3 py-2 text-left text-sm font-medium transition-colors ${
+              horizontal ? "min-h-9 flex-none whitespace-nowrap" : ""
+            } ${
               isActive
                 ? "bg-surface-raised text-ink-primary shadow-card"
                 : "text-ink-muted hover:text-ink-secondary"

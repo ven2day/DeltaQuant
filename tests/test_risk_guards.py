@@ -7,10 +7,10 @@ Tests for the deterministic tail-risk guards:
 """
 
 from src.agents.risk_compliance import RiskLimits, check_kill_switch
-from src.execution.costs import CostModel
-from src.execution.exit_manager import ExitManager
-from src.execution.paper_engine import LocalPaperEngine
-from src.risk.guards import DrawdownTracker, is_circuit_locked
+from src.markets.nse.execution.exit_manager import ExitManager
+from src.markets.nse.execution.paper_engine import LocalPaperEngine
+from src.markets.nse.risk.costs import CostModel
+from src.markets.nse.risk.guards import DrawdownTracker, is_circuit_locked
 
 # ---------------------------------------------------------------------------
 # DrawdownTracker

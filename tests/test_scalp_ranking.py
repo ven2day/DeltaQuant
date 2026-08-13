@@ -1,9 +1,9 @@
 from dataclasses import dataclass
 from unittest.mock import MagicMock, patch
 
-from src.market.scalp_confirmation import ScalpConfirmationResult
-from src.market.scalp_opportunity import ScalpOpportunity
-from src.market.scalp_ranking import (
+from src.markets.nse.strategies.scalp_confirmation import ScalpConfirmationResult
+from src.markets.nse.strategies.scalp_opportunity import ScalpOpportunity
+from src.markets.nse.strategies.scalp_ranking import (
     ScalpRankingWeights,
     rank_scalp_opportunities,
     scalp_performance_key,
@@ -94,7 +94,7 @@ def test_historical_win_probability_uses_namespaced_key_not_bare_strategy():
     tracker = _Tracker(total=0, winners=0)
     opp = _opportunity(strategy="momentum")
 
-    with patch("src.market.scalp_ranking.get_settings", return_value=_settings_mock()):
+    with patch("src.markets.nse.strategies.scalp_ranking.get_settings", return_value=_settings_mock()):
         rank_scalp_opportunities([opp], tracker, "trending_up", weights=EQUAL_WEIGHTS)
 
     assert tracker.calls[0][0] == "scalp::momentum"
@@ -104,7 +104,7 @@ def test_cold_start_reads_as_neutral_fifty_percent_not_zero():
     tracker = _Tracker(total=0, winners=0)
     opp = _opportunity()
 
-    with patch("src.market.scalp_ranking.get_settings", return_value=_settings_mock()):
+    with patch("src.markets.nse.strategies.scalp_ranking.get_settings", return_value=_settings_mock()):
         ranked = rank_scalp_opportunities([opp], tracker, "trending_up", weights=EQUAL_WEIGHTS)
 
     assert ranked[0].historical_win_probability == 0.5
@@ -115,7 +115,7 @@ def test_missing_ml_probability_defaults_to_neutral_not_zero():
     tracker = _Tracker()
     opp = _opportunity(ml_probability=None)
 
-    with patch("src.market.scalp_ranking.get_settings", return_value=_settings_mock()):
+    with patch("src.markets.nse.strategies.scalp_ranking.get_settings", return_value=_settings_mock()):
         ranked = rank_scalp_opportunities([opp], tracker, "trending_up", weights=EQUAL_WEIGHTS)
 
     assert ranked[0].ml_probability_score == 0.5
@@ -125,7 +125,7 @@ def test_entry_quality_score_maps_status_to_expected_values():
     tracker = _Tracker()
     cases = {"ENTER_NOW": 1.0, "WAIT_BREAKOUT": 0.5, "WAIT_PULLBACK": 0.5, "REJECT": 0.0}
 
-    with patch("src.market.scalp_ranking.get_settings", return_value=_settings_mock()):
+    with patch("src.markets.nse.strategies.scalp_ranking.get_settings", return_value=_settings_mock()):
         for status, expected in cases.items():
             opp = _opportunity(status=status)
             ranked = rank_scalp_opportunities(
@@ -138,7 +138,7 @@ def test_missing_entry_quality_scores_zero_not_a_crash():
     opp = ScalpOpportunity(symbol="RELIANCE", direction="BUY")  # entry_quality=None
     tracker = _Tracker()
 
-    with patch("src.market.scalp_ranking.get_settings", return_value=_settings_mock()):
+    with patch("src.markets.nse.strategies.scalp_ranking.get_settings", return_value=_settings_mock()):
         ranked = rank_scalp_opportunities([opp], tracker, "trending_up", weights=EQUAL_WEIGHTS)
 
     assert ranked[0].entry_quality_score == 0.0
@@ -149,7 +149,7 @@ def test_mtf_alignment_score_capped_at_one():
     opp = _opportunity(aligned=10, required=4)  # more aligned than required
     tracker = _Tracker()
 
-    with patch("src.market.scalp_ranking.get_settings", return_value=_settings_mock()):
+    with patch("src.markets.nse.strategies.scalp_ranking.get_settings", return_value=_settings_mock()):
         ranked = rank_scalp_opportunities([opp], tracker, "trending_up", weights=EQUAL_WEIGHTS)
 
     assert ranked[0].mtf_alignment_score == 1.0
@@ -159,7 +159,7 @@ def test_volume_liquidity_score_capped_at_one():
     opp = _opportunity(relative_volume=100.0)  # absurdly high
     tracker = _Tracker()
 
-    with patch("src.market.scalp_ranking.get_settings", return_value=_settings_mock()):
+    with patch("src.markets.nse.strategies.scalp_ranking.get_settings", return_value=_settings_mock()):
         ranked = rank_scalp_opportunities([opp], tracker, "trending_up", weights=EQUAL_WEIGHTS)
 
     assert ranked[0].volume_liquidity_score == 1.0
@@ -169,7 +169,7 @@ def test_regime_incompatible_scores_zero_on_that_component():
     opp = _opportunity(regime_compatible=False)
     tracker = _Tracker()
 
-    with patch("src.market.scalp_ranking.get_settings", return_value=_settings_mock()):
+    with patch("src.markets.nse.strategies.scalp_ranking.get_settings", return_value=_settings_mock()):
         ranked = rank_scalp_opportunities([opp], tracker, "trending_up", weights=EQUAL_WEIGHTS)
 
     assert ranked[0].regime_score == 0.0
@@ -180,7 +180,7 @@ def test_stronger_opportunity_ranks_first():
     weak = _opportunity(status="REJECT", relative_volume=0.1, regime_compatible=False)
     tracker = _Tracker()
 
-    with patch("src.market.scalp_ranking.get_settings", return_value=_settings_mock()):
+    with patch("src.markets.nse.strategies.scalp_ranking.get_settings", return_value=_settings_mock()):
         ranked = rank_scalp_opportunities(
             [weak, strong], tracker, "trending_up", weights=EQUAL_WEIGHTS
         )
@@ -200,7 +200,7 @@ def test_rank_score_matches_manual_weighted_sum():
     )
     tracker = _Tracker(total=0, winners=0)  # -> historical_win_probability=0.5
 
-    with patch("src.market.scalp_ranking.get_settings", return_value=_settings_mock()):
+    with patch("src.markets.nse.strategies.scalp_ranking.get_settings", return_value=_settings_mock()):
         ranked = rank_scalp_opportunities([opp], tracker, "trending_up", weights=EQUAL_WEIGHTS)
 
     expected = (1 / 6) * (1.0 + 1.0 + 1.0 + 1.0 + 0.5 + 0.8)
@@ -218,12 +218,12 @@ def test_weights_default_to_settings_when_not_passed():
     opp = _opportunity(status="ENTER_NOW")
     tracker = _Tracker()
 
-    with patch("src.market.scalp_ranking.get_settings", return_value=settings):
+    with patch("src.markets.nse.strategies.scalp_ranking.get_settings", return_value=settings):
         ranked = rank_scalp_opportunities([opp], tracker, "trending_up")
 
     assert ranked[0].rank_score == 1.0  # only entry_quality (weight=1.0) contributes
 
 
 def test_empty_input_returns_empty_list():
-    with patch("src.market.scalp_ranking.get_settings", return_value=_settings_mock()):
+    with patch("src.markets.nse.strategies.scalp_ranking.get_settings", return_value=_settings_mock()):
         assert rank_scalp_opportunities([], _Tracker(), "trending_up") == []

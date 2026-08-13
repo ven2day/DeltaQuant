@@ -8,8 +8,8 @@ flag a target as infeasible rather than recommending more risk, and pace trackin
 from datetime import datetime
 from types import SimpleNamespace
 
+from src.markets.nse.sessions.market_time import IST
 from src.profit.goal_engine import ProfitGoalEngine
-from src.utils.market_time import IST
 
 
 def _settings(**overrides):

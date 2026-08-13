@@ -9,10 +9,14 @@ Strategies:
 - SMAcrossoverStrategy: Classic moving average crossover
 """
 
+from typing import Any
+
 import pandas as pd
 
-from src.market.indicators import Timeframe, calculate_indicators
-from src.market.signals import SignalEngine, SignalType, StrategyType
+from src.core.candidates import SignalEngine, SignalType, StrategyType
+from src.core.features import MarketRelativeFeatures
+from src.core.indicators import Timeframe, calculate_indicators
+from src.core.strategies import ProductionStrategyConfig
 
 
 class Strategy:
@@ -39,7 +43,7 @@ class RealSignalStrategy(Strategy):
     Backtests the SAME logic the live system trades.
 
     Instead of a separate re-implementation of indicators, this feeds the real
-    `ta`-based indicators (src.market.indicators) into the live `SignalEngine`, so a
+    `ta`-based indicators (src.core.indicators) into the live `SignalEngine`, so a
     backtest faithfully reflects live behaviour (fixes the audit's backtest≠live divergence).
     Only uses bars strictly prior to the current one (no look-ahead).
     """
@@ -52,6 +56,9 @@ class RealSignalStrategy(Strategy):
         min_bars: int = 50,
         strategy_types: list[StrategyType] | None = None,
         timeframe: Timeframe = Timeframe.D1,
+        indicator_cache: dict[tuple[int, object], Any] | None = None,
+        production_config: ProductionStrategyConfig | None = None,
+        market_relative_by_timestamp: dict[str, MarketRelativeFeatures] | None = None,
     ):
         """
         Args:
@@ -59,12 +66,12 @@ class RealSignalStrategy(Strategy):
             min_bars: Warm-up bars before signals are considered.
             strategy_types: Restrict signal generation to these named strategies (all
                 four if None). Used by scripts/validate_strategy.py to walk-forward
-                validate ONE named strategy at a time for the H-8 admission registry,
+                validate ONE named strategy at a time for the strategy eligibility registry,
                 instead of only the mixed "best signal of any strategy" default.
             timeframe: The actual bar frequency of the data this strategy is fed
                 (default D1, matching every pre-existing caller). Previously
                 hardcoded regardless of what interval the caller actually passed in
-                -- meaning every H-8 registry artifact registered before this field
+                -- meaning every legacy strict-grain artifact registered before this field
                 existed was labeled D1 even if (hypothetically) intraday data had
                 been fed in. Passing the real timeframe here is what makes an
                 honestly-labeled SCALP/5m artifact possible (see
@@ -74,17 +81,44 @@ class RealSignalStrategy(Strategy):
         self.min_bars = min_bars
         self.strategy_types = strategy_types
         self.timeframe = timeframe
-        self._engine = SignalEngine()
+        self._indicator_cache = indicator_cache
+        self._market_relative_by_timestamp = market_relative_by_timestamp or {}
+        self._engine = SignalEngine(
+            production_config=production_config or ProductionStrategyConfig.defaults()
+        )
+
+    # calculate_indicators' longest lookback is EMA-200 (src/core/indicators/engine.py
+    # config.ema_periods); an EMA's weight on bars older than ~5x its period is
+    # negligible, so a 1,000-bar trailing window reproduces the full-history value to
+    # well within trading precision. BacktestEngine.run() passes the FULL expanding
+    # history=data.iloc[:i] at every bar i (by design, for strategies that legitimately
+    # need it) -- without this cap, RealSignalStrategy.on_bar recomputes indicators over
+    # that ever-growing slice every bar, which is O(n^2) in bar count. Harmless for ~500
+    # daily bars; on ~5,000 intraday bars (5m over 90d) it turns a few-second backtest
+    # into one that never practically finishes. This also brings backtest history depth
+    # in line with live, which never holds unbounded from-inception history either.
+    _MAX_LOOKBACK_BARS = 1000
 
     def on_bar(self, row: pd.Series, history: pd.DataFrame) -> str | None:
         if len(history) < self.min_bars:
             return None
-        # The live indicators expect lowercase OHLCV column names.
-        df = history.rename(columns=str.lower)
         try:
-            indicators = calculate_indicators(df, self.symbol, timeframe=self.timeframe)
+            cache_key = (len(history), history.index[-1])
+            indicators = (
+                self._indicator_cache.get(cache_key) if self._indicator_cache is not None else None
+            )
+            if indicators is None:
+                # The live indicators expect lowercase OHLCV column names.
+                df = history.tail(self._MAX_LOOKBACK_BARS).rename(columns=str.lower)
+                indicators = calculate_indicators(df, self.symbol, timeframe=self.timeframe)
+                if self._indicator_cache is not None:
+                    self._indicator_cache[cache_key] = indicators
             signals = self._engine.generate_signals(
-                indicators, active_strategies=self.strategy_types
+                indicators,
+                active_strategies=self.strategy_types,
+                market_relative=self._market_relative_by_timestamp.get(
+                    indicators.settled_candle_timestamp
+                ),
             )
         except Exception:
             return None

@@ -5,6 +5,7 @@ Tests for the FinOps layer: LLM cost/token accounting, budgets, and alerts.
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from src.finops.alerts import AlertManager, get_alert_manager, reset_alert_manager
+from src.finops.attribution import LLMCallReason, LLMMarket
 from src.finops.cost_tracker import (
     CostTracker,
     _extract_model,
@@ -13,6 +14,7 @@ from src.finops.cost_tracker import (
     record_llm_response,
     reset_cost_tracker,
 )
+from src.finops.storage import FinOpsEventStore
 
 
 class _FakeResponse:
@@ -57,6 +59,100 @@ def test_record_usage_accumulates_and_aggregates_by_agent():
     assert summary["by_agent"]["market_regime"]["calls"] == 2
     assert summary["by_agent"]["news_analyst"]["input_tokens"] == 400
     assert summary["total_cost_usd"] > 0
+
+
+def test_market_and_reason_aggregates_are_strictly_isolated():
+    tracker = CostTracker()
+    tracker.record_usage(
+        "market_regime",
+        "qwen3.7-plus",
+        100,
+        10,
+        market=LLMMarket.NSE,
+        call_reason=LLMCallReason.REGIME_CONTEXT,
+        component="market_regime",
+    )
+    tracker.record_usage(
+        "context_review",
+        "qwen3.7-plus",
+        200,
+        20,
+        market=LLMMarket.FOREX,
+        call_reason=LLMCallReason.CANDIDATE_REVIEW,
+        component="signal_validation",
+    )
+
+    nse = tracker.daily_summary("NSE")
+    forex = tracker.daily_summary("FOREX")
+    total = tracker.daily_summary()
+    assert nse["calls"] == 1
+    assert nse["candidate_review_calls"] == 0
+    assert nse["context_support_calls"] == 1
+    assert forex["calls"] == 1
+    assert forex["candidate_review_calls"] == 1
+    assert total["calls"] == nse["calls"] + forex["calls"]
+
+
+def test_support_agent_does_not_increment_candidate_review_count():
+    tracker = CostTracker()
+    tracker.record_usage(
+        "strategy_selection",
+        "qwen3.7-plus",
+        10,
+        2,
+        market="NSE",
+        call_reason="SUPPORT_AGENT",
+    )
+    summary = tracker.daily_summary("NSE")
+    assert summary["candidate_review_calls"] == 0
+    assert summary["context_support_calls"] == 1
+
+
+def test_cycle_metrics_reset_by_cycle_identity():
+    tracker = CostTracker()
+    tracker.record_usage(
+        "market_regime",
+        "qwen3.7-plus",
+        10,
+        2,
+        market="NSE",
+        call_reason="REGIME_CONTEXT",
+        cycle_id="cycle-1",
+    )
+    assert tracker.cycle_summary("cycle-1", "NSE")["calls"] == 1
+    assert tracker.cycle_summary("cycle-2", "NSE")["calls"] == 0
+
+
+def test_durable_daily_metrics_survive_runtime_restart(tmp_path):
+    store = FinOpsEventStore(tmp_path / "finops.sqlite3")
+    first = CostTracker(store=store, session_id="session-a")
+    first.record_usage(
+        "news_analyst",
+        "qwen3.7-plus",
+        50,
+        5,
+        market="FOREX",
+        call_reason="NEWS_ANALYSIS",
+    )
+    second = CostTracker(store=store, session_id="session-b")
+    assert second.daily_summary("FOREX")["calls"] == 1
+    assert second.session_summary("FOREX")["calls"] == 0
+
+
+def test_legacy_records_remain_explicitly_unclassified(tmp_path):
+    store = FinOpsEventStore(tmp_path / "legacy.sqlite3")
+    tracker = CostTracker(store=store)
+    tracker.record_usage(
+        "legacy",
+        "unknown",
+        12,
+        3,
+        market=None,
+        call_reason=None,
+    )
+    summary = tracker.daily_summary()
+    assert summary["by_market"]["UNKNOWN_LEGACY"]["calls"] == 1
+    assert summary["by_reason"]["UNKNOWN_LEGACY"]["calls"] == 1
 
 
 def test_register_pricing_override():
@@ -115,6 +211,26 @@ def test_cost_budget_hard_breach():
     assert status["hard_breached"] is True
 
 
+def test_horizon_budget_isolated_but_global_total_authoritative():
+    t = CostTracker()
+    t.record_usage("critic", "qwen3.7-plus", 600, 0, trade_horizon="SCALP")
+    settings = MagicMock(
+        daily_token_budget=0,
+        llm_daily_budget_total=1_000,
+        llm_daily_budget_scalp=500,
+        llm_daily_budget_swing=800,
+        daily_cost_budget_usd=0.0,
+        finops_budget_soft_pct=0.8,
+    )
+    with patch("src.finops.cost_tracker.get_settings", return_value=settings):
+        assert t.is_over_hard_budget("SCALP") is True
+        assert t.is_over_hard_budget("SWING") is False
+
+        t.record_usage("critic", "qwen3.7-plus", 400, 0, trade_horizon="SWING")
+        assert t.budget_status("SWING")["global_hard_breached"] is True
+        assert t.is_over_hard_budget("SWING") is True
+
+
 # ---------------------------------------------------------------------------
 # Usage extraction from LangChain responses
 # ---------------------------------------------------------------------------
@@ -154,6 +270,28 @@ def test_record_llm_response_records_to_singleton():
     assert rec.input_tokens == 1000
     assert rec.output_tokens == 500
     assert get_cost_tracker().today_tokens == 1500
+
+
+def test_record_llm_response_preserves_structured_attribution():
+    reset_cost_tracker()
+    response = _FakeResponse(usage_metadata={"input_tokens": 100, "output_tokens": 25})
+    record = record_llm_response(
+        "context_review",
+        response,
+        model="qwen3.7-plus",
+        market="FOREX",
+        call_reason="CANDIDATE_REVIEW",
+        component="signal_validation",
+        cycle_id="fx-1",
+        candidate_id="EUR_USD-30m",
+        symbol="EUR_USD",
+        timeframe="30m",
+    )
+    assert record is not None
+    assert record.market == "FOREX"
+    assert record.call_reason == "CANDIDATE_REVIEW"
+    assert record.component == "signal_validation"
+    assert record.candidate_id == "EUR_USD-30m"
 
 
 def test_record_llm_response_disabled_returns_none():

@@ -22,7 +22,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from src.config import Settings, get_settings
-from src.utils.market_time import now_ist
+from src.markets.nse.sessions.market_time import now_ist
 
 # A win-rate above this is treated as unrealistic for a retail momentum system.
 _MAX_REALISTIC_WIN_RATE = 0.85

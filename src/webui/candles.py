@@ -1,6 +1,6 @@
 """Pure OHLCV-DataFrame -> chart-candle conversion for the dashboard's Charts tab.
 
-Split out from the ``_get_candles`` closure in ``scripts/run_live_trading.py`` (which
+Split out from the ``_get_candles`` closure in ``src/markets/nse/runtime/live.py`` (which
 just supplies the ``HistoryManager`` dependency) so the conversion logic itself --
 NaN handling, timestamp conversion -- is unit-testable without needing a running
 trading loop.

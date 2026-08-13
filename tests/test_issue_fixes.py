@@ -26,9 +26,9 @@ from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 
 from src.agents.prediction import PredictionSignal
 from src.agents.risk_compliance import risk_compliance_node
-from src.utils.formatting import fmt_optional, plain_english_fallback_cause
-from src.utils.market_time import IST
-from src.utils.serialization import to_native
+from src.core.utils.formatting import fmt_optional, plain_english_fallback_cause
+from src.core.utils.serialization import to_native
+from src.markets.nse.sessions.market_time import IST
 
 # ---------------------------------------------------------------------------
 # #18 — to_native converts numpy scalars/arrays to native Python types

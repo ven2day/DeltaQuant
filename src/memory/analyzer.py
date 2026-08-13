@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any
 
-from src.execution.journal import TradeJournal
+from src.markets.nse.execution.journal import TradeJournal
 
 logger = logging.getLogger(__name__)
 

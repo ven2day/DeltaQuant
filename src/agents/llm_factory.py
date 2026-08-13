@@ -28,13 +28,13 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from src.config import get_settings
-from src.utils.circuit_breaker import (
+from src.core.utils.circuit_breaker import (
     CircuitBreaker,
     CircuitBreakerOpenError,
     get_llm_provider_circuit_breaker,
 )
-from src.utils.errors import RateLimitError
-from src.utils.rate_limiter import RateLimiter, get_llm_provider_limiter
+from src.core.utils.errors import RateLimitError
+from src.core.utils.rate_limiter import RateLimiter, get_llm_provider_limiter
 
 if TYPE_CHECKING:
     from langchain_core.language_models.chat_models import BaseChatModel
@@ -60,6 +60,33 @@ def primary_and_fallback_models() -> tuple[str, str]:
     if settings.llm_provider == "qwen":
         return settings.qwen_model_primary, settings.qwen_model_fallback
     return settings.groq_model_primary, settings.groq_model_fallback
+
+
+def model_for_tier(tier: str) -> str:
+    """Resolve a deterministic FAST/REVIEW model without hardcoded call-site names."""
+    settings = get_settings()
+    primary, fallback = primary_and_fallback_models()
+    if settings.llm_provider != "qwen":
+        return fallback if tier.upper() == "FAST" else primary
+    if tier.upper() == "FAST":
+        return settings.qwen_fast_model or fallback
+    return settings.qwen_review_model or primary
+
+
+def review_model_tier(
+    signals: list[dict[str, Any]], shared_market_context: dict[str, Any] | None = None
+) -> str:
+    """Route contextual review from deterministic uncertainty only."""
+    context = shared_market_context or {}
+    if str(context.get("major_market_event_risk", "NONE")).upper() not in {"", "NONE"}:
+        return "REVIEW"
+    if float(context.get("regime_confidence", 1.0) or 0.0) < 0.65:
+        return "REVIEW"
+    for signal in signals:
+        confidence = float(signal.get("confidence", 0.0) or 0.0)
+        if 0.50 <= confidence < 0.75:
+            return "REVIEW"
+    return "FAST"
 
 
 def get_llm_limiter() -> RateLimiter:
@@ -147,6 +174,8 @@ def invoke_with_fallback(
     max_tokens: int = 1024,
     temperature: float | None = None,
     on_model_selected: Callable[[str], None] | None = None,
+    models_to_try: tuple[str, ...] | None = None,
+    trade_horizon: str = "SHARED",
 ) -> Any:
     """Try the primary model, then the fallback model, on rate-limit (429) errors.
 
@@ -174,13 +203,24 @@ def invoke_with_fallback(
     protects against genuine outages: a non-rate-limit failure is recorded normally.
     """
     settings = get_settings()
-    models_to_try = list(primary_and_fallback_models())
+    configured_models = models_to_try or primary_and_fallback_models()
+    # Qwen deployments commonly configure the same model as primary and fallback.
+    # Retrying the identical deployment cannot route around a per-model quota.
+    unique_models = (
+        list(dict.fromkeys(configured_models))
+        if getattr(settings, "llm_cost_optimization_enabled", False) is True
+        else list(configured_models)
+    )
     last_error: Exception | None = None
 
     if not circuit_breaker.is_available:
         raise CircuitBreakerOpenError(circuit_breaker.name, circuit_breaker.recovery_time)
 
-    for model_name in models_to_try:
+    for model_name in unique_models:
+        from src.finops import get_cost_tracker
+
+        if get_cost_tracker().is_over_hard_budget(trade_horizon):
+            raise RuntimeError(f"FinOps hard budget reached for {str(trade_horizon).upper()}")
         try:
             agent = create_chat_model(model_name, temperature=temperature, max_tokens=max_tokens)
             response = agent.invoke(messages)

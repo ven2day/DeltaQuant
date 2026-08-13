@@ -10,7 +10,7 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
-from src.utils.market_time import now_ist
+from src.markets.nse.sessions.market_time import now_ist
 
 # In-memory activity log retention (this is the raw buffer TradingStats
 # keeps; the web UI's Activity Log panel scrolls through all of it).
@@ -45,6 +45,11 @@ class TradingStats:
     session_start: datetime = field(default_factory=now_ist)
     trading_mode: str = "paper"
     data_source: str = "simulated"
+    execution_mode: str = "local_paper"
+    quote_source: str = "simulated"
+    candle_source: str = "simulated"
+    broker_orders_enabled: bool = False
+    data_lineage: dict = field(default_factory=dict)
 
     # True when the trading loop is currently allowed to open NEW positions — the same
     # is_trading_window()/force_trading_window check run_live_trading.py's cycle gate
@@ -104,11 +109,38 @@ class TradingStats:
     # (Groq rate limit, circuit breaker open, disabled, or an outright error) -- plain
     # English, e.g. "Signal Validation: the AI reviewer hit its daily usage limit".
     agent_fallback_notice: str = ""
+    # Lifecycle of the expensive candidate-review portion of the graph. A healthy
+    # cycle can run technical + ML + shared-context agents and then stop at WAIT.
+    ai_review_status: str = "not_started"
+    ai_review_reason: str = "Waiting for the first scan"
 
     # FinOps (LLM cost tracking, today / IST)
     llm_calls: int = 0
     llm_tokens: int = 0
     llm_cost_usd: float = 0.0
+    llm_input_tokens: int = 0
+    llm_output_tokens: int = 0
+    # Structured market-scoped views. Legacy scalar fields above remain for API/UI
+    # compatibility, but are populated from the active market rather than globally.
+    llm_finops: dict = field(default_factory=dict)
+    llm_session_metrics: dict = field(default_factory=dict)
+    llm_cycle_metrics: dict = field(default_factory=dict)
+    qwen_calls_per_cycle: int = 0
+    qwen_calls_by_agent: dict = field(default_factory=dict)
+    qwen_input_tokens_by_agent: dict = field(default_factory=dict)
+    qwen_output_tokens_by_agent: dict = field(default_factory=dict)
+    qwen_cost_by_agent: dict = field(default_factory=dict)
+    scalp_qwen_cost: float = 0.0
+    swing_qwen_cost: float = 0.0
+    qwen_cache_hits: int = 0
+    qwen_cache_misses: int = 0
+    qwen_cache_hit_rate: float = 0.0
+    dedup_skip_count: int = 0
+    deterministic_rejection_count: int = 0
+    zero_llm_candidate_percentage: float = 0.0
+    cost_per_candidate_reviewed: float = 0.0
+    cost_per_ai_approved_candidate: float = 0.0
+    cost_per_executed_trade: float = 0.0
 
     # Profit-target goal (month-to-date pace)
     goal_enabled: bool = False
@@ -139,17 +171,32 @@ class TradingStats:
     candidate_decisions: list = field(default_factory=list)
 
     # Scalp horizon: top-ranked ScalpOpportunity.to_dict() dicts, refreshed every
-    # cycle the same way candidate_decisions is (see scripts/run_live_trading.py) --
+    # cycle the same way candidate_decisions is (see src/markets/nse/runtime/live.py) --
     # empty unless settings.scalp_enabled=True. Serialized automatically by
     # stats_to_dict()'s dataclasses.asdict(), no webui backend change needed.
     scalp_opportunities: list = field(default_factory=list)
+    # One deterministic BUY / NO_BUY / NO_DATA result for every symbol in the
+    # configured scalp universe. Unlike scalp_opportunities, this list is not capped
+    # to the small number allowed through to agent review/execution.
+    scalp_symbol_statuses: list = field(default_factory=list)
+    scalp_scan_completed_at: str = ""
     # Funnel counters for one cycle's scalp pipeline (req 13): raw strategy triggers
     # -> consolidated symbol/timeframe decisions -> multi-timeframe scalp candidates
-    # -> entry-quality passed -> regime-compatible -> H-8 admitted -> sent to AI ->
+    # -> entry-quality passed -> regime-compatible -> registry eligible -> sent to AI ->
     # AI approved -> execution accepted. Reset to zero at the start of each cycle's
     # scalp scan so a cycle with scalp_enabled=False just shows an all-zero funnel
     # rather than stale counts from a previous cycle.
     scalp_funnel: dict = field(default_factory=dict)
+    scalp_rejection_reasons: list = field(default_factory=list)
+
+    # Exact per-cycle audit. Unlike signals_generated (a session cumulative counter),
+    # these fields are replaced atomically for each meaningful candle event.
+    signal_funnel: dict = field(default_factory=dict)
+    rejection_reasons: list = field(default_factory=list)
+    rejection_drilldown: list = field(default_factory=list)
+    strategy_funnel: list = field(default_factory=list)
+    strategy_eligibility_registry: list = field(default_factory=list)
+    qwen_call_audit: list = field(default_factory=list)
 
     chart_symbol: str = ""
     chart_timeframes: dict = field(default_factory=dict)
@@ -255,6 +302,28 @@ class TradingDashboard:
     def update_market_data(self, quotes: dict):
         """Update market quotes."""
         self.stats.market_quotes = quotes
+
+    def begin_cycle(self, cycle: int) -> None:
+        """Publish a cycle even when it later returns before trade review."""
+        self.stats.cycles_run = cycle
+        self.stats.ai_review_status = "scanning"
+        self.stats.ai_review_reason = "Technical and ML pre-check in progress"
+        self.stats.agent_fallback_notice = ""
+
+    def update_shared_market_context(self, context: dict) -> None:
+        """Surface cached market-wide agents independently of trade admission."""
+        self.stats.current_regime = str(context.get("regime", "unknown"))
+        self.stats.regime_confidence = float(context.get("regime_confidence", 0.0) or 0.0)
+        self.stats.regime_reasoning = str(context.get("regime_reasoning", ""))
+        self.stats.news_headlines = list(context.get("news_headlines", []))
+        news_sentiment = context.get("news_sentiment") or {}
+        self.stats.news_sentiment = float(news_sentiment.get("avg_sentiment", 0.0) or 0.0)
+        self.stats.market_mood = dict(context.get("market_mood", {}))
+
+    def set_ai_review_status(self, status: str, reason: str) -> None:
+        """Record why deep candidate review ran, skipped, paused, or failed."""
+        self.stats.ai_review_status = status
+        self.stats.ai_review_reason = reason
 
     def set_current_signal(
         self,

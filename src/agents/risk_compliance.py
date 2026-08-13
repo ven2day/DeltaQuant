@@ -15,23 +15,62 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
-from src.backtesting.strategy_registry import StrategyRegistry
+from src.backtesting.strategy_eligibility import (
+    eligibility_registry_from_settings,
+    resolve_eligibility_environment,
+)
 from src.config import get_settings
-from src.market.sectors import get_stock_sector
-from src.market.signals import StrategyType
-from src.utils.market_time import is_trading_window, now_ist
+from src.markets.nse.sessions.market_time import is_trading_window, now_ist
+from src.markets.nse.universe.sectors import get_stock_sector
 
 from .state import TradingState
 
 logger = logging.getLogger(__name__)
 
-# The governed strategy names (src.market.signals.StrategyType) that the H-8
-# admission registry knows how to validate. A signal tagged with one of these must have
-# a current VALIDATED registry artifact to be approved here -- fail closed. Signals that
-# don't carry one of these names (e.g. hand-built fixtures, other non-governed entry
-# paths) are left to the existing checks and are not affected by this gate.
-_GOVERNED_STRATEGY_NAMES = {member.value for member in StrategyType}
 
+def _decision_chain(signal: dict[str, Any], *, risk_result: dict[str, Any], final: str) -> dict[str, Any]:
+    """Compact reproducible lineage; natural-language reasoning is never authoritative."""
+
+    return {
+        "symbol": signal.get("symbol"),
+        "timeframe": signal.get("timeframe"),
+        "trade_horizon": signal.get("trade_horizon"),
+        "settled_candle_timestamp": signal.get("signal_candle_timestamp"),
+        "feature_snapshot": {
+            "id": signal.get("feature_snapshot_id"),
+            "version": signal.get("feature_version"),
+        },
+        "strategies": {
+            "strongest": signal.get("strategy"),
+            "version": signal.get("strategy_version"),
+            "supporting": signal.get("supporting_strategies", []),
+            "opposing": signal.get("opposing_strategies", []),
+            "agreement": signal.get("agreement_level"),
+            "conflict": signal.get("conflict_level"),
+        },
+        "strategy_eligibility": {
+            "model_version": signal.get("model_version", signal.get("strategy_version")),
+            "validation_status": signal.get(
+                "eligibility_status", signal.get("validation_status")
+            ),
+            "current_regime": signal.get("current_regime"),
+            "regime_policy": signal.get("regime_policy"),
+            "original_confidence": signal.get("original_confidence"),
+            "regime_adjusted_confidence": signal.get("regime_adjusted_confidence"),
+            "registry_decision": signal.get("registry_decision"),
+            "registry_reason": signal.get("registry_reason"),
+        },
+        "ml": {
+            "status": signal.get("ml_status", "ABSTAIN"),
+            "probability": signal.get("ml_probability"),
+            "model_version": signal.get("ml_model_version"),
+            "feature_version": signal.get("ml_feature_version"),
+            "required": bool(signal.get("ml_required", False)),
+        },
+        "qwen_context": signal.get("validation", {}),
+        "risk": risk_result,
+        "final": final,
+    }
 
 @dataclass
 class RiskLimits:
@@ -74,10 +113,10 @@ class RiskLimits:
         ``trade_horizon="SCALP"`` selects the tighter ``settings.scalp_max_position_pct``
         in place of swing's ``max_position_pct`` for check #3 (position_size) -- every
         other limit (exposure, daily caps, drawdown, trading hours, sector/correlation
-        caps, and the H-8 admission check in ``_run_risk_checks``) is unchanged
+        caps, and the strategy-eligibility check in ``_run_risk_checks``) is unchanged
         regardless of horizon. A single ``risk_compliance_node`` invocation processes
         one horizon's signals at a time (the scalp and swing batches go through
-        separate graph invocations, see ``scripts/run_live_trading.py``), so building
+        separate graph invocations, see ``src/markets/nse/runtime/live.py``), so building
         one ``RiskLimits`` per call here matches that existing one-call-per-invocation
         shape rather than needing per-signal limits.
         """
@@ -155,6 +194,7 @@ def risk_compliance_node(state: TradingState) -> dict[str, Any]:
     portfolio = state.get("portfolio", {})
     daily_stats = state.get("daily_stats", {})
     regime = state.get("regime", "unknown")
+    execution_mode = str(state.get("execution_mode", "market_paper"))
 
     # Get risk limits (horizon-aware position-size cap; see from_settings docstring)
     limits = RiskLimits.from_settings(trade_horizon=state.get("trade_horizon", "SWING"))
@@ -165,6 +205,18 @@ def risk_compliance_node(state: TradingState) -> dict[str, Any]:
 
     for signal in validated_signals:
         checks = _run_risk_checks(signal, portfolio, daily_stats, limits, regime=regime)
+        signal_execution_mode = str(signal.get("execution_mode", execution_mode))
+        checks.append(
+            RiskCheckResult(
+                passed=signal_execution_mode == execution_mode,
+                rule="execution_mode_isolation",
+                message=(
+                    f"Signal execution mode {signal_execution_mode!r} does not match "
+                    f"cycle mode {execution_mode!r}"
+                ),
+                severity="block",
+            )
+        )
 
         # Collect results
         blocking_failures = [c for c in checks if not c.passed and c.severity == "block"]
@@ -176,6 +228,9 @@ def risk_compliance_node(state: TradingState) -> dict[str, Any]:
                 "approved": False,
                 "failures": [c.to_dict() for c in blocking_failures],
             }
+            signal["decision_chain"] = _decision_chain(
+                signal, risk_result=signal["risk_result"], final="REJECTED_BY_RISK"
+            )
             rejected.append(signal)
 
             for failure in blocking_failures:
@@ -186,6 +241,9 @@ def risk_compliance_node(state: TradingState) -> dict[str, Any]:
                 "approved": True,
                 "warnings": [c.to_dict() for c in warning_failures],
             }
+            signal["decision_chain"] = _decision_chain(
+                signal, risk_result=signal["risk_result"], final="PAPER_APPROVED"
+            )
             approved.append(signal)
 
             for warning in warning_failures:
@@ -208,10 +266,11 @@ def _run_risk_checks(
     daily_stats: dict[str, Any],
     limits: RiskLimits,
     regime: str = "unknown",
+    enforce_strategy_eligibility: bool = True,
 ) -> list[RiskCheckResult]:
     """Run all risk checks on a signal.
 
-    Hard/soft severity matrix (H-3, DeltaQuant-Quant-Risk-Review.md): every check that
+    Hard/soft severity matrix (H-3, docs/audits/DeltaQuant-Quant-Risk-Review.md): every check that
     represents a stated portfolio/risk *limit* is a hard "block" -- daily_trade_limit,
     daily_loss_limit, position_size, risk_reward, stop_loss_pct, max_positions,
     total_exposure, trading_hours, drawdown, duplicate_position, sector_exposure,
@@ -261,7 +320,7 @@ def _run_risk_checks(
     )
 
     # 4. Risk-reward ratio (H-3: hardened from warning to block -- a sub-minimum R:R signal
-    # is a real edge/economics problem, not a soft advisory; see DeltaQuant-Quant-Risk-Review.md)
+    # is a real edge/economics problem, not a soft advisory; see docs/audits/DeltaQuant-Quant-Risk-Review.md)
     rr_ratio = signal.get("risk_reward_ratio", 0)
     checks.append(
         RiskCheckResult(
@@ -427,7 +486,11 @@ def _run_risk_checks(
     ]
     symbol_correlations = return_correlations.get(symbol, {})
     max_corr = max(
-        (abs(symbol_correlations[other]) for other in existing_symbols if other in symbol_correlations),
+        (
+            abs(symbol_correlations[other])
+            for other in existing_symbols
+            if other in symbol_correlations
+        ),
         default=0.0,
     )
     checks.append(
@@ -442,35 +505,40 @@ def _run_risk_checks(
         )
     )
 
-    # 14. Strategy admission gate (H-8, DeltaQuant-Quant-Risk-Review.md). Final-gate
-    # backstop for the same check strategy_selection_node already applies upstream: a
-    # governed strategy name with no current, non-expired VALIDATED registry artifact
-    # must not produce an approved trade, regardless of how it got this far (LLM
-    # validation approving a strategy outside the active list, a direct graph
-    # invocation that skipped strategy_selection, etc). Signals that don't carry one of
-    # the four governed strategy names are unaffected -- this is not a general "is this
-    # a known strategy" check, only the H-8 admission gate.
-    strategy_name = signal.get("strategy")
-    if strategy_name in _GOVERNED_STRATEGY_NAMES:
+    # 14. Final strategy-eligibility backstop. The exact registry decision is recomputed
+    # after Qwen so contextual output can never promote a blocked strategy or regime.
+    strategy_name = str(signal.get("strategy", ""))
+    if enforce_strategy_eligibility and strategy_name:
         settings = get_settings()
-        registry_dir = getattr(settings, "strategy_registry_dir", "data/strategy_registry")
-        signal_timeframe = signal.get("timeframe")
-        signal_trade_horizon = signal.get("trade_horizon", "SWING")
-        admitted = StrategyRegistry(str(registry_dir)).is_admitted(
-            strategy_name,
-            regime=regime,
-            timeframe=signal_timeframe,
-            trade_horizon=signal_trade_horizon,
+        signal_timeframe = str(signal.get("timeframe", ""))
+        registry = eligibility_registry_from_settings(settings)
+        environment = resolve_eligibility_environment(
+            str(signal.get("execution_mode", "market_paper")),
+            requested_execution_mode=str(getattr(settings, "execution_mode", "local_paper")),
+            trading_mode=str(getattr(settings, "trading_mode", "paper")),
         )
+        eligibility = registry.evaluate(
+            strategy_name=strategy_name,
+            timeframe=signal_timeframe,
+            model_version=str(
+                signal.get("model_version", signal.get("strategy_version", ""))
+            ),
+            environment=environment,
+            current_regime=regime,
+            confidence=float(
+                signal.get("original_confidence", signal.get("confidence", 0.0)) or 0.0
+            ),
+            action=str(signal.get("signal_type", "BUY")),
+            market=str(signal.get("market", getattr(settings, "market", "NSE"))),
+        )
+        signal.update(eligibility.to_dict())
+        signal["registry_reason"] = eligibility.reason_code
+        signal["eligibility_status"] = eligibility.validation_status.value
         checks.append(
             RiskCheckResult(
-                passed=admitted,
-                rule="strategy_admission",
-                message=(
-                    f"Strategy '{strategy_name}' has no current VALIDATED registry artifact "
-                    f"for regime '{regime}', timeframe '{signal_timeframe}', trade_horizon "
-                    f"'{signal_trade_horizon}' (H-8 strategy admission gate)"
-                ),
+                passed=eligibility.execution_allowed,
+                rule="strategy_eligibility",
+                message=eligibility.message,
                 severity="block",
             )
         )
@@ -579,6 +647,20 @@ def check_kill_switch(state: TradingState, limits: RiskLimits | None = None) -> 
     """
     if limits is None:
         limits = RiskLimits.from_settings()
+
+    settings = get_settings()
+    market = str(state.get("market", getattr(settings, "market", "NSE"))).upper()
+    if bool(getattr(settings, "global_kill_switch", False)):
+        logger.critical("KILL SWITCH: GLOBAL_KILL_SWITCH is active")
+        return True
+    market_switch = {
+        "NSE": bool(getattr(settings, "nse_kill_switch", False)),
+        "FOREX": bool(getattr(settings, "forex_kill_switch", False)),
+        "CRYPTO": bool(getattr(settings, "crypto_kill_switch", False)),
+    }.get(market, True)
+    if market_switch:
+        logger.critical("KILL SWITCH: %s_KILL_SWITCH is active", market)
+        return True
 
     daily_stats = state.get("daily_stats", {})
 

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import logging
 
-from src.utils.market_time import now_ist
+from src.markets.nse.sessions.market_time import now_ist
 
 logger = logging.getLogger(__name__)
 

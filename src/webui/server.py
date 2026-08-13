@@ -8,9 +8,10 @@ Every route (REST and the ``/ws`` WebSocket) requires a valid session — see
 ``src/webui/auth.py``. There is no unauthenticated read path: the dashboard exposes
 wallet balance, positions, and trading activity, and this app is designed to be
 reachable over the network, not just loopback (M-8,
-DeltaQuant-Quant-Risk-Review.md).
+docs/audits/DeltaQuant-Quant-Risk-Review.md).
 """
 
+import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -29,7 +30,8 @@ from fastapi import (
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from src.market.stock_discovery import MIDCAP_STOCKS, NIFTY50_STOCKS
+from src.finops import get_cost_tracker
+from src.markets.api_registry import MarketApiRegistry
 from src.webui.auth import (
     LoginAttemptTracker,
     create_session_token,
@@ -40,13 +42,6 @@ from src.webui.auth import (
 logger = logging.getLogger(__name__)
 
 SESSION_COOKIE_NAME = "dq_session"
-
-# Symbols chartable from the Charts tab's symbol picker -- the same NIFTY50+midcap
-# universe the discovery/signal loop scans (see stock_discovery.py), not limited to
-# currently open positions. Static and small, so served straight from this list
-# rather than threaded through as a callback like get_candles/get_snapshot.
-TRADEABLE_UNIVERSE = sorted(set(NIFTY50_STOCKS) | set(MIDCAP_STOCKS))
-
 
 class ConnectionHub:
     """Tracks connected WebSocket clients and broadcasts state to all of them."""
@@ -99,6 +94,11 @@ def create_app(
     cookie_secure: bool = False,
     login_max_attempts: int = 5,
     login_lockout_minutes: int = 15,
+    get_universe: Callable[[], list[str]] | None = None,
+    market_api_registry: MarketApiRegistry | None = None,
+    websocket_poll_seconds: float | None = None,
+    get_jobs_status: Callable[[], Awaitable[dict[str, Any]]] | None = None,
+    run_job: Callable[[str], Awaitable[bool]] | None = None,
 ) -> FastAPI:
     """Build the FastAPI app: snapshot, signal-history, health, and auth routes plus the WebSocket.
 
@@ -108,7 +108,7 @@ def create_app(
     invalidates every existing session, logging everyone out). ``cookie_secure``
     should be True whenever the app is served over HTTPS (it prevents the browser
     from ever sending the session cookie over plain HTTP) — see the caller in
-    ``scripts/run_live_trading.py`` for how it's derived from settings.
+    ``src/markets/nse/runtime/live.py`` for how it's derived from settings.
     """
     app = FastAPI(title="₹DeltaQuant Web UI")
     attempts = LoginAttemptTracker(
@@ -206,7 +206,7 @@ def create_app(
         limit: int = 250, _subject: str = Depends(_require_session)
     ) -> list[dict[str, Any]]:
         """Return the durable, net-of-charges paper trade ledger."""
-        from src.execution.paper_engine import LocalPaperEngine
+        from src.markets.nse.execution.paper_engine import LocalPaperEngine
 
         return LocalPaperEngine().get_closed_trade_history(limit=limit)
 
@@ -228,13 +228,119 @@ def create_app(
     def get_universe_route(_subject: str = Depends(_require_session)) -> list[str]:
         """NSE symbols the Charts tab's symbol picker can chart -- lets a user pull up
         any NIFTY50/midcap stock for analysis, not just symbols with an open position."""
-        return TRADEABLE_UNIVERSE
+        if get_universe is not None:
+            return get_universe()
+        # Compatibility for the existing NSE combined runtime.  The import is kept
+        # inside the legacy endpoint so a standalone Forex/API process never imports
+        # NSE discovery modules merely by importing this server.
+        from src.markets.nse.universe.discovery import MIDCAP_STOCKS, NIFTY50_STOCKS
+
+        return sorted(set(NIFTY50_STOCKS) | set(MIDCAP_STOCKS))
+
+    @app.get("/api/markets/summary")
+    def markets_summary(_subject: str = Depends(_require_session)) -> dict[str, Any]:
+        return market_api_registry.summary() if market_api_registry is not None else {}
+
+    @app.get("/api/finops/summary")
+    def finops_summary(
+        market: str | None = None, _subject: str = Depends(_require_session)
+    ) -> dict[str, Any]:
+        """Structured daily totals; contains no prompts, responses, or credentials."""
+        return get_cost_tracker().daily_summary(market)
+
+    @app.get("/api/finops/calls")
+    def finops_calls(
+        market: str | None = None,
+        limit: int = 100,
+        _subject: str = Depends(_require_session),
+    ) -> list[dict[str, Any]]:
+        return get_cost_tracker().recent_records(max(1, min(limit, 500)), market=market)
+
+    @app.get("/api/models/status")
+    def models_status(_subject: str = Depends(_require_session)) -> list[dict[str, Any]]:
+        return market_api_registry.models_status() if market_api_registry is not None else []
+
+    @app.get("/api/validation/status")
+    def validation_status(_subject: str = Depends(_require_session)) -> list[dict[str, Any]]:
+        return market_api_registry.validation_status() if market_api_registry is not None else []
+
+    @app.get("/api/{market}/status")
+    def market_status(market: str, _subject: str = Depends(_require_session)) -> dict[str, Any]:
+        view = market_api_registry.get(market) if market_api_registry is not None else None
+        if view is None:
+            raise HTTPException(status_code=404, detail="Market runtime not registered")
+        return view.scoped_status()
+
+    @app.get("/api/{market}/signals")
+    def market_signals(
+        market: str, days: int = 7, _subject: str = Depends(_require_session)
+    ) -> list[dict[str, Any]]:
+        view = market_api_registry.get(market) if market_api_registry is not None else None
+        if view is None:
+            raise HTTPException(status_code=404, detail="Market runtime not registered")
+        return view.scoped_signals(days)
+
+    @app.get("/api/{market}/candidates")
+    def market_candidates(
+        market: str, _subject: str = Depends(_require_session)
+    ) -> list[dict[str, Any]]:
+        view = market_api_registry.get(market) if market_api_registry is not None else None
+        if view is None:
+            raise HTTPException(status_code=404, detail="Market runtime not registered")
+        return view.scoped_candidates()
+
+    @app.get("/api/{market}/positions")
+    def market_positions(
+        market: str, _subject: str = Depends(_require_session)
+    ) -> list[dict[str, Any]]:
+        view = market_api_registry.get(market) if market_api_registry is not None else None
+        if view is None:
+            raise HTTPException(status_code=404, detail="Market runtime not registered")
+        return view.scoped_positions()
+
+    @app.get("/api/{market}/strategies")
+    def market_strategies(
+        market: str, _subject: str = Depends(_require_session)
+    ) -> list[dict[str, Any]]:
+        view = market_api_registry.get(market) if market_api_registry is not None else None
+        if view is None:
+            raise HTTPException(status_code=404, detail="Market runtime not registered")
+        return view.scoped_strategies()
+
+    @app.get("/api/{market}/models")
+    def market_models(
+        market: str, _subject: str = Depends(_require_session)
+    ) -> list[dict[str, Any]]:
+        view = market_api_registry.get(market) if market_api_registry is not None else None
+        if view is None:
+            raise HTTPException(status_code=404, detail="Market runtime not registered")
+        return view.scoped_models()
 
     @app.get("/api/health")
     async def get_health_route(
         full: bool = False, _subject: str = Depends(_require_session)
     ) -> dict[str, Any]:
         return await get_health(full)
+
+    @app.get("/api/system/jobs")
+    async def jobs_status_route(_subject: str = Depends(_require_session)) -> dict[str, Any]:
+        """Local-services liveness (backend/frontend/postgres/timescaledb) and
+        background-job freshness (strategy validation, scalp ML training,
+        signal discovery) -- distinct from /api/health, which only checks
+        external service connectivity (Dhan, LLM provider, etc)."""
+        return await get_jobs_status() if get_jobs_status is not None else {}
+
+    @app.post("/api/system/jobs/{name}/run")
+    async def run_job_route(
+        name: str, _subject: str = Depends(_require_session)
+    ) -> dict[str, Any]:
+        """Manually trigger a background job now, bypassing its staleness
+        check. Refuses (started=False) if that job is already running or
+        unknown -- never queues a second concurrent run."""
+        if run_job is None:
+            raise HTTPException(status_code=404, detail="Job control not available")
+        started = await run_job(name)
+        return {"started": started}
 
     @app.websocket("/ws")
     async def ws_endpoint(websocket: WebSocket) -> None:
@@ -257,9 +363,19 @@ def create_app(
             # until the next broadcast tick.
             await websocket.send_json(get_snapshot())
             while True:
-                # Nothing is expected from the client — this just blocks until
-                # it disconnects (any inbound text is ignored).
-                await websocket.receive_text()
+                # A combined NSE runtime broadcasts through ConnectionHub.  The
+                # standalone API instead reads independent worker snapshots, so
+                # it polls the getter and pushes fresh state without requiring
+                # the browser to send messages.
+                if websocket_poll_seconds is None:
+                    await websocket.receive_text()
+                    continue
+                try:
+                    await asyncio.wait_for(
+                        websocket.receive_text(), timeout=max(0.05, websocket_poll_seconds)
+                    )
+                except TimeoutError:
+                    await websocket.send_json(get_snapshot())
         except WebSocketDisconnect:
             pass
         finally:
@@ -294,6 +410,11 @@ class WebUIServer:
         cookie_secure: bool = False,
         login_max_attempts: int = 5,
         login_lockout_minutes: int = 15,
+        get_universe: Callable[[], list[str]] | None = None,
+        market_api_registry: MarketApiRegistry | None = None,
+        websocket_poll_seconds: float | None = None,
+        get_jobs_status: Callable[[], Awaitable[dict[str, Any]]] | None = None,
+        run_job: Callable[[str], Awaitable[bool]] | None = None,
     ) -> None:
         app = create_app(
             hub,
@@ -309,6 +430,11 @@ class WebUIServer:
             cookie_secure=cookie_secure,
             login_max_attempts=login_max_attempts,
             login_lockout_minutes=login_lockout_minutes,
+            get_universe=get_universe,
+            market_api_registry=market_api_registry,
+            websocket_poll_seconds=websocket_poll_seconds,
+            get_jobs_status=get_jobs_status,
+            run_job=run_job,
         )
         config = uvicorn.Config(app, host=host, port=port, log_level="warning")
         self._server = uvicorn.Server(config)

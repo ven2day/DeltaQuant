@@ -1,4 +1,4 @@
-"""Tests for src/market/dhan_quotes_feed.py — DhanHQ live quotes.
+"""Tests for src/markets/nse/broker/dhan/quotes.py — DhanHQ live quotes.
 
 Response shapes mirror real live calls (quote_data double-nested under
 "data"; historical_daily_data returning parallel arrays including "close") —
@@ -11,7 +11,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from src.market.dhan_quotes_feed import (
+from src.markets.nse.broker.dhan.quotes import (
     DhanQuotesFeed,
     QuotesFeed,
     _fetch_previous_close,
@@ -25,8 +25,8 @@ def _no_real_rate_limiting():
     # shared process-wide state (see src/utils/rate_limiter.py); depleting its token
     # bucket across many tests causes genuine sleeps, not a mock-friendly no-op.
     with (
-        patch("src.market.dhan_quotes_feed.get_dhan_data_api_limiter") as mock_data_limiter,
-        patch("src.market.dhan_quotes_feed.get_dhan_quote_api_limiter") as mock_quote_limiter,
+        patch("src.markets.nse.broker.dhan.quotes.get_dhan_data_api_limiter") as mock_data_limiter,
+        patch("src.markets.nse.broker.dhan.quotes.get_dhan_quote_api_limiter") as mock_quote_limiter,
     ):
         yield mock_data_limiter, mock_quote_limiter
 
@@ -45,12 +45,12 @@ def _feed(security_ids=None, cache_file="dummy.json"):
     security_ids = security_ids or {"RELIANCE": "2885", "TCS": "11536"}
     with (
         patch(
-            "src.market.dhan_quotes_feed.get_settings",
+            "src.markets.nse.broker.dhan.quotes.get_settings",
             return_value=_mock_settings(cache_file=cache_file),
         ),
-        patch("src.market.dhan_quotes_feed.get_valid_access_token", return_value="token"),
-        patch("src.market.dhan_quotes_feed.get_dhan_client"),
-        patch("src.market.dhan_quotes_feed.fetch_security_id_map", return_value=security_ids),
+        patch("src.markets.nse.broker.dhan.quotes.get_valid_access_token", return_value="token"),
+        patch("src.markets.nse.broker.dhan.quotes.get_dhan_client"),
+        patch("src.markets.nse.broker.dhan.quotes.fetch_security_id_map", return_value=security_ids),
     ):
         return DhanQuotesFeed(symbols=list(security_ids.keys()))
 
@@ -184,9 +184,9 @@ def test_fetch_quotes_skips_previous_close_requests_when_history_is_disabled(tmp
     assert quotes["RELIANCE"].last_price == 1325.0
 
 
-def test_fetch_quotes_batches_at_100_securities_per_request(tmp_path):
+def test_fetch_quotes_batches_at_1000_securities_per_request(tmp_path):
     cache_file = str(tmp_path / "cache.json")
-    security_ids = {f"SYM{i}": str(i) for i in range(150)}
+    security_ids = {f"SYM{i}": str(i) for i in range(1, 1002)}
     feed = _feed(security_ids=security_ids, cache_file=cache_file)
     feed._client.historical_daily_data.return_value = _daily_response([100.0])
     feed._client.quote_data.return_value = _quote_data_response({})
@@ -195,12 +195,10 @@ def test_fetch_quotes_batches_at_100_securities_per_request(tmp_path):
 
     assert feed._client.quote_data.call_count == 2
     first_call_ids = feed._client.quote_data.call_args_list[0][0][0]["NSE_EQ"]
-    assert len(first_call_ids) == 100
+    assert len(first_call_ids) == 1000
 
 
-def test_fetch_quotes_uses_the_correct_limiter_for_each_endpoint(
-    tmp_path, _no_real_rate_limiting
-):
+def test_fetch_quotes_uses_the_correct_limiter_for_each_endpoint(tmp_path, _no_real_rate_limiting):
     # Regression guard: a live 276-symbol scan showed DhanHQ enforces one account-
     # wide 5 req/s cap across ALL its Data APIs combined (not per-endpoint) — a local
     # per-file delay isn't enough since other concurrent Dhan callers (e.g. the
@@ -215,11 +213,11 @@ def test_fetch_quotes_uses_the_correct_limiter_for_each_endpoint(
     feed.fetch_quotes()
 
     # One acquire per previous-close fetch (250, one per symbol) plus one per
-    # quote_data batch (3: 100/100/50) — every single DhanHQ call draws from
+    # quote_data batch (one request for all 250) — every single DhanHQ call draws from
     # the shared limiter, not just quote_data.
     data_limiter, quote_limiter = _no_real_rate_limiting
     assert data_limiter.return_value.acquire_sync.call_count == 250
-    assert quote_limiter.return_value.acquire_sync.call_count == 3
+    assert quote_limiter.return_value.acquire_sync.call_count == 1
 
 
 def test_fetch_quotes_skips_failed_batch_without_raising(tmp_path):
@@ -308,10 +306,10 @@ def test_symbol_missing_from_previous_closes_still_returns_a_quote_with_zero_cha
 def test_quotes_facade_prefers_dhan_when_it_returns_data():
     with (
         patch(
-            "src.market.dhan_quotes_feed.get_settings",
+            "src.markets.nse.broker.dhan.quotes.get_settings",
             return_value=_mock_settings("dhan", True),
         ),
-        patch("src.market.dhan_quotes_feed.DhanQuotesFeed") as mock_dhan_cls,
+        patch("src.markets.nse.broker.dhan.quotes.DhanQuotesFeed") as mock_dhan_cls,
     ):
         mock_dhan_cls.return_value.fetch_quotes.return_value = {"RELIANCE": object()}
         feed = QuotesFeed(symbols=["RELIANCE"])
@@ -324,10 +322,10 @@ def test_quotes_facade_prefers_dhan_when_it_returns_data():
 def test_quotes_facade_returns_empty_when_dhan_returns_empty():
     with (
         patch(
-            "src.market.dhan_quotes_feed.get_settings",
+            "src.markets.nse.broker.dhan.quotes.get_settings",
             return_value=_mock_settings("dhan", True),
         ),
-        patch("src.market.dhan_quotes_feed.DhanQuotesFeed") as mock_dhan_cls,
+        patch("src.markets.nse.broker.dhan.quotes.DhanQuotesFeed") as mock_dhan_cls,
     ):
         mock_dhan_cls.return_value.fetch_quotes.return_value = {}
         feed = QuotesFeed(symbols=["RELIANCE"])
@@ -340,10 +338,10 @@ def test_quotes_facade_returns_empty_when_dhan_returns_empty():
 def test_quotes_facade_skips_dhan_when_disabled():
     with (
         patch(
-            "src.market.dhan_quotes_feed.get_settings",
+            "src.markets.nse.broker.dhan.quotes.get_settings",
             return_value=_mock_settings("dhan", False),
         ),
-        patch("src.market.dhan_quotes_feed.DhanQuotesFeed") as mock_dhan_cls,
+        patch("src.markets.nse.broker.dhan.quotes.DhanQuotesFeed") as mock_dhan_cls,
     ):
         feed = QuotesFeed(symbols=["RELIANCE"])
         result = feed.fetch_quotes()

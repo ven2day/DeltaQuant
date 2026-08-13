@@ -149,7 +149,7 @@ export interface ScalpingCandidate {
 
 // One symbol/timeframe cell of the scalp assessment matrix
 // (src/market/assessment_matrix.py TimeframeAssessment.to_dict()). `decision` is
-// descriptive only, never an admission decision -- H-8 and risk_compliance still
+// descriptive only, never an admission decision -- strategy eligibility and risk still
 // gate every trade independently regardless of what a cell reads here.
 export interface TimeframeAssessment {
   timeframe: string;
@@ -218,24 +218,194 @@ export interface ScalpOpportunity {
   expected_r: number;
 }
 
+// src/market/scalp_scan.py ScalpSymbolStatus.to_dict(). This is the uncapped,
+// full-universe technical scan. BUY is a setup indication, not order approval.
+export interface ScalpSymbolStatus {
+  symbol: string;
+  decision: "BUY" | "NO_BUY" | "NO_DATA";
+  stage: string;
+  reasons: string[];
+  available_timeframes: string[];
+  missing_timeframes: string[];
+  raw_buy_signals: number;
+  timeframe_states: Record<string, TimeframeAssessment>;
+  primary_strategy: string;
+  primary_timeframe: string;
+  entry_quality: EntryQualityResult | null;
+  mtf_confirmation: ScalpConfirmationResult | null;
+  regime_compatible: boolean | null;
+  score: number;
+  selected_for_review: boolean;
+  entry_price: number;
+  stop_loss: number;
+  target_price: number;
+  expected_r: number;
+  ml_probability: number | null;
+}
+
 // src/market/scalp_scan.py FUNNEL_KEYS -- req 13's funnel observability counters,
 // one full cycle's worth: raw strategy triggers -> ... -> execution accepted.
 export interface ScalpFunnel {
   raw_triggers: number;
   consolidated: number;
   mtf_candidates: number;
+  mtf_confirmed: number;
+  mtf_conflict: number;
+  mtf_missing_data: number;
   entry_quality_passed: number;
+  ml_scored: number;
   regime_compatible: number;
-  h8_admitted: number;
+  registry_eligible: number;
+  confidence_reduced: number;
   sent_to_ai: number;
   ai_approved: number;
   execution_accepted: number;
+}
+
+export interface SignalFunnel {
+  cycle_id: number;
+  trade_horizon: string;
+  symbols_requested: number;
+  symbols_ready: number;
+  symbols_scanned: number;
+  strategy_evaluations: number;
+  raw_signals: number;
+  technical_setups: number;
+  deterministic_qualified: number;
+  deterministic_rejected: number;
+  registry_eligible: number;
+  registry_shadow_only: number;
+  registry_blocked: number;
+  registry_unvalidated: number;
+  regime_blocked: number;
+  confidence_reduced: number;
+  ml_candidates: number;
+  ml_inference: number;
+  ml_abstain: number;
+  ml_pass: number;
+  qwen_required: number;
+  qwen_skipped_clear: number;
+  qwen_cache_hits: number;
+  qwen_external_calls: number;
+  qwen_deferred: number;
+  qwen_rejected: number;
+  signal_validation_pass: number;
+  signal_validation_reject: number;
+  risk_approved: number;
+  risk_blocked: number;
+  final_buy: number;
+  final_hold: number;
+  final_wait: number;
+  final_reject: number;
+  reconciled: boolean;
+  reconciliation_errors: string[];
+}
+
+export interface RejectionBreakdown {
+  stage: string;
+  reason: string;
+  count: number;
+  percentage: number;
+  strategy?: string;
+  timeframe?: string;
+  symbol?: string;
+}
+
+export interface StrategyFunnelRow {
+  strategy: string;
+  timeframe: string;
+  trade_horizon: string;
+  raw?: number;
+  technical_setups?: number;
+  qualified?: number;
+  registry_eligible?: number;
+  shadow_only?: number;
+  ml_evaluated?: number;
+  ml_abstained?: number;
+  qwen_required?: number;
+  validation_passed?: number;
+  validation_rejected?: number;
+  risk_approved?: number;
+  risk_rejected?: number;
+  final_orders?: number;
+  rejected?: number;
+}
+
+export interface DataLineage {
+  execution_mode?: string;
+  runtime_mode?: string;
+  market_data_source?: string;
+  quote_source?: string;
+  candle_source?: string;
+  is_simulated?: boolean;
+  exchange_timestamp?: string;
+  symbols_in_current_quote_batch?: number;
+  simulated_data_executable?: boolean;
+  broker_orders_enabled?: boolean;
+}
+
+export interface QwenCallAuditRow {
+  agent: string;
+  purpose: string;
+  calls: number;
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  cache_hits: number;
+  candidate_related: boolean;
+  symbols: string[];
+  cycle_id: string;
+}
+
+export interface StrategyEligibilityRegistryRow {
+  strategy: string;
+  timeframe: string;
+  model_version: string;
+  validation_status: string;
+  validated_at: string;
+  allowed_regimes: string[];
+  disabled_regimes: string[];
+  minimum_model_confidence: number;
+  minimum_strategy_confidence: number;
+  oos_trade_count: number;
+  oos_profit_factor: number | null;
+  oos_max_drawdown: number | null;
+  oos_win_rate: number | null;
+  status_reason: string;
+}
+
+export interface FinOpsBucket {
+  calls: number;
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  cost_usd: number;
+}
+
+export interface FinOpsSummary {
+  date: string;
+  calls: number;
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  total_cost_usd: number;
+  candidate_review_calls: number;
+  context_support_calls: number;
+  by_market: Record<string, FinOpsBucket>;
+  by_reason: Record<string, FinOpsBucket>;
+  by_component: Record<string, FinOpsBucket>;
+  by_model: Record<string, FinOpsBucket>;
 }
 
 export interface TradingStats {
   session_start: string;
   trading_mode: string;
   data_source: string;
+  execution_mode: string;
+  quote_source: string;
+  candle_source: string;
+  broker_orders_enabled: boolean;
+  data_lineage: DataLineage;
   // Backend-computed: the same is_trading_window()/force_trading_window gate the
   // cycle loop itself uses for new entries — not a client-guessed clock.
   market_open: boolean;
@@ -275,10 +445,15 @@ export interface TradingStats {
   market_mood: MarketMood | Record<string, never>;
   prediction_signals: PredictionSignal[];
   agent_fallback_notice: string;
+  ai_review_status: string;
+  ai_review_reason: string;
 
   llm_calls: number;
   llm_tokens: number;
   llm_cost_usd: number;
+  llm_finops: FinOpsSummary | Record<string, never>;
+  llm_session_metrics: FinOpsSummary | Record<string, never>;
+  llm_cycle_metrics: FinOpsSummary | Record<string, never>;
 
   goal_enabled: boolean;
   goal_feasible: boolean;
@@ -303,7 +478,16 @@ export interface TradingStats {
   // Top-ranked scalp opportunities, refreshed every cycle the same way
   // candidate_decisions is -- empty unless the backend's scalp_enabled is on.
   scalp_opportunities: ScalpOpportunity[];
+  scalp_symbol_statuses: ScalpSymbolStatus[];
+  scalp_scan_completed_at: string;
   scalp_funnel: ScalpFunnel | Record<string, never>;
+  scalp_rejection_reasons: RejectionBreakdown[];
+  signal_funnel: SignalFunnel | Record<string, never>;
+  rejection_reasons: RejectionBreakdown[];
+  rejection_drilldown: RejectionBreakdown[];
+  strategy_funnel: StrategyFunnelRow[];
+  strategy_eligibility_registry: StrategyEligibilityRegistryRow[];
+  qwen_call_audit: QwenCallAuditRow[];
   chart_symbol: string;
   chart_timeframes: Record<string, ChartSeries>;
   simulation_event_time: string;
@@ -379,5 +563,46 @@ export interface SystemHealth {
   version: string;
   uptime_seconds: number;
   services: ServiceHealthEntry[];
+  markets?: Record<
+    string,
+    {
+      provider: string;
+      environment?: string;
+      healthy?: boolean;
+      market_data: string;
+      pricing_stream?: string;
+      execution: string;
+      kill_switch?: boolean;
+      message?: string;
+      latest_price_age_seconds?: number | null;
+    }
+  >;
   checked_at: string;
+}
+
+export interface LocalServiceEntry {
+  name: string;
+  required: boolean;
+  running: boolean;
+  detail: string;
+}
+
+export interface BackgroundJobStatus {
+  enabled: boolean;
+  last_run_at: string | null;
+  hours_since_run: number | null;
+  refresh_interval_hours: number;
+  stale: boolean;
+  state: "idle" | "running" | "never_run";
+  last_run_failed: boolean;
+  intervals?: Record<string, string>;
+}
+
+export interface SystemJobsStatus {
+  local_services: LocalServiceEntry[];
+  background_jobs: {
+    signal_discovery: BackgroundJobStatus;
+    strategy_validation: BackgroundJobStatus;
+    scalp_training: BackgroundJobStatus;
+  };
 }

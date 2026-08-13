@@ -14,7 +14,8 @@ from typing import Any, Literal, cast
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 
-from src.utils.serialization import to_native
+from src.config import get_settings
+from src.core.utils.serialization import to_native
 
 from .market_regime import market_regime_node
 from .news_analyst import NewsAnalyst
@@ -34,21 +35,24 @@ def _news_analyst_node(state: dict) -> dict:
 
     try:
         analyst = NewsAnalyst()
+        market = str(state.get("market", "NSE"))
+        cycle_id = str(state.get("workflow_id", ""))
         try:
             asyncio.get_running_loop()
         except RuntimeError:
             # LangGraph can execute this synchronous node in a worker thread,
             # where there is no event loop to retrieve. Create one directly.
-            sentiment = asyncio.run(analyst.get_market_sentiment())
+            sentiment = asyncio.run(
+                analyst.get_market_sentiment(market=market, cycle_id=cycle_id)
+            )
         else:
             # A loop is already running in this thread, so run the coroutine in
             # a short-lived worker rather than attempting nested asyncio.run().
             import concurrent.futures
 
             with concurrent.futures.ThreadPoolExecutor() as pool:
-                sentiment = pool.submit(asyncio.run, analyst.get_market_sentiment()).result(
-                    timeout=30
-                )
+                coroutine = analyst.get_market_sentiment(market=market, cycle_id=cycle_id)
+                sentiment = pool.submit(asyncio.run, coroutine).result(timeout=30)
 
         # Canonical contract: news_sentiment is a dict ({"avg_sentiment": float}),
         # consumed by the sentiment, regime, and validation agents. Returning a
@@ -78,12 +82,25 @@ def support_agents_node(state: TradingState) -> TradingState:
     logger.info("Running support agents (news, sentiment, prediction)...")
 
     merged_state = dict(state)
+    ml_enabled = get_settings().ml_predictions_enabled
 
-    agents = [
-        ("news_analyst", _news_analyst_node),
-        ("sentiment", sentiment_analysis_node),
-        ("prediction", prediction_node),
-    ]
+    shared_context = state.get("shared_market_context") or {}
+    if shared_context:
+        merged_state.update(
+            {
+                "news_sentiment": dict(shared_context.get("news_sentiment", {})),
+                "news_headlines": list(shared_context.get("news_headlines", [])),
+                "market_mood": dict(shared_context.get("market_mood", {})),
+            }
+        )
+        agents = [("prediction", prediction_node)] if ml_enabled else []
+    else:
+        agents = [
+            ("news_analyst", _news_analyst_node),
+            ("sentiment", sentiment_analysis_node),
+        ]
+        if ml_enabled:
+            agents.append(("prediction", prediction_node))
 
     for name, node_fn in agents:
         try:
@@ -228,6 +245,8 @@ async def run_trading_cycle(
     precomputed_predictions: dict[str, dict[str, Any]] | None = None,
     data_namespace: str = "paper_market_data",
     trade_horizon: str = "SWING",
+    execution_mode: str = "market_paper",
+    shared_market_context: dict[str, Any] | None = None,
 ) -> TradingState:
     """
     Run a complete trading cycle through the agent graph.
@@ -250,11 +269,11 @@ async def run_trading_cycle(
             historical performance/lesson data query the caller's actual namespace
             instead of always defaulting to paper_market_data (see H-9).
         trade_horizon: "SWING" (default, matches every pre-existing caller) or
-            "SCALP" -- threaded into TradingState so strategy_selection's H-8 gate
-            and risk_compliance's admission check/position sizing use the matching
-            registry grain and limits (see src/backtesting/strategy_registry.py).
+            "SCALP" -- threaded into TradingState for horizon-specific risk limits and
+            model inference semantics. Strategy eligibility remains keyed only by
+            strategy, timeframe, and model version.
             One invocation handles one horizon's signals; a cycle that runs both
-            calls this twice (see scripts/run_live_trading.py).
+            calls this twice (see src/markets/nse/runtime/live.py).
 
     Returns:
         Final trading state with decisions
@@ -263,18 +282,105 @@ async def run_trading_cycle(
     # Create initial state with inputs. Coerce every input to native Python types: quotes,
     # indicators and P&L-derived stats can carry numpy scalars, which crash the msgpack
     # checkpoint boundary (see to_native / #18).
-    state = create_initial_state(data_namespace=data_namespace, trade_horizon=trade_horizon)
+    from src.markets.nse.execution.runtime_mode import (
+        RuntimeExecutionMode,
+        assert_namespace_matches_mode,
+    )
+
+    runtime_mode = RuntimeExecutionMode.parse(execution_mode)
+    assert_namespace_matches_mode(runtime_mode, data_namespace)
+    signal_payloads = [s.to_dict() if hasattr(s, "to_dict") else dict(s) for s in signals]
+    for signal in signal_payloads:
+        declared_mode = signal.get("execution_mode")
+        if declared_mode is not None and str(declared_mode) != runtime_mode.value:
+            raise ValueError(
+                f"Signal execution mode {declared_mode!r} cannot enter a "
+                f"{runtime_mode.value!r} graph cycle"
+            )
+        signal["execution_mode"] = runtime_mode.value
+
+    state = create_initial_state(
+        data_namespace=data_namespace,
+        trade_horizon=trade_horizon,
+        execution_mode=runtime_mode.value,
+    )
     state["market_data"] = to_native(market_data)
     state["indicators"] = to_native(indicators)
-    state["signals"] = to_native(
-        [s.to_dict() if hasattr(s, "to_dict") else s for s in signals]
-    )
+    state["signals"] = to_native(signal_payloads)
     state["memory_lessons"] = to_native(memory_lessons or [])
     state["portfolio"] = to_native(portfolio or {"capital": 1000000, "positions": []})
     state["daily_stats"] = to_native(
         daily_stats or {"trades_count": 0, "profit_loss": 0, "max_drawdown": 0}
     )
     state["precomputed_predictions"] = to_native(precomputed_predictions or {})
+    state["shared_market_context"] = to_native(shared_market_context or {})
+    if shared_market_context:
+        state["errors"] = [str(error) for error in shared_market_context.get("errors", [])]
+
+    settings = get_settings()
+    pre_llm_rejected: list[dict[str, Any]] = []
+    if settings.llm_cost_optimization_enabled and shared_market_context:
+        state["regime"] = str(shared_market_context.get("regime", "unknown"))
+        state["regime_confidence"] = float(
+            shared_market_context.get("regime_confidence", 0.0) or 0.0
+        )
+        state["regime_reasoning"] = str(shared_market_context.get("regime_reasoning", ""))
+
+        if shared_market_context.get("errors"):
+            state["risk_rejected"] = [
+                {
+                    **dict(signal),
+                    "risk_result": {
+                        "approved": False,
+                        "stage": "pre_qwen",
+                        "failures": [
+                            {
+                                "passed": False,
+                                "rule": "shared_market_context",
+                                "message": "Shared market context degraded; fail-closed entry block",
+                                "severity": "block",
+                            }
+                        ],
+                    },
+                }
+                for signal in state["signals"]
+            ]
+            state["llm_optimization_metrics"] = {
+                "raw_candidates": len(signals),
+                "pre_llm_risk_pass": 0,
+                "qwen_candidates": 0,
+                "qwen_calls": 0,
+                "deterministic_rejection_count": len(signals),
+                "rejection_counts": {"shared_market_context": len(signals)},
+            }
+            return state
+
+        from .pre_llm import filter_pre_llm_candidates
+
+        gate = filter_pre_llm_candidates(state)
+        pre_llm_rejected = gate.rejected
+        state["signals"] = gate.passed
+        state["pre_llm_rejected"] = pre_llm_rejected
+        state["llm_optimization_metrics"] = {
+            "raw_candidates": len(signals),
+            "consolidated_candidates": len(signals),
+            **gate.stage_counts,
+            "qwen_candidates": len(gate.passed),
+            "qwen_calls": 0,
+            "qwen_cache_hits": 0,
+            "qwen_cache_misses": 0,
+            "qwen_approved": 0,
+            "deterministic_rejection_count": len(gate.rejected),
+            "rejection_counts": gate.rejection_counts,
+        }
+        if not gate.passed:
+            state["risk_rejected"] = pre_llm_rejected
+            logger.info(
+                "Pre-Qwen gate rejected all %d %s candidates; graph skipped",
+                len(signals),
+                trade_horizon,
+            )
+            return state
 
     # Configure optional Langfuse tracing for this graph invocation.
     from src.observability.tracing import get_langfuse_callback
@@ -287,6 +393,14 @@ async def run_trading_cycle(
             "workflow_type": "trading_cycle",
             "signals_count": len(signals),
             "trade_horizon": trade_horizon,
+            "market_context_version": str((shared_market_context or {}).get("context_version", "")),
+            "symbols": sorted(
+                {
+                    str(signal.get("symbol", ""))
+                    for signal in state.get("signals", [])
+                    if isinstance(signal, dict) and signal.get("symbol")
+                }
+            ),
         },
     }
     langfuse_callback = get_langfuse_callback()
@@ -296,7 +410,17 @@ async def run_trading_cycle(
     # Run the graph
     logger.info(f"Starting trading cycle with {len(signals)} signals")
 
+    initial_metrics = dict(state.get("llm_optimization_metrics", {}))
     final_state = await graph.ainvoke(state, config=config)
+    final_metrics = dict(final_state.get("llm_optimization_metrics", {}))
+    final_state["llm_optimization_metrics"] = {**initial_metrics, **final_metrics}
+
+    if pre_llm_rejected:
+        final_state["pre_llm_rejected"] = pre_llm_rejected
+        final_state["risk_rejected"] = [
+            *pre_llm_rejected,
+            *final_state.get("risk_rejected", []),
+        ]
 
     # Log results
     approved = len(final_state.get("approved_trades", []))

@@ -9,11 +9,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from src.execution.adapter import OrderRequest, OrderResult, OrderSide, OrderStatus
-from src.execution.costs import CostModel
-from src.execution.live_executor import LiveBrokerExecutor, reconcile_positions
-from src.execution.paper_engine import LocalPaperEngine
-from src.execution.service import ExecutionMode, ExecutionService, IdempotencyStore
+from src.markets.nse.broker.dhan.execution import OrderRequest, OrderResult, OrderSide, OrderStatus
+from src.markets.nse.execution.live_executor import LiveBrokerExecutor, reconcile_positions
+from src.markets.nse.execution.paper_engine import LocalPaperEngine
+from src.markets.nse.execution.service import ExecutionMode, ExecutionService, IdempotencyStore
+from src.markets.nse.risk.costs import CostModel
 
 
 def _req():
@@ -144,7 +144,7 @@ def _live_service(engine, tmp_path, broker_executor):
     # full C-2 conjunction (see resolve_effective_execution_mode) -- without it, this
     # legitimately-configured live path would now (correctly) resolve to SHADOW.
     fake_settings = MagicMock(dhan_client_id="id", dhan_access_token="tok", trading_mode="live")
-    with patch("src.execution.service.get_settings", return_value=fake_settings):
+    with patch("src.markets.nse.execution.service.get_settings", return_value=fake_settings):
         return ExecutionService(
             engine=engine,
             mode=ExecutionMode.LIVE,

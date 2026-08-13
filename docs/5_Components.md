@@ -26,7 +26,7 @@
 | `price_geometry.py` | Shared EMA/session-VWAP/ATR%/wick-ratio/zigzag-pivot helpers used by the scalp entry-quality evaluator, kept separate from `candidate_policy.py` so the swing evaluation path is never touched. |
 | `signal_consolidation.py` | **Scalp.** Merges multiple strategies agreeing on the same symbol+timeframe+direction into one confidence-boosted `ConsolidatedSignal`, gated by `ENABLE_SIGNAL_CONSOLIDATION`. |
 | `assessment_matrix.py` | **Scalp.** Builds one BUY/WAIT/REJECT `TimeframeAssessment` per symbol/timeframe, using that timeframe's own locally-inferred regime (not one label collapsed across the cycle). |
-| `regime_compatibility.py` | **Scalp.** Deterministic strategy/regime compatibility table + pre-LLM cost filter — never a substitute for the H-8 admission gate. |
+| `regime_compatibility.py` | **Scalp.** Advisory compatibility helper; authoritative runtime regime policy is owned by `StrategyEligibilityRegistry`. |
 | `entry_quality.py` | **Scalp.** `EntryQualityEvaluator` — deterministic VWAP/EMA9/ATR-extension/swing-support-resistance/breakout-retest/volume/wick checks; returns ENTER_NOW/WAIT_PULLBACK/WAIT_BREAKOUT/REJECT plus a preferred entry range. |
 | `scalp_confirmation.py` | **Scalp.** Multi-timeframe confirmation across the 5m=execution/15m=primary/30m=directional/1h=context/4h=optional-macro roles. |
 | `scalp_opportunity.py` | **Scalp.** `ScalpOpportunity` — the canonical domain object carried scanner → ranker → agents → UI → execution. |
@@ -44,7 +44,7 @@ path. See [System Design Decisions](4_System_Design.md) for how it's isolated.
 | `operators.py` | The allowlisted OHLCV operator catalogue and `FormulaCompiler` — parses formulas as a restricted AST (never `exec`/`eval`) and evaluates them with a hand-written tree-walking interpreter. |
 | `evaluator.py` | `RankICEvaluator`: cross-sectional Spearman Rank-IC of a factor against forward returns, with a t-test p-value. |
 | `models.py` | Shared dataclasses (proposed signal, evaluation result, acceptance record). |
-| `store.py` | Atomic on-disk persistence (`data/discovered_signals/<timeframe>/`); re-validates formulas and thresholds again at load time, not just at save time. |
+| `store.py` | Atomic on-disk persistence (`data/nse/discovered_signals/<timeframe>/`); re-validates formulas and thresholds again at load time, not just at save time. |
 | `live.py` | `DiscoveredSignalScorer`: re-evaluates accepted formulas against the live cross-sectional Dhan panel and produces a bounded per-symbol probability tilt. |
 | `scheduler.py` | `AutomaticDiscoveryScheduler`: optional 24h-default background research loop, decoupled from the trading-cycle timer. |
 
@@ -97,8 +97,9 @@ path. See [System Design Decisions](4_System_Design.md) for how it's isolated.
 
 | Path | Use |
 | --- | --- |
-| `scripts/setup.py` | Guided one-command setup: creates `.env`, checks required keys, prints a readiness checklist. Run this first. |
-| `scripts/run_live_trading.py` | Main real-data local-paper workflow. |
+| `scripts/setup.py` | Guided setup for isolated common/NSE profiles. Run this first. |
+| `src/markets/nse/runtime/live.py` | Canonical NSE real-data local-paper workflow. |
+| `scripts/run_live_trading.py` | Thin compatibility launcher for the canonical NSE worker. |
 | `scripts/check_config.py` | Configuration inspection. |
 | `scripts/test_dhan_connection.py` | Dhan connectivity validation. |
 | `scripts/diagnose_risk.py` | Risk diagnostics. |
@@ -112,4 +113,4 @@ path. See [System Design Decisions](4_System_Design.md) for how it's isolated.
 
 PostgreSQL stores agent memory, daily risk state, trade journal data, signal
 history, and paper engine state. Historical Dhan OHLCV cache files live under
-`data/history_cache/`.
+`data/nse/history_cache/`.

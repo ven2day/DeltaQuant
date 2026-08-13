@@ -22,17 +22,46 @@ wire NSE Bhavcopy or a vendor dataset. The verdict here is necessary but NOT suf
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
 import pandas as pd
+from scipy.stats import t as student_t
 
 from src.backtesting.engine import BacktestEngine, Strategy, Trade
 
 # Minimum OOS trades before a verdict is statistically meaningful.
 MIN_OOS_TRADES = 30
+
+# Nominal significance level for "is mean OOS PnL actually different from
+# zero" (one-sample t-test), before Bonferroni correction. Same threshold
+# and same multiple-comparisons logic src/signal_discovery/workflow.py
+# already uses for Rank-IC acceptance -- a validation run tests many
+# strategy/timeframe combinations against the same universe in pursuit of a
+# handful of approvals, which is exactly the multiple-comparisons setup that
+# makes an uncorrected p<0.05 bar too easy to clear by chance alone.
+DEFAULT_P_VALUE_THRESHOLD = 0.05
+
+
+def _pnl_significance_p_value(pnls: list[float]) -> float | None:
+    """Two-tailed p-value for H0: mean(pnls) == 0 (one-sample t-test).
+
+    None (not "trivially significant") when there's too little data to test --
+    the caller must treat that as "cannot yet reject the null", not as a pass.
+    """
+    if len(pnls) < 2:
+        return None
+    arr = np.asarray(pnls, dtype=float)
+    mean = float(arr.mean())
+    std = float(arr.std(ddof=1))
+    if std == 0.0:
+        return None
+    standard_error = std / math.sqrt(len(arr))
+    t_stat = mean / standard_error
+    return float(2 * student_t.sf(abs(t_stat), df=len(arr) - 1))
 
 
 @dataclass
@@ -58,6 +87,7 @@ class WalkForwardReport:
     oos_max_drawdown_pct: float
     fold_consistency: float  # fraction of folds with positive return
     folds: list[FoldResult] = field(default_factory=list)
+    oos_pnls: list[float] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -203,6 +233,7 @@ def run_walk_forward(
         oos_max_drawdown_pct=agg["max_drawdown_pct"],
         fold_consistency=consistency,
         folds=fold_results,
+        oos_pnls=all_pnls,
     )
 
 
@@ -231,12 +262,27 @@ def edge_verdict(
     oos_expectancy: float,
     oos_return_pct: float,
     fold_consistency: float,
+    *,
+    p_value: float | None = None,
+    num_tests: int = 1,
+    require_significance: bool = False,
+    p_value_threshold: float = DEFAULT_P_VALUE_THRESHOLD,
 ) -> dict[str, Any]:
     """
     Blunt go/no-go on whether there is a deployable OOS edge.
 
     VALIDATED requires: enough OOS trades, positive net expectancy AND return, and the edge
     showing up in a majority of folds (not one lucky window). Anything else is NOT VALIDATED.
+
+    ``require_significance=True`` (opt-in -- default False preserves every existing caller's
+    behavior unchanged) additionally requires statistical significance at a
+    Bonferroni-corrected threshold: ``num_tests`` must be the actual number of
+    strategy/timeframe combinations evaluated in the same validation run (same pattern as
+    src/signal_discovery/workflow.py's ``_corrected_p_threshold``) -- a batch validating N
+    candidates in pursuit of a handful of approvals is exactly the multiple-comparisons setup
+    where an uncorrected p<0.05 bar is cleared by chance far more often than 5% of the time.
+    With significance required, ``p_value=None`` (too few trades to test, e.g. < 2) is treated
+    as "not yet proven significant", not as a pass -- silence is not evidence of an edge.
     """
     reasons: list[str] = []
     if oos_trades < MIN_OOS_TRADES:
@@ -249,16 +295,42 @@ def edge_verdict(
         reasons.append(
             f"edge in only {fold_consistency:.0%} of folds (<= 50% — likely regime-specific/luck)"
         )
+    corrected_threshold = p_value_threshold / max(1, num_tests)
+    if require_significance:
+        if p_value is None:
+            reasons.append("too few OOS trades to test statistical significance")
+        elif p_value > corrected_threshold:
+            reasons.append(
+                f"not statistically significant: p={p_value:.4f} > "
+                f"{corrected_threshold:.4f} (Bonferroni-corrected for {num_tests} tests this run)"
+            )
     validated = not reasons
-    return {
+    result: dict[str, Any] = {
         "verdict": "VALIDATED" if validated else "NOT VALIDATED",
         "validated": validated,
         "reasons": reasons or ["positive net-of-cost edge, consistent across folds"],
     }
+    if require_significance:
+        result["p_value"] = p_value
+        result["bonferroni_corrected_p_threshold"] = corrected_threshold
+        result["num_tests"] = num_tests
+    return result
 
 
-def aggregate_reports(reports: list[WalkForwardReport]) -> dict[str, Any]:
-    """Combine per-symbol OOS reports into a universe-level verdict."""
+def aggregate_reports(
+    reports: list[WalkForwardReport],
+    *,
+    num_tests: int = 1,
+    require_significance: bool = False,
+) -> dict[str, Any]:
+    """Combine per-symbol OOS reports into a universe-level verdict.
+
+    ``num_tests``/``require_significance`` are forwarded to ``edge_verdict`` --
+    see there for the Bonferroni-correction rationale. Default
+    ``require_significance=False`` preserves every existing caller's behavior
+    unchanged; callers running a multi-strategy validation batch should pass
+    the real strategy count and opt in.
+    """
     total_trades = sum(r.oos_trades for r in reports)
     total_pnl_pct = sum(r.oos_return_pct for r in reports)
     # Trade-weighted expectancy across symbols.
@@ -269,10 +341,38 @@ def aggregate_reports(reports: list[WalkForwardReport]) -> dict[str, Any]:
     )
     consistencies = [r.fold_consistency for r in reports if r.oos_trades > 0]
     avg_consistency = sum(consistencies) / len(consistencies) if consistencies else 0.0
+    weighted_win_rate = (
+        sum(r.oos_win_rate * r.oos_trades for r in reports) / total_trades
+        if total_trades
+        else 0.0
+    )
+    finite_profit_factors = [
+        (r.oos_profit_factor, r.oos_trades)
+        for r in reports
+        if r.oos_trades > 0 and math.isfinite(r.oos_profit_factor)
+    ]
+    finite_profit_factor_trades = sum(trades for _factor, trades in finite_profit_factors)
+    weighted_profit_factor = (
+        sum(factor * trades for factor, trades in finite_profit_factors)
+        / finite_profit_factor_trades
+        if finite_profit_factor_trades
+        else None
+    )
+    max_oos_drawdown = max((r.oos_max_drawdown_pct for r in reports), default=0.0)
     symbols_positive = sum(1 for r in reports if r.oos_return_pct > 0 and r.oos_trades > 0)
     evaluated = sum(1 for r in reports if r.oos_trades > 0)
 
-    verdict = edge_verdict(total_trades, weighted_exp, total_pnl_pct, avg_consistency)
+    pooled_pnls = [pnl for r in reports for pnl in r.oos_pnls]
+    p_value = _pnl_significance_p_value(pooled_pnls)
+    verdict = edge_verdict(
+        total_trades,
+        weighted_exp,
+        total_pnl_pct,
+        avg_consistency,
+        p_value=p_value,
+        num_tests=num_tests,
+        require_significance=require_significance,
+    )
     return {
         "symbols": len(reports),
         "symbols_evaluated": evaluated,
@@ -281,5 +381,10 @@ def aggregate_reports(reports: list[WalkForwardReport]) -> dict[str, Any]:
         "weighted_oos_expectancy": round(weighted_exp, 4),
         "summed_oos_return_pct": round(total_pnl_pct, 3),
         "avg_fold_consistency": round(avg_consistency, 3),
+        "weighted_oos_win_rate": round(weighted_win_rate, 3),
+        "weighted_oos_profit_factor": (
+            round(weighted_profit_factor, 3) if weighted_profit_factor is not None else None
+        ),
+        "max_oos_drawdown_pct": round(max_oos_drawdown, 3),
         **verdict,
     }

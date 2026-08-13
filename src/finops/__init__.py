@@ -1,6 +1,7 @@
 """FinOps layer: LLM cost/token accounting, budgets, and operational alerts."""
 
 from src.finops.alerts import AlertManager, get_alert_manager, reset_alert_manager
+from src.finops.attribution import LLMCallReason, LLMMarket
 from src.finops.cost_tracker import (
     CostTracker,
     UsageRecord,
@@ -12,6 +13,8 @@ from src.finops.cost_tracker import (
 __all__ = [
     "AlertManager",
     "CostTracker",
+    "LLMCallReason",
+    "LLMMarket",
     "UsageRecord",
     "get_alert_manager",
     "get_cost_tracker",

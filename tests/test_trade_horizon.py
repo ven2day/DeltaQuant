@@ -1,17 +1,17 @@
 """
-Tests for the TradeHorizon domain type (src/market/signals.py) and its Stage-1
+Tests for the TradeHorizon domain type (src/core/candidates/signals.py) and its Stage-1
 scaffolding: every pre-existing call site must keep behaving exactly as before now
 that a trade_horizon field/setting exists, since scalp support is additive-only.
 """
 
-from src.market.indicators import Timeframe
-from src.market.signals import (
+from src.core.candidates import (
     SignalStrength,
     SignalType,
     StrategyType,
     TradeHorizon,
     TradingSignal,
 )
+from src.core.indicators import Timeframe
 
 
 def _signal(**overrides) -> TradingSignal:

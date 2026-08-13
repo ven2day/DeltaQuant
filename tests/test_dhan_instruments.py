@@ -1,9 +1,9 @@
-"""Tests for src/market/dhan_instruments.py — DhanHQ instrument-master resolution."""
+"""Tests for src/markets/nse/broker/dhan/instruments.py — DhanHQ instrument-master resolution."""
 
 from unittest.mock import MagicMock, patch
 
-import src.market.dhan_instruments as dhan_instruments
-from src.market.dhan_instruments import FALLBACK_SECURITY_IDS, fetch_security_id_map
+import src.markets.nse.broker.dhan.instruments as dhan_instruments
+from src.markets.nse.broker.dhan.instruments import FALLBACK_SECURITY_IDS, fetch_security_id_map
 
 _SAMPLE_CSV = (
     "SEM_EXM_EXCH_ID,SEM_SEGMENT,SEM_SMST_SECURITY_ID,SEM_INSTRUMENT_NAME,SEM_EXPIRY_CODE,"
@@ -37,7 +37,7 @@ def _mock_response(text: str):
 def test_fetch_security_id_map_filters_to_nse_cash_equities():
     _reset_cache()
     with patch(
-        "src.market.dhan_instruments.requests.get", return_value=_mock_response(_SAMPLE_CSV)
+        "src.markets.nse.broker.dhan.instruments.requests.get", return_value=_mock_response(_SAMPLE_CSV)
     ):
         result = fetch_security_id_map()
 
@@ -47,7 +47,7 @@ def test_fetch_security_id_map_filters_to_nse_cash_equities():
 def test_fetch_security_id_map_filters_to_requested_symbols():
     _reset_cache()
     with patch(
-        "src.market.dhan_instruments.requests.get", return_value=_mock_response(_SAMPLE_CSV)
+        "src.markets.nse.broker.dhan.instruments.requests.get", return_value=_mock_response(_SAMPLE_CSV)
     ):
         result = fetch_security_id_map(["RELIANCE", "NOTPRESENT"])
 
@@ -57,7 +57,7 @@ def test_fetch_security_id_map_filters_to_requested_symbols():
 def test_fetch_security_id_map_caches_across_calls():
     _reset_cache()
     with patch(
-        "src.market.dhan_instruments.requests.get", return_value=_mock_response(_SAMPLE_CSV)
+        "src.markets.nse.broker.dhan.instruments.requests.get", return_value=_mock_response(_SAMPLE_CSV)
     ) as mock_get:
         fetch_security_id_map()
         fetch_security_id_map()
@@ -67,7 +67,7 @@ def test_fetch_security_id_map_caches_across_calls():
 
 def test_fetch_security_id_map_falls_back_on_network_failure():
     _reset_cache()
-    with patch("src.market.dhan_instruments.requests.get", side_effect=Exception("no network")):
+    with patch("src.markets.nse.broker.dhan.instruments.requests.get", side_effect=Exception("no network")):
         result = fetch_security_id_map(["RELIANCE"])
 
     assert result == {"RELIANCE": FALLBACK_SECURITY_IDS["RELIANCE"]}
@@ -76,7 +76,7 @@ def test_fetch_security_id_map_falls_back_on_network_failure():
 def test_fetch_security_id_map_falls_back_on_empty_result():
     _reset_cache()
     empty_csv = "SEM_EXM_EXCH_ID,SEM_SEGMENT\nBSE,C\n"
-    with patch("src.market.dhan_instruments.requests.get", return_value=_mock_response(empty_csv)):
+    with patch("src.markets.nse.broker.dhan.instruments.requests.get", return_value=_mock_response(empty_csv)):
         result = fetch_security_id_map(["RELIANCE"])
 
     assert result == {"RELIANCE": FALLBACK_SECURITY_IDS["RELIANCE"]}

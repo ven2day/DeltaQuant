@@ -10,12 +10,13 @@ from src.backtesting.engine import BacktestEngine, Strategy
 from src.backtesting.walk_forward import (
     MIN_OOS_TRADES,
     _metrics_from_pnls,
+    _pnl_significance_p_value,
     aggregate_reports,
     edge_verdict,
     generate_test_folds,
     run_walk_forward,
 )
-from src.execution.costs import CostModel
+from src.markets.nse.risk.costs import CostModel
 
 
 def _uptrend(n=240):
@@ -169,6 +170,90 @@ def test_edge_verdict_rejects_exactly_half_consistency():
     v = edge_verdict(oos_trades=100, oos_expectancy=1.0, oos_return_pct=5.0, fold_consistency=0.5)
     assert v["validated"] is False
     assert any("folds" in r for r in v["reasons"])
+
+
+def test_edge_verdict_ignores_p_value_when_significance_not_required():
+    # require_significance defaults to False -- every pre-existing caller that never
+    # passes a p_value must keep behaving exactly as before this feature was added.
+    v = edge_verdict(
+        oos_trades=100, oos_expectancy=1.5, oos_return_pct=8.0, fold_consistency=0.7,
+        p_value=0.99,  # would fail any significance bar, but the check isn't requested
+    )
+    assert v["validated"] is True
+    assert "p_value" not in v
+
+
+def test_edge_verdict_requires_significance_when_opted_in():
+    v = edge_verdict(
+        oos_trades=100, oos_expectancy=1.5, oos_return_pct=8.0, fold_consistency=0.7,
+        p_value=0.2, num_tests=1, require_significance=True,
+    )
+    assert v["validated"] is False
+    assert any("not statistically significant" in r for r in v["reasons"])
+    assert v["p_value"] == 0.2
+
+
+def test_edge_verdict_missing_p_value_rejected_when_significance_required():
+    # p_value=None (too few trades to test) must NOT be treated as a pass -- an
+    # untested strategy is not the same thing as a proven one.
+    v = edge_verdict(
+        oos_trades=100, oos_expectancy=1.5, oos_return_pct=8.0, fold_consistency=0.7,
+        p_value=None, require_significance=True,
+    )
+    assert v["validated"] is False
+    assert any("too few OOS trades to test" in r for r in v["reasons"])
+
+
+def test_edge_verdict_bonferroni_threshold_tightens_with_more_tests():
+    # p=0.03 clears the nominal 0.05 bar alone, but not once divided across 10 tests.
+    solo = edge_verdict(
+        oos_trades=100, oos_expectancy=1.5, oos_return_pct=8.0, fold_consistency=0.7,
+        p_value=0.03, num_tests=1, require_significance=True,
+    )
+    batched = edge_verdict(
+        oos_trades=100, oos_expectancy=1.5, oos_return_pct=8.0, fold_consistency=0.7,
+        p_value=0.03, num_tests=10, require_significance=True,
+    )
+    assert solo["validated"] is True
+    assert batched["validated"] is False
+    assert batched["bonferroni_corrected_p_threshold"] < solo["bonferroni_corrected_p_threshold"]
+
+
+def test_pnl_significance_p_value_too_few_points_returns_none():
+    assert _pnl_significance_p_value([]) is None
+    assert _pnl_significance_p_value([5.0]) is None
+
+
+def test_pnl_significance_p_value_zero_variance_returns_none():
+    assert _pnl_significance_p_value([10.0, 10.0, 10.0]) is None
+
+
+def test_pnl_significance_p_value_detects_clear_positive_edge():
+    # A large, consistently positive sample should be very significant (small p).
+    pnls = [100.0 + i % 5 for i in range(200)]
+    p = _pnl_significance_p_value(pnls)
+    assert p is not None
+    assert p < 0.001
+
+
+def test_pnl_significance_p_value_high_for_noise_around_zero():
+    rng = np.random.default_rng(42)
+    pnls = list(rng.normal(loc=0.0, scale=10.0, size=30))
+    p = _pnl_significance_p_value(pnls)
+    assert p is not None
+    assert p > 0.05
+
+
+def test_aggregate_reports_forwards_significance_settings():
+    data = _uptrend(240)
+    r1 = run_walk_forward(data, _PingPong, symbol="A", cost_model=CostModel.zero())
+    r2 = run_walk_forward(data, _PingPong, symbol="B", cost_model=CostModel.zero())
+    agg = aggregate_reports([r1, r2], num_tests=5, require_significance=True)
+    assert agg["num_tests"] == 5
+    assert agg["bonferroni_corrected_p_threshold"] == 0.05 / 5
+    # Backward-compatible default: no significance fields leak in when not requested.
+    agg_default = aggregate_reports([r1, r2])
+    assert "p_value" not in agg_default
 
 
 def test_aggregate_reports():

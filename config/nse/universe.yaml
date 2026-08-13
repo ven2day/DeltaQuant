@@ -1,0 +1,5 @@
+schema_version: 1
+market: NSE
+provider: DHAN
+source: config/nse/symbols.csv
+dynamic_discovery: true

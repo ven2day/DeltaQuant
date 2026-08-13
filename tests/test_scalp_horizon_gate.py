@@ -1,154 +1,67 @@
-"""
-Stage 11 acceptance tests: the H-8 admission gate and signal_validation/
-risk_compliance thresholds are horizon-aware, and specifically verify the two named
-risk scenarios from the scalping-feature requirements never happen:
-
-1. H-8 must never be bypassed for scalp -- a SWING-validated artifact (or no
-   artifact at all) must not admit a SCALP-tagged signal, regardless of how strong
-   its entry quality/ranking evidence is.
-2. signal_validation's rr_ratio/confidence fallback bar must be horizon-selectable
-   but never silently lowered for scalp -- scalp defaults ship numerically equal to
-   the swing hardcoded 1.5/0.6.
-"""
+"""SCALP keeps horizon-specific risk thresholds without horizon-specific eligibility."""
 
 from unittest.mock import patch
 
-from src.agents.risk_compliance import RiskLimits, risk_compliance_node
+from src.agents.risk_compliance import RiskLimits
 from src.agents.signal_validation import _fallback_signal_validation
 from src.agents.state import create_initial_state
-from src.backtesting.strategy_registry import StrategyRegistry, build_strategy_version
+from src.backtesting.strategy_eligibility import (
+    EligibilityStatus,
+    StrategyEligibility,
+    StrategyEligibilityRegistry,
+)
 from src.config.settings import Settings
 
 
-def _validated_swing_artifact(tmp_path, strategy_name="momentum"):
-    """A current, VALIDATED artifact for the SWING horizon only (the default) --
-    exactly what scripts/validate_strategy.py has always produced pre-Stage-2."""
-    version = build_strategy_version(
-        strategy_name,
-        owner="test",
-        dataset_id="test-dataset",
-        oos_trades=100,
-        oos_expectancy=2.0,
-        oos_return_pct=10.0,
-        fold_consistency=0.8,
-    )
-    StrategyRegistry(tmp_path).register(version)
-
-
-def test_scalp_signal_blocked_at_h8_with_no_scalp_artifact_regardless_of_quality(tmp_path):
-    """The core acceptance test: a scalp signal with excellent entry-quality
-    evidence (high confidence, tight risk-reward) must still be rejected at H-8
-    check #14 when no SCALP-horizon registry artifact exists -- no amount of local
-    evidence can substitute for admission."""
-    _validated_swing_artifact(tmp_path, "momentum")  # SWING only, no SCALP artifact
-
-    state = create_initial_state(trade_horizon="SCALP")
-    state["regime"] = "trending_up"
-    state["validated_signals"] = [
-        {
-            "symbol": "RELIANCE",
-            "strategy": "momentum",
-            "timeframe": "5m",
-            "trade_horizon": "SCALP",
-            "confidence": 0.99,  # deliberately excellent evidence
-            "risk_reward_ratio": 5.0,
-        }
-    ]
-
-    settings_mock = type("S", (), {"strategy_registry_dir": str(tmp_path)})()
-    with (
-        patch("src.agents.risk_compliance.now_ist") as mock_now,
-        patch(
-            "src.agents.risk_compliance.RiskLimits.from_settings",
-            return_value=RiskLimits(),
-        ),
-        patch("src.agents.risk_compliance.get_settings", return_value=settings_mock),
-    ):
-        mock_now.return_value.strftime.return_value = "12:00"
-        result = risk_compliance_node(state)
-
-    assert result["approved_trades"] == []
-    failures = result["risk_rejected"][0]["risk_result"]["failures"]
-    admission_failure = next(f for f in failures if f["rule"] == "strategy_admission")
-    assert "trade_horizon 'SCALP'" in admission_failure["message"]
-
-
-def test_swing_signal_for_same_strategy_still_admitted(tmp_path):
-    """The flip side: the exact same registry state must keep admitting the SWING
-    signal it always has -- proving Stage 11 didn't collaterally break swing."""
-    _validated_swing_artifact(tmp_path, "momentum")
-
-    state = create_initial_state(trade_horizon="SWING")
-    state["regime"] = "trending_up"
-    state["validated_signals"] = [
-        {
-            "symbol": "RELIANCE",
-            "strategy": "momentum",
-            "timeframe": "1h",
-            "confidence": 0.8,
-            "risk_reward_ratio": 2.0,
-        }
-    ]
-
-    settings_mock = type("S", (), {"strategy_registry_dir": str(tmp_path)})()
-    with (
-        patch("src.agents.risk_compliance.now_ist") as mock_now,
-        patch(
-            "src.agents.risk_compliance.RiskLimits.from_settings",
-            return_value=RiskLimits(),
-        ),
-        patch("src.agents.risk_compliance.get_settings", return_value=settings_mock),
-    ):
-        mock_now.return_value.strftime.return_value = "12:00"
-        result = risk_compliance_node(state)
-
-    assert len(result["approved_trades"]) == 1
-    assert result["risk_rejected"] == []
-
-
-def test_scalp_admitted_once_a_matching_scalp_artifact_exists(tmp_path):
-    """Confirms the gate isn't just permanently closed for SCALP -- once a genuine
-    SCALP/5m VALIDATED artifact is registered (Stage 14's operational step), a
-    matching signal clears H-8 exactly like swing always has."""
-    version = build_strategy_version(
-        "momentum",
-        owner="test",
-        dataset_id="test-dataset-5m",
-        oos_trades=100,
-        oos_expectancy=2.0,
-        oos_return_pct=10.0,
-        fold_consistency=0.8,
+def _paper_eligibility(tmp_path, strategy_name="momentum"):
+    record = StrategyEligibility(
+        strategy_name=strategy_name,
         timeframe="5m",
-        trade_horizon="SCALP",
+        model_version="model-v1",
+        validation_status=EligibilityStatus.PAPER_APPROVED,
+        validated_at="2026-08-01T00:00:00+00:00",
+        validation_window={"dataset": "test-dataset"},
+        oos_trade_count=100,
+        oos_profit_factor=1.4,
+        oos_max_drawdown=0.08,
+        oos_win_rate=0.58,
+        minimum_model_confidence=0.0,
     )
-    StrategyRegistry(tmp_path).register(version)
+    registry = StrategyEligibilityRegistry(tmp_path)
+    registry.register(record)
+    return registry
 
-    state = create_initial_state(trade_horizon="SCALP")
-    state["regime"] = "trending_up"
-    state["validated_signals"] = [
-        {
-            "symbol": "RELIANCE",
-            "strategy": "momentum",
-            "timeframe": "5m",
-            "trade_horizon": "SCALP",
-            "confidence": 0.8,
-            "risk_reward_ratio": 2.0,
-        }
-    ]
 
-    settings_mock = type("S", (), {"strategy_registry_dir": str(tmp_path)})()
-    with (
-        patch("src.agents.risk_compliance.now_ist") as mock_now,
-        patch(
-            "src.agents.risk_compliance.RiskLimits.from_settings",
-            return_value=RiskLimits(),
-        ),
-        patch("src.agents.risk_compliance.get_settings", return_value=settings_mock),
-    ):
-        mock_now.return_value.strftime.return_value = "12:00"
-        result = risk_compliance_node(state)
+def test_same_strategy_timeframe_model_eligibility_serves_scalp_and_swing(tmp_path):
+    registry = _paper_eligibility(tmp_path)
+    for horizon in ("SCALP", "SWING"):
+        decision = registry.evaluate(
+            strategy_name="momentum",
+            timeframe="5m",
+            model_version="model-v1",
+            environment="PAPER",
+            current_regime="trending_up",
+            confidence=0.8,
+        )
+        assert decision.execution_allowed, horizon
 
-    assert len(result["approved_trades"]) == 1
+
+def test_missing_strategy_eligibility_still_fails_closed_in_paper(tmp_path):
+    # Explicit gate-enabled settings, independent of whatever the real environment's
+    # STRATEGY_ELIGIBILITY_PAPER_GATE_ENABLED happens to be set to right now -- this
+    # test is specifically about the fail-closed default, not the toggle.
+    settings = _real_settings(strategy_eligibility_paper_gate_enabled=True)
+    with patch("src.backtesting.strategy_eligibility.get_settings", return_value=settings):
+        decision = StrategyEligibilityRegistry(tmp_path).evaluate(
+            strategy_name="momentum",
+            timeframe="5m",
+            model_version="model-v1",
+            environment="PAPER",
+            current_regime="trending_up",
+            confidence=0.99,
+        )
+    assert not decision.pipeline_allowed
+    assert decision.reason_code == "ELIGIBILITY_REGISTRY_MISSING"
 
 
 # ---------------------------------------------------------------------------

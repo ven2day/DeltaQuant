@@ -154,7 +154,9 @@ class _FakeLLM:
 
 @pytest.mark.asyncio
 async def test_workflow_accepts_and_persists_signal(tmp_path, monkeypatch):
-    monkeypatch.setattr("src.signal_discovery.workflow.record_llm_response", lambda *args: None)
+    monkeypatch.setattr(
+        "src.signal_discovery.workflow.record_llm_response", lambda *args, **kwargs: None
+    )
     monkeypatch.setattr(
         "src.signal_discovery.workflow.get_cost_tracker",
         lambda: type("Tracker", (), {"is_over_hard_budget": lambda self: False})(),

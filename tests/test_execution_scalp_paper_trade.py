@@ -2,7 +2,7 @@
 Stage 12 tests: execution/journal/exit-manager threading for the scalp horizon.
 
 Full end-to-end (scan -> rank -> graph -> risk -> execution) is exercised through
-`scripts/run_live_trading.py`'s live-session closure, which -- like the rest of that
+`src/markets/nse/runtime/live.py`'s live-session closure, which -- like the rest of that
 module -- isn't practically unit-testable without mocking the entire live-session
 object graph (see tests/test_scalp_scan.py's docstring for the same rationale on
 Stage 10). These tests instead verify, precisely, the actual units Stage 12 touched:
@@ -10,7 +10,7 @@ Stage 10). These tests instead verify, precisely, the actual units Stage 12 touc
 - journal.py's decision_chain now carries trade_horizon (the one real code change).
 - exit_manager.py's pre-existing `timeframe` param (already generic/display-only,
   per Stage 12's plan) correctly threads a scalp entry timeframe like "5m".
-- The idempotency-key format `scripts/run_live_trading.py`'s new scalp execution
+- The idempotency-key format `src/markets/nse/runtime/live.py`'s new scalp execution
   block builds is verified by direct construction: it always contains the literal
   "scalp" tag plus the horizon-suffixed workflow_id, so it can never collide with a
   same-cycle, same-symbol SWING entry's key, which never contains either.
@@ -32,8 +32,8 @@ with patch("src.config.get_settings") as mock_get_settings:
     mock_settings.long_only = False
     mock_get_settings.return_value = mock_settings
 
-    from src.execution.exit_manager import ExitManager
-    from src.execution.journal import TradeJournal, TradeRecord
+    from src.markets.nse.execution.exit_manager import ExitManager
+    from src.markets.nse.execution.journal import TradeJournal, TradeRecord
 
 
 @pytest.fixture
@@ -115,7 +115,7 @@ def test_exit_manager_threads_scalp_entry_timeframe():
 
 
 def test_scalp_idempotency_key_never_collides_with_swing_key_same_cycle_same_symbol():
-    """Pins the exact idempotency-key construction scripts/run_live_trading.py's
+    """Pins the exact idempotency-key construction src/markets/nse/runtime/live.py's
     scalp execution block uses (Stage 12) against the pre-existing swing format, for
     the SAME data_namespace/cycle/symbol -- proving they can never collide even
     when a swing and a scalp entry fire for the same symbol in the same cycle.

@@ -22,8 +22,8 @@ package is `src` (all internal imports are `from src.<module> import ...`).
 uv sync                         # install runtime deps
 uv sync --extra dev             # install dev deps (pytest, ruff, mypy)
 
-uv run python scripts/check_config.py       # validate .env / settings (run this first)
-uv run python scripts/run_live_trading.py   # MAIN entry point: live/sim dashboard + paper execution
+uv run python scripts/check_config.py       # validate active env profiles/settings first
+uv run deltaquant-nse                       # canonical NSE dashboard + paper runtime
 uv run python src/backtesting/engine.py     # run a backtest
 
 # pytest/ruff/mypy live in the `dev` optional group — pass --extra dev (or `uv sync --extra dev` once).
@@ -88,7 +88,7 @@ consumer, read with `isinstance`/`.get(...)` guards so a stray type never crashe
 ### Configuration
 
 All config is centralized in [src/config/settings.py](src/config/settings.py): a
-pydantic-settings `Settings` model loaded from `.env`. Access it **only** through the cached
+pydantic-settings `Settings` adapter loaded from `env/.env.common` plus one market profile. Access it **only** through the cached
 `get_settings()`; use `reload_settings()` to clear the cache. Secrets are `SecretStr` —
 read them with `.get_secret_value()`. The `@model_validator` performs cross-field checks
 (e.g. live mode requires Dhan creds, risk-param sanity) but **logs warnings rather than
@@ -99,7 +99,7 @@ Key switches: `market_data_source` (`dhan` only — YFinance was removed), `exec
 
 ### Pluggable data & execution layers
 
-- **Market data** — [src/market/manager.py](src/market/manager.py) `MarketDataManager`
+- **Market data** — [src/markets/nse/market_data/manager.py](src/markets/nse/market_data/manager.py) `MarketDataManager`
   auto-selects WebSocket (live Dhan) or simulated data based on `is_market_open()` and
   connection availability. Indicators (`ta` library) are computed in
   `indicators.py`; `signals.py` `SignalEngine` turns them into signals; `stock_discovery.py`
@@ -117,12 +117,12 @@ Key switches: `market_data_source` (`dhan` only — YFinance was removed), `exec
     `SignalEngine._directional_confidence` blends the strategy's base with how many independent
     indicators (RSI/MACD/DI/price-vs-MA) agree with the direction, not a hardcoded constant.
     The live loop sizes entries with the real `PositionSizer`
-    ([sizing.py](src/market/sizing.py)) off `risk_per_trade` + the stop distance (Kelly when a
+    ([sizing.py](src/markets/nse/risk/sizing.py)) off `risk_per_trade` + the stop distance (Kelly when a
     strategy win-rate exists), **not** a flat % of cash. Agent prompts ask for *calibrated*
     confidence and to weigh the news/mood/ML enrichment.
-- **Execution** — [src/execution/service.py](src/execution/service.py) `ExecutionService` is
+- **Execution** — [src/markets/nse/execution/service.py](src/markets/nse/execution/service.py) `ExecutionService` is
   the single mode-switched entry point the live loop uses to place orders. It wraps
-  `paper_engine.py` (and, later, the broker in [adapter.py](src/execution/adapter.py):
+  `paper_engine.py` (and, later, the broker in [adapter.py](src/markets/nse/execution/adapter.py):
   `ExecutionAdapter` for DhanHQ, imported lazily). `exit_manager.py` handles trailing stops /
   time exits / partial profits; `journal.py` logs trade history.
   - **Execution safety (do not regress):** every `submit(...)` carries an `idempotency_key`;
@@ -131,12 +131,12 @@ Key switches: `market_data_source` (`dhan` only — YFinance was removed), `exec
     live decision/sizing, simulate the fill, send nothing). A `live`/`dhan_paper` request
     **never silently downgrades**: without `allow_live_orders=True` (default-off master gate)
     or without Dhan creds it resolves to SHADOW with a loud warning. Live submission goes
-    through `submit_async` → `LiveBrokerExecutor` ([live_executor.py](src/execution/live_executor.py)),
+    through `submit_async` → `LiveBrokerExecutor` ([live_executor.py](src/markets/nse/execution/live_executor.py)),
     which submits then **polls `get_order_status` to a terminal fill** (never assumes PLACED ==
     filled); `reconcile_positions` checks local vs broker positions at startup (broker = source
     of truth). All live paths stay gated behind `allow_live_orders` (default off → shadow).
   - **Paper engine realism (do not regress):** `LocalPaperEngine` fills through a
-    [`CostModel`](src/execution/costs.py) (slippage + NSE-style brokerage/STT/GST, all
+    [`CostModel`](src/markets/nse/execution/costs.py) (slippage + NSE-style brokerage/STT/GST, all
     configurable via `paper_*` settings; pass `CostModel.zero()` for ideal fills in unit
     tests). `place_order` does proper **long/short/partial** accounting: an opposite-side
     order closes/covers (FIFO) and only the remainder opens a new position; realized P&L is
@@ -148,9 +148,9 @@ Key switches: `market_data_source` (`dhan` only — YFinance was removed), `exec
 
 ### Local signal ranking (replaces the old universe screener)
 
-`src/market/universe_screener.py` (a deterministic pullback/trend/RSI filter) was **removed —
+The former legacy universe screener (a deterministic pullback/trend/RSI filter) was **removed —
 do not resurrect it or re-add the import**. The live loop now runs `SignalEngine` on every
-symbol × every `signal_timeframes` entry unconditionally, then [signal_ranking.py](src/market/signal_ranking.py)
+symbol × every `signal_timeframes` entry unconditionally, then [signal_ranking.py](src/markets/nse/strategies/signal_ranking.py)
 `rank_signals()` blends technical confidence, `PredictionAgent` ML direction agreement,
 sample-smoothed historical win rate per strategy/regime, and `expected_r = p*RR - (1-p)` into
 a rank score; `select_diversified_signals()` then applies the sector cap and
@@ -276,7 +276,7 @@ the `rich` terminal UI. `notifications/telegram.py` sends trade alerts.
   include the `sys.path` line so it works regardless of the working directory.
 - **Graph nodes return partial state dicts**, never the full state; let LangGraph merge.
 - **Never let an LLM/agent failure propagate** — return a fallback, matching existing agents.
-- **Market-hour decisions use IST, not host-local time.** Use `src/utils/market_time.py`
+- **Market-hour decisions use IST, not host-local time.** Use `src/core/utils/market_time.py`
   (`now_ist()`, `is_market_hours()`, `IST`) — never bare `datetime.now()` — for `is_market_open()`
   and the risk engine's trading-hours check. IST is a fixed UTC+05:30 offset (NSE has no DST), so
   this stays correct on a UTC cloud host / CI runner.

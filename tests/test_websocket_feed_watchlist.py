@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 import pytest
 
-import src.market.websocket_feed as websocket_feed
+import src.markets.nse.broker.dhan.websocket as websocket_feed
 
 
 @pytest.fixture(autouse=True)
@@ -25,7 +25,7 @@ def _restore_watchlist():
 
 
 def test_refresh_watchlist_replaces_contents_on_success():
-    with patch("src.market.websocket_feed.fetch_security_id_map", return_value={"FOO": "999"}):
+    with patch("src.markets.nse.broker.dhan.websocket.fetch_security_id_map", return_value={"FOO": "999"}):
         result = websocket_feed.refresh_watchlist(["FOO"])
 
     assert result == {"FOO": "999"}
@@ -35,7 +35,7 @@ def test_refresh_watchlist_replaces_contents_on_success():
 
 def test_refresh_watchlist_is_a_noop_when_resolution_returns_empty():
     original = dict(websocket_feed.NSE_WATCHLIST)
-    with patch("src.market.websocket_feed.fetch_security_id_map", return_value={}):
+    with patch("src.markets.nse.broker.dhan.websocket.fetch_security_id_map", return_value={}):
         result = websocket_feed.refresh_watchlist(["NOTHING_RESOLVED"])
 
     # A failed/empty resolution must never wipe out an already-working watchlist.
@@ -44,11 +44,11 @@ def test_refresh_watchlist_is_a_noop_when_resolution_returns_empty():
 
 
 def test_refresh_watchlist_mutates_in_place_for_existing_imports():
-    # Simulates `from src.market.websocket_feed import NSE_WATCHLIST` used elsewhere
+    # Simulates `from src.markets.nse.broker.dhan.websocket import NSE_WATCHLIST` used elsewhere
     # (manager.py, run_live_trading.py): that binding is the SAME dict object, so it
     # must reflect the refresh without needing to be re-imported.
     aliased = websocket_feed.NSE_WATCHLIST
-    with patch("src.market.websocket_feed.fetch_security_id_map", return_value={"BAR": "42"}):
+    with patch("src.markets.nse.broker.dhan.websocket.fetch_security_id_map", return_value={"BAR": "42"}):
         websocket_feed.refresh_watchlist(["BAR"])
 
     assert aliased is websocket_feed.NSE_WATCHLIST

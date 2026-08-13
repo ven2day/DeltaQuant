@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch
 import pandas as pd
 import pytest
 
-from src.market.entry_quality import MIN_BARS_REQUIRED, evaluate_entry_quality
+from src.markets.nse.strategies.entry_quality import MIN_BARS_REQUIRED, evaluate_entry_quality
 
 
 def _settings_mock(**overrides):
@@ -36,7 +36,7 @@ def _frame(rows: list[list[float]]) -> pd.DataFrame:
 def _evaluate(rows, *, direction="BUY", stop_loss=99.5, target_price=101.0, settings=None):
     df = _frame(rows)
     with patch(
-        "src.market.entry_quality.get_settings",
+        "src.markets.nse.strategies.entry_quality.get_settings",
         return_value=settings or _settings_mock(),
     ):
         return evaluate_entry_quality("TEST", direction, df, None, stop_loss, target_price)

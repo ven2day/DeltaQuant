@@ -23,54 +23,46 @@ from src.agents.llm_factory import (
     invoke_with_fallback,
     primary_and_fallback_models,
 )
-from src.backtesting.strategy_registry import StrategyRegistry
 from src.config import get_settings
-from src.finops import record_llm_response
-from src.market.signals import StrategyType
-from src.utils.circuit_breaker import CircuitBreakerOpenError
-from src.utils.formatting import plain_english_fallback_cause
+from src.core.candidates import StrategyType
+from src.core.utils.circuit_breaker import CircuitBreakerOpenError
+from src.core.utils.formatting import plain_english_fallback_cause
+from src.finops import LLMCallReason, record_llm_response
 
 from .state import TradingState
 
 logger = logging.getLogger(__name__)
 
 # Every strategy name the LLM is allowed to select, derived from the same enum the
-# signal engine and the H-8 admission gate use -- one source of truth instead of a
+# signal engine and the eligibility registry use -- one source of truth instead of a
 # hardcoded list that could silently drift out of sync when a strategy is added.
 _VALID_STRATEGY_NAMES = [member.value for member in StrategyType]
 
 
-def _gate_active_strategies(
-    strategies: list[str], regime: str, *, trade_horizon: str = "SWING"
-) -> list[str]:
-    """Strip any strategy without a current, non-expired VALIDATED registry artifact
-    for this exact trade_horizon (H-8, DeltaQuant-Quant-Risk-Review.md).
+def _retain_eligible_candidate_strategies(state: TradingState, strategies: list[str]) -> list[str]:
+    """Retain requested strategies represented by pre-qualified candidates.
 
-    Fail closed: an unknown/unvalidated/expired/wrong-horizon strategy is silently
-    *not* removed with just a warning -- it never reaches ``active_strategies`` at
-    all, so it cannot survive downstream into a validated signal or an approved
-    trade. Every strip is still logged loudly (not swallowed) so an operator can see
-    why nothing traded. ``trade_horizon`` is matched exactly against the registry
-    artifact -- a SWING-validated artifact can never admit a SCALP request, so
-    promoting scalping never silently inherits swing's (daily-bar) validation.
+    Strategy eligibility is evaluated before this node using the exact candidate
+    timeframe and model version. Repeating a coarser lookup here would create policy
+    drift, so this node only intersects Qwen's selection with those prior decisions.
     """
-    settings = get_settings()
-    registry_dir = getattr(settings, "strategy_registry_dir", "data/strategy_registry")
-    registry = StrategyRegistry(str(registry_dir))
-    admitted, stripped = registry.filter_admitted(
-        strategies, regime=regime, trade_horizon=trade_horizon
-    )
+
+    eligible_names: set[str] = set()
+    for signal in state.get("signals", []):
+        if not isinstance(signal, dict):
+            continue
+        if signal.get("registry_decision") != "ALLOW":
+            continue
+        eligible_names.add(str(signal.get("strategy", "")))
+        eligible_names.update(str(item) for item in signal.get("supporting_strategies", []))
+    retained = [name for name in strategies if name in eligible_names]
+    stripped = [name for name in strategies if name not in eligible_names]
     if stripped:
-        logger.warning(
-            "Strategy admission gate (H-8): stripped %s from active strategies for regime "
-            "'%s' / trade_horizon '%s' -- no current VALIDATED artifact in %s. Run "
-            "`uv run python scripts/validate_strategy.py` to (re)validate.",
+        logger.info(
+            "Strategy selection retained prior eligibility decisions; skipped %s",
             stripped,
-            regime,
-            trade_horizon,
-            registry_dir,
         )
-    return admitted
+    return retained
 
 
 STRATEGY_SYSTEM_PROMPT = """You are a Strategy Selection Agent for an automated trading system.
@@ -88,10 +80,20 @@ Available strategies:
 - ema_heiken_ashi_rsi: Best in established trends; explicitly sits out sideways markets
 - ema_psar: Best in trending markets with sustained directional moves; avoid in choppy/sideways conditions
 - ema_cci: Best when a long-term (EMA200) trend has strong momentum confirmation
+- ema_adx_trend: EMA20/50 trend confirmed by ADX and directional index
+- donchian_breakout: Previous-bar Donchian breakout with relative-volume confirmation
+- time_series_momentum: Medium-horizon return momentum above ATR noise
+- trend_pullback: Completed-candle recovery near EMA20 inside an established trend
+- supertrend_adx_ema: SuperTrend confirmed independently by EMA50, ADX, and DI
+- macd_trend_continuation: MACD re-acceleration inside an EMA50 trend
+- bollinger_rsi_mean_reversion: Confirmed Bollinger re-entry in low-ADX conditions
+- vwap_mean_reversion: Reversal from a statistically material session-VWAP deviation
+- opening_range_breakout: Completed NSE opening-range breakout with volume and VWAP
+- relative_strength_momentum: Timestamp-aligned market-relative and cross-sectional momentum
 
 Consider:
 - Avoid strategies that historically underperformed in the current regime
-- Don't be too aggressive - selecting 1-2 strategies is often better than all 4
+- Retain every prior-eligible strategy materially supported by the supplied candidate evidence
 - Weight memory lessons heavily - past mistakes should inform current decisions
 - Lean on the REAL historical win-rates provided (not assumptions); prefer strategies with a
   proven edge in this regime, and be cautious when win-rates are only prior estimates
@@ -104,6 +106,12 @@ Respond with JSON:
         "strategy_name": "why selected or rejected"
     }
 }"""
+
+COMPACT_STRATEGY_SYSTEM_PROMPT = """Select every DeltaQuant strategy materially supported by the supplied eligible candidates.
+Use only names in available_strategies. Prefer proven regime performance and heed concise
+memory warnings. Return JSON only: {"active_strategies":["name"],"reasoning":"one sentence"}.
+Strategy eligibility is enforced by Python before and after this response; never claim to
+override it."""
 
 
 def strategy_selection_node(state: TradingState) -> dict[str, Any]:
@@ -121,12 +129,53 @@ def strategy_selection_node(state: TradingState) -> dict[str, Any]:
     """
     logger.info("Running Strategy Selection Agent...")
 
+    working_state = state.copy()
+    eligibility_rejected: list[dict[str, Any]] = list(state.get("pre_llm_rejected", []))
+    metrics = state.get("llm_optimization_metrics", {})
+    already_checked = bool(metrics.get("pre_llm_risk_pass")) or (
+        bool(state.get("signals"))
+        and all(
+            isinstance(signal, dict)
+            and signal.get("registry_decision") == "ALLOW"
+            and signal.get("registry_qwen_allowed") is True
+            for signal in state.get("signals", [])
+        )
+    )
+    if not already_checked:
+        from src.agents.pre_llm import filter_pre_llm_candidates
+
+        gate = filter_pre_llm_candidates(working_state)
+        working_state["signals"] = gate.passed
+        eligibility_rejected.extend(gate.rejected)
+        working_state["pre_llm_rejected"] = eligibility_rejected
+        working_state["llm_optimization_metrics"] = {
+            **dict(metrics),
+            **gate.stage_counts,
+            "eligibility_rejection_counts": gate.rejection_counts,
+        }
+        if not gate.passed:
+            return {
+                "signals": [],
+                "active_strategies": [],
+                "strategy_reasoning": (
+                    "No candidate passed deterministic strategy eligibility and pre-Qwen risk."
+                ),
+                "pre_llm_rejected": eligibility_rejected,
+                "risk_rejected": eligibility_rejected,
+                "llm_optimization_metrics": working_state["llm_optimization_metrics"],
+            }
+
+    state = working_state
+
     settings = get_settings()
 
     if not settings.enable_llm_agents:
         return _fallback_strategy_selection(
             state, state.get("regime", "unknown"), "LLM agents disabled via settings"
         )
+
+    if getattr(settings, "llm_cost_optimization_enabled", False) is True:
+        return _optimized_strategy_selection(state)
 
     rate_limiter = get_llm_limiter()
     circuit_breaker = get_llm_circuit_breaker()
@@ -157,7 +206,9 @@ def strategy_selection_node(state: TradingState) -> dict[str, Any]:
 
         # Check circuit breaker
         if not circuit_breaker.is_available:
-            raise CircuitBreakerOpenError(f"{current_provider()}_api", circuit_breaker.recovery_time)
+            raise CircuitBreakerOpenError(
+                f"{current_provider()}_api", circuit_breaker.recovery_time
+            )
 
         # Apply rate limiting
         if settings.enable_rate_limiting:
@@ -173,21 +224,31 @@ def strategy_selection_node(state: TradingState) -> dict[str, Any]:
             messages,
             circuit_breaker=circuit_breaker,
             max_tokens=1024,
+            trade_horizon=str(state.get("trade_horizon", "SWING")),
             on_model_selected=_record_model_used,
         )
-        record_llm_response("strategy_selection", response, model=model_used)
+        record_llm_response(
+            "strategy_selection",
+            response,
+            model=model_used,
+            trade_horizon=str(state.get("trade_horizon", "SWING")),
+            purpose="candidate_strategy_context",
+            cycle_id=str(state.get("workflow_id", "")),
+            market=str(state.get("market", "NSE")),
+            call_reason=LLMCallReason.SUPPORT_AGENT,
+            component="strategy_selection",
+        )
         result = _parse_strategy_response(response.content)
 
-        trade_horizon = state.get("trade_horizon", "SWING")
-        admitted = _gate_active_strategies(
-            result["active_strategies"], regime, trade_horizon=trade_horizon
-        )
+        admitted = _retain_eligible_candidate_strategies(state, result["active_strategies"])
         logger.info(f"Selected strategies: {result['active_strategies']} -> admitted: {admitted}")
 
         return {
+            "signals": state.get("signals", []),
             "active_strategies": admitted,
             "strategy_reasoning": result["reasoning"],
             "messages": [response],
+            "pre_llm_rejected": eligibility_rejected,
         }
 
     except CircuitBreakerOpenError as e:
@@ -197,6 +258,94 @@ def strategy_selection_node(state: TradingState) -> dict[str, Any]:
     except Exception as e:
         logger.error(f"Strategy Selection Agent error: {e}")
         return _fallback_strategy_selection(state, state.get("regime", "unknown"), str(e))
+
+
+def _compact_strategy_payload(state: TradingState) -> dict[str, Any]:
+    """Build a small, deterministic strategy-selection payload."""
+    regime = str(state.get("regime", "unknown"))
+    namespace = str(state.get("data_namespace", "paper_market_data"))
+    performance: dict[str, dict[str, Any]] = {}
+    try:
+        from src.memory.performance_tracker import get_performance_tracker
+
+        tracker = get_performance_tracker(namespace)
+        for name in _VALID_STRATEGY_NAMES:
+            item = tracker.get_strategy_performance(name, regime)
+            performance[name] = {
+                "win_rate": round(float(item.win_rate), 3),
+                "trades": int(item.total_trades),
+            }
+    except Exception as exc:
+        logger.debug("Compact strategy performance unavailable: %s", exc)
+
+    lessons = [
+        {
+            "category": lesson.get("category"),
+            "severity": lesson.get("severity"),
+            "description": str(lesson.get("description", ""))[:120],
+        }
+        for lesson in state.get("memory_lessons", [])[:3]
+        if isinstance(lesson, dict)
+        and lesson.get("category") in {"strategy_mismatch", "overtrading"}
+    ]
+    daily = state.get("daily_stats", {})
+    return {
+        "regime": regime,
+        "regime_confidence": round(float(state.get("regime_confidence", 0.0) or 0.0), 2),
+        "trade_horizon": str(state.get("trade_horizon", "SWING")).upper(),
+        "available_strategies": _VALID_STRATEGY_NAMES,
+        "candidate_strategies": sorted(
+            {str(signal.get("strategy", "")) for signal in state.get("signals", [])} - {""}
+        ),
+        "performance": performance,
+        "daily": {
+            "trades": int(daily.get("trades_count", 0) or 0),
+            "pnl_sign": 1
+            if float(daily.get("profit_loss", 0.0) or 0.0) > 0
+            else -1
+            if float(daily.get("profit_loss", 0.0) or 0.0) < 0
+            else 0,
+        },
+        "lessons": lessons,
+    }
+
+
+def _optimized_strategy_selection(state: TradingState) -> dict[str, Any]:
+    """Admit every exact-grain strategy represented by this candidate batch.
+
+    Strategy selection is not a pre-evaluation Top-K gate.  The signal engine has
+    already evaluated every strategy against the shared feature snapshot; this node
+    preserves those hypotheses and reuses prior eligibility decisions. Contextual Qwen review,
+    when needed, belongs in ``signal_validation_node`` where conflicts/news are visible.
+    """
+    requested: list[str] = []
+    for signal in state.get("signals", []):
+        if not isinstance(signal, dict):
+            continue
+        names = signal.get("supporting_strategies") or [signal.get("strategy")]
+        for name in names:
+            normalized = str(name or "")
+            if normalized and normalized not in requested:
+                requested.append(normalized)
+    admitted = _retain_eligible_candidate_strategies(state, requested)
+    metrics = dict(state.get("llm_optimization_metrics", {}))
+    metrics.update(
+        {
+            "strategies_requested": len(requested),
+            "strategies_admitted": len(admitted),
+            "strategy_selection_qwen_calls": 0,
+        }
+    )
+    return {
+        "signals": state.get("signals", []),
+        "active_strategies": admitted,
+        "strategy_reasoning": (
+            "All candidate-producing strategies with prior eligibility retained without "
+            "preselecting one strategy."
+        ),
+        "llm_optimization_metrics": metrics,
+        "pre_llm_rejected": state.get("pre_llm_rejected", []),
+    }
 
 
 def _fallback_strategy_selection(
@@ -221,19 +370,20 @@ def _fallback_strategy_selection(
         "volatile": ["breakout"],
     }
 
-    trade_horizon = state.get("trade_horizon", "SWING")
     strategies = regime_strategies.get(regime, ["trend_following"])
-    admitted = _gate_active_strategies(strategies, regime, trade_horizon=trade_horizon)
+    admitted = _retain_eligible_candidate_strategies(state, strategies)
 
     logger.info(f"Using fallback strategies for {regime}: {strategies} -> admitted: {admitted}")
 
     return {
+        "signals": state.get("signals", []),
         "active_strategies": admitted,
         "strategy_reasoning": (
             f"AI review skipped because {plain_english_fallback_cause(error_msg)}. "
             f"Backup rule selected the default strategy set for '{regime}'."
         ),
         "errors": state.get("errors", []) + [f"Strategy Agent fallback: {error_msg}"],
+        "pre_llm_rejected": state.get("pre_llm_rejected", []),
     }
 
 

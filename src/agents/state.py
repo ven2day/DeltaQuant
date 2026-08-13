@@ -161,8 +161,16 @@ class TradingState(TypedDict):
     # (e.g. strategy_selection's LLM context) must pass this through to
     # get_performance_tracker()/AgentMemoryDB rather than relying on the default, or a
     # mock/simulated session silently reads live-data-paper history into its prompt
-    # context (and vice versa) -- see DeltaQuant-Quant-Risk-Review.md H-9.
+    # context (and vice versa) -- see docs/audits/DeltaQuant-Quant-Risk-Review.md H-9.
     data_namespace: str
+
+    # Explicit paper-runtime environment ("market_paper" or "mock"). This travels
+    # alongside trade_horizon so every graph node and persistence boundary can reject
+    # cross-environment data rather than inferring identity from the current quote source.
+    execution_mode: str
+    market: str
+    market_data_provider: str
+    provider_environment: str
 
     # ===========================================
     # Sentiment & Prediction (Free Tier)
@@ -190,17 +198,28 @@ class TradingState(TypedDict):
     precomputed_predictions: dict[str, dict[str, Any]]
 
     # Which trade horizon this cycle's batch of `signals` belongs to: "SWING" (default,
-    # every pre-existing caller) or "SCALP". Read by strategy_selection's H-8 gate and
-    # risk_compliance's admission check/RiskLimits so a strategy validated only on one
-    # horizon can never silently admit trades on the other -- see
-    # src/backtesting/strategy_registry.py and DeltaQuant-Quant-Risk-Review.md H-8.
+    # every pre-existing caller) or "SCALP". RiskLimits keeps horizon-specific sizing;
+    # strategy eligibility intentionally does not use horizon as an artifact key.
     trade_horizon: str
+
+    # Market-wide Qwen/news interpretation generated once per physical cycle and
+    # reused by both horizon-specific graph invocations when cost optimization is on.
+    shared_market_context: dict[str, Any]
+
+    # Per-invocation optimization funnel. Kept in state so LangGraph/LangFuse and the
+    # dashboard can report deterministic rejects and cache reuse without global logs.
+    llm_optimization_metrics: dict[str, Any]
+    pre_llm_rejected: list[dict[str, Any]]
 
 
 def create_initial_state(
     workflow_id: str | None = None,
     data_namespace: str = "paper_market_data",
     trade_horizon: str = "SWING",
+    execution_mode: str = "market_paper",
+    market: str = "NSE",
+    market_data_provider: str = "DHAN",
+    provider_environment: str = "",
 ) -> TradingState:
     """
     Create an initial empty trading state.
@@ -212,6 +231,7 @@ def create_initial_state(
             matching PerformanceTracker's/AgentMemoryDB's own default.
         trade_horizon: "SWING" (default, matches every pre-existing caller) or "SCALP" —
             see the field docstring on TradingState.trade_horizon.
+        execution_mode: Explicit paper-runtime environment.
 
     Returns:
         Initialized TradingState with default values
@@ -255,6 +275,10 @@ def create_initial_state(
         timestamp=datetime.now().isoformat(),
         errors=[],
         data_namespace=data_namespace,
+        execution_mode=execution_mode,
+        market=market.upper(),
+        market_data_provider=market_data_provider.upper(),
+        provider_environment=provider_environment.upper(),
         # Sentiment & Prediction (Free Tier)
         news_sentiment={},
         news_headlines=[],
@@ -262,4 +286,7 @@ def create_initial_state(
         prediction_signals=[],
         precomputed_predictions={},
         trade_horizon=trade_horizon,
+        shared_market_context={},
+        llm_optimization_metrics={},
+        pre_llm_rejected=[],
     )

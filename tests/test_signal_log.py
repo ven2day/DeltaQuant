@@ -5,12 +5,12 @@ from datetime import date, datetime, timedelta
 import pandas as pd
 
 from scripts import backfill_signal_history
-from src.execution.signal_log import SignalLogger, SignalRecord
+from src.markets.nse.execution.signal_log import SignalLogger, SignalRecord
 
 # --- SignalRecord.from_signal ---
 
 
-def test_from_signal_approved_has_no_reason():
+def test_from_signal_approved_uses_validation_reasoning_when_present():
     signal = {
         "symbol": "TCS",
         "signal_type": "BUY",
@@ -19,6 +19,7 @@ def test_from_signal_approved_has_no_reason():
         "strategy": "trend_following",
         "confidence": 0.72,
         "timestamp": "2026-08-05T10:00:00",
+        "validation": {"reasoning": "Clean bullish setup, no contextual risk flags"},
     }
     record = SignalRecord.from_signal(signal, "approved")
 
@@ -29,8 +30,23 @@ def test_from_signal_approved_has_no_reason():
     assert record.strategy == "trend_following"
     assert record.confidence == 0.72
     assert record.status == "approved"
-    assert record.reason == ""
+    assert record.reason == "Clean bullish setup, no contextual risk flags"
     assert record.source == "live"
+
+
+def test_from_signal_approved_falls_back_to_confidence_rr_summary():
+    # No validation.reasoning (e.g. the deterministic no-Qwen-needed path) -- still
+    # show something explanatory instead of a blank Reason column.
+    signal = {
+        "symbol": "TCS",
+        "signal_type": "BUY",
+        "entry_price": 3450.5,
+        "confidence": 0.72,
+        "risk_reward_ratio": 2.5,
+    }
+    record = SignalRecord.from_signal(signal, "approved")
+
+    assert record.reason == "confidence 72%, RR 2.5"
 
 
 def test_from_signal_preserves_explicit_backfill_metadata():
@@ -125,8 +141,8 @@ def test_from_signal_rejected_risk_extracts_first_failure_message():
     assert record.reason == "Outside trading hours"
 
 
-def test_from_signal_rejected_risk_prioritizes_strategy_admission_over_earlier_failures():
-    """The H-8 admission failure (risk_compliance.py check 14, evaluated LAST by list
+def test_from_signal_rejected_risk_prioritizes_strategy_eligibility_over_earlier_failures():
+    """The eligibility failure (risk_compliance.py check 14, evaluated LAST by list
     order) must be the reported reason when present, even though an earlier check
     like trading-hours or risk-reward also failed first in the list -- otherwise a
     signal that could never be approved on any cycle reads as merely mistimed."""
@@ -140,17 +156,15 @@ def test_from_signal_rejected_risk_prioritizes_strategy_admission_over_earlier_f
             "failures": [
                 {"rule": "trading_hours", "message": "Outside trading hours (09:15-15:15)"},
                 {
-                    "rule": "strategy_admission",
-                    "message": "Strategy 'trend_following' has no current VALIDATED "
-                    "registry artifact for regime 'trending_up' (H-8 strategy admission gate)",
+                    "rule": "strategy_eligibility",
+                    "message": "BUY blocked: strategy not PAPER_APPROVED",
                 },
             ],
         },
     }
     record = SignalRecord.from_signal(signal, "rejected_risk")
 
-    assert "strategy admission gate" in record.reason
-    assert record.reason.startswith("Strategy 'trend_following'")
+    assert record.reason == "BUY blocked: strategy not PAPER_APPROVED"
 
 
 def test_from_signal_missing_timestamp_falls_back_to_now():

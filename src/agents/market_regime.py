@@ -22,13 +22,14 @@ from src.agents.llm_factory import (
     get_llm_circuit_breaker,
     get_llm_limiter,
     invoke_with_fallback,
+    model_for_tier,
     primary_and_fallback_models,
 )
 from src.config import get_settings
-from src.finops import record_llm_response
-from src.utils.circuit_breaker import CircuitBreakerOpenError
-from src.utils.errors import RateLimitError
-from src.utils.formatting import plain_english_fallback_cause
+from src.core.utils.circuit_breaker import CircuitBreakerOpenError
+from src.core.utils.errors import RateLimitError
+from src.core.utils.formatting import plain_english_fallback_cause
+from src.finops import LLMCallReason, record_llm_response
 
 from .state import MarketRegime, TradingState
 
@@ -65,11 +66,16 @@ independent factors (trend indicators + sentiment + predictions) agree; use 0.4â
 single weak signal; prefer "ranging" with lower confidence when unsure.
 Consider the memory lessons carefully to avoid past mistakes."""
 
+COMPACT_REGIME_SYSTEM_PROMPT = """Classify the structured NSE market summary as exactly one of
+trending_up, trending_down, ranging, volatile. Calibrate confidence; lower it when technical,
+breadth, mood, and news inputs conflict. Return JSON only: {"regime":"...","confidence":0.0,
+"reasoning":"one sentence","key_factors":["CODE"]}. Do not calculate trade risk or signals."""
+
 
 def create_regime_agent():
     """Create the market regime classification agent (currently configured provider)."""
     primary_model, _fallback_model = primary_and_fallback_models()
-    return create_chat_model(primary_model, max_tokens=1024)
+    return create_chat_model(primary_model, max_tokens=get_settings().qwen_max_output_tokens_regime)
 
 
 def market_regime_node(state: TradingState) -> dict[str, Any]:
@@ -89,6 +95,14 @@ def market_regime_node(state: TradingState) -> dict[str, Any]:
 
     settings = get_settings()
 
+    shared_context = state.get("shared_market_context") or {}
+    if settings.llm_cost_optimization_enabled and shared_context:
+        return {
+            "regime": str(shared_context.get("regime", "unknown")),
+            "regime_confidence": float(shared_context.get("regime_confidence", 0.0) or 0.0),
+            "regime_reasoning": str(shared_context.get("regime_reasoning", "")),
+        }
+
     if not settings.enable_llm_agents:
         return _fallback_regime_classification(state, "LLM agents disabled via settings")
 
@@ -107,16 +121,25 @@ def market_regime_node(state: TradingState) -> dict[str, Any]:
         ]
 
         # Build context for the agent (enriched with support agent outputs)
-        context = _build_regime_context_enriched(indicators, market_data, regime_lessons, state)
+        optimized = getattr(settings, "llm_cost_optimization_enabled", False) is True
+        context = (
+            _compact_regime_context(indicators, market_data, regime_lessons, state)
+            if optimized
+            else _build_regime_context_enriched(indicators, market_data, regime_lessons, state)
+        )
 
         messages = [
-            SystemMessage(content=REGIME_SYSTEM_PROMPT),
+            SystemMessage(
+                content=COMPACT_REGIME_SYSTEM_PROMPT if optimized else REGIME_SYSTEM_PROMPT
+            ),
             HumanMessage(content=context),
         ]
 
         # Check circuit breaker state
         if not circuit_breaker.is_available:
-            raise CircuitBreakerOpenError(f"{current_provider()}_api", circuit_breaker.recovery_time)
+            raise CircuitBreakerOpenError(
+                f"{current_provider()}_api", circuit_breaker.recovery_time
+            )
 
         # Apply rate limiting before LLM call
         if settings.enable_rate_limiting:
@@ -125,7 +148,14 @@ def market_regime_node(state: TradingState) -> dict[str, Any]:
         # Try primary model first, then the fallback model, on rate limit (see
         # llm_factory.invoke_with_fallback -- shared by every LLM node so this
         # resilience can't be silently omitted in a new/edited agent).
-        model_used = primary_and_fallback_models()[0]
+        sentiment = state.get("news_sentiment") or {}
+        sentiment_score = (
+            float(sentiment.get("avg_sentiment", 0.0) or 0.0)
+            if isinstance(sentiment, dict)
+            else 0.0
+        )
+        tier = "REVIEW" if optimized and abs(sentiment_score) >= 0.5 else "FAST"
+        model_used = model_for_tier(tier) if optimized else primary_and_fallback_models()[0]
 
         def _record_model_used(name: str) -> None:
             nonlocal model_used
@@ -135,13 +165,25 @@ def market_regime_node(state: TradingState) -> dict[str, Any]:
             messages,
             circuit_breaker=circuit_breaker,
             temperature=settings.groq_temperature,
-            max_tokens=1024,
+            max_tokens=(settings.qwen_max_output_tokens_regime if optimized else 1024),
+            models_to_try=(model_used, model_for_tier("FAST")) if optimized else None,
+            trade_horizon=str(state.get("trade_horizon", "SHARED")),
             on_model_selected=_record_model_used,
         )
         logger.info(f"Regime agent using model: {model_used}")
 
         # Record token usage / cost for FinOps (never raises).
-        record_llm_response("market_regime", response, model=model_used)
+        record_llm_response(
+            "market_regime",
+            response,
+            model=model_used,
+            trade_horizon=str(state.get("trade_horizon", "SHARED")),
+            purpose="market_context_regime",
+            cycle_id=str(state.get("workflow_id", "")),
+            market=str(state.get("market", "NSE")),
+            call_reason=LLMCallReason.REGIME_CONTEXT,
+            component="market_regime",
+        )
 
         # Parse response
         result = _parse_regime_response(response.content)
@@ -274,6 +316,75 @@ def _build_regime_context(
             )
 
     return "\n".join(context_parts)
+
+
+def _compact_regime_context(
+    indicators: dict[str, Any],
+    market_data: dict[str, Any],
+    lessons: list[dict[str, Any]],
+    state: dict[str, Any],
+) -> str:
+    """Serialize a bounded set of already-computed regime features."""
+    allowed = {
+        "adx",
+        "plus_di",
+        "minus_di",
+        "rsi",
+        "atr",
+        "atr_percent",
+        "bb_percent",
+        "ema_20",
+        "ema_50",
+        "sma_20",
+        "sma_50",
+        "vwap",
+        "close",
+        "change_percent",
+    }
+
+    def _select(value: Any) -> Any:
+        if hasattr(value, "to_dict"):
+            value = value.to_dict()
+        if not isinstance(value, dict):
+            return value
+        selected: dict[str, Any] = {}
+        for key, child in value.items():
+            if key in allowed:
+                selected[str(key)] = child
+            elif isinstance(child, dict):
+                nested = _select(child)
+                if nested:
+                    selected[str(key)] = nested
+        return selected
+
+    news = state.get("news_sentiment") or {}
+    mood = state.get("market_mood") or {}
+    payload = {
+        "symbols": [
+            {
+                "symbol": symbol,
+                "price": {
+                    "close": data.get("close", data.get("last_price")),
+                    "change_percent": data.get("change_percent"),
+                }
+                if isinstance(data, dict)
+                else {},
+                "indicators": _select(indicators.get(symbol, {})),
+            }
+            for symbol, data in list(market_data.items())[:5]
+        ],
+        "news_sentiment": news.get("avg_sentiment") if isinstance(news, dict) else None,
+        "mood_index": mood.get("mood_index") if isinstance(mood, dict) else None,
+        "lessons": [
+            {
+                "severity": lesson.get("severity"),
+                "description": str(lesson.get("description", ""))[:120],
+            }
+            for lesson in lessons[:2]
+            if isinstance(lesson, dict)
+        ],
+    }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
 
 
 def _build_regime_context_enriched(

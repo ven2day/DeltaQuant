@@ -2,8 +2,8 @@ import asyncio
 import contextlib
 from unittest.mock import MagicMock
 
-from src.market.dhan_quotes_feed import Quote
-from src.market.sector_movers import SectorMoversTracker, compute_sector_movers
+from src.markets.nse.broker.dhan.quotes import Quote
+from src.markets.nse.universe.sector_movers import SectorMoversTracker, compute_sector_movers
 
 
 def _quote(symbol: str, change_percent: float) -> Quote:

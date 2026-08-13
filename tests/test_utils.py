@@ -3,7 +3,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from src.utils.cache import (
+from src.core.utils.cache import (
     TTLCache,
     _caches,
     cached,
@@ -13,12 +13,14 @@ from src.utils.cache import (
     get_quote_cache,
     get_sentiment_cache,
 )
-from src.utils.rate_limiter import (
+from src.core.utils.rate_limiter import (
     RateLimiter,
-    get_dhan_data_api_limiter,
-    get_dhan_quote_api_limiter,
     get_groq_limiter,
     rate_limited,
+)
+from src.markets.nse.broker.dhan.rate_limits import (
+    get_dhan_data_api_limiter,
+    get_dhan_quote_api_limiter,
 )
 
 # --- RateLimiter Tests ---
@@ -102,9 +104,9 @@ def test_rate_limiter_get_wait_time(rate_limiter):
 
 def test_get_groq_limiter():
     # Reset global
-    import src.utils.rate_limiter
+    import src.core.utils.rate_limiter
 
-    src.utils.rate_limiter._groq_limiter = None
+    src.core.utils.rate_limiter._groq_limiter = None
 
     limiter1 = get_groq_limiter()
     limiter2 = get_groq_limiter()
@@ -114,24 +116,25 @@ def test_get_groq_limiter():
 
 def test_get_dhan_data_api_limiter():
     # Reset global
-    import src.utils.rate_limiter
+    import src.markets.nse.broker.dhan.rate_limits
 
-    src.utils.rate_limiter._dhan_data_api_limiter = None
+    src.markets.nse.broker.dhan.rate_limits._dhan_data_api_limiter = None
 
     limiter1 = get_dhan_data_api_limiter()
     limiter2 = get_dhan_data_api_limiter()
     assert limiter1 is limiter2
     # Under DhanHQ's documented 5 req/s account-wide cap for Data APIs.
-    assert limiter1.requests_per_minute == 60
+    # Run at 4 req/s, leaving headroom under DhanHQ's documented 5 req/s cap.
+    assert limiter1.requests_per_minute == 240
     # No startup burst allowance — see the singleton's definition for why a full
     # bucket start caused DH-904 on every restart with multiple trackers.
     assert limiter1.available_tokens == 1.0
 
 
 def test_get_dhan_quote_api_limiter():
-    import src.utils.rate_limiter
+    import src.markets.nse.broker.dhan.rate_limits
 
-    src.utils.rate_limiter._dhan_quote_api_limiter = None
+    src.markets.nse.broker.dhan.rate_limits._dhan_quote_api_limiter = None
 
     limiter1 = get_dhan_quote_api_limiter()
     limiter2 = get_dhan_quote_api_limiter()

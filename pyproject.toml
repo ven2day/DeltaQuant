@@ -1,14 +1,14 @@
 [project]
 name = "trading-agent"
 version = "0.1.0"
-description = "Long-only NSE paper investing workflow with DhanHQ data and bounded agent review"
+description = "Isolated multi-market quantitative trading domains on a shared DeltaQuant core"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [
     { name = "Trading Agent Team" }
 ]
-keywords = ["trading", "agents", "langgraph", "nse", "paper-trading"]
+keywords = ["trading", "agents", "langgraph", "nse", "forex", "paper-trading"]
 
 dependencies = [
     # Agent Orchestration
@@ -44,6 +44,7 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "pydantic>=2.0.0",
     "pydantic-settings>=2.0.0",
+    "pyyaml>=6.0.0",
     "rich>=13.0.0",  # CLI dashboard
     # Optional: Redis for caching
     "redis>=5.0.0",
@@ -52,6 +53,14 @@ dependencies = [
     "pandas-stubs~=2.3.3",
 ]
 
+[project.scripts]
+deltaquant-api = "src.markets.api_runtime:main"
+deltaquant-nse = "src.markets.nse.runtime.worker:main"
+deltaquant-forex = "src.markets.forex.runtime.worker:main"
+deltaquant-crypto = "src.markets.crypto.runtime.worker:main"
+deltaquant-validator = "src.background.validator:main"
+deltaquant-ml-trainer = "src.background.trainer:main"
+
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0.0",
@@ -59,6 +68,7 @@ dev = [
     "pytest-cov>=4.0.0",
     "ruff>=0.5.0",
     "mypy>=1.10.0",
+    "types-PyYAML>=6.0.0",
 ]
 web = [
     "fastapi>=0.110.0",

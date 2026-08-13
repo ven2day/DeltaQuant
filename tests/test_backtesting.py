@@ -18,7 +18,7 @@ from src.backtesting.strategies import (
     RSIStrategy,
     SMACrossoverStrategy,
 )
-from src.market.indicators import Timeframe
+from src.core.indicators import Timeframe
 
 # --- BacktestEngine Tests ---
 
@@ -206,6 +206,34 @@ def test_real_signal_strategy_passes_its_timeframe_to_calculate_indicators():
         strategy.on_bar(history.iloc[-1], history.iloc[:-1])
 
     assert mock_calc.call_args.kwargs["timeframe"] == Timeframe.M5
+
+
+def test_real_signal_strategy_reuses_shared_offline_indicator_cache():
+    from src.backtesting.strategies import RealSignalStrategy
+
+    dates = pd.date_range("2024-01-01", periods=60, freq="5min")
+    history = pd.DataFrame(
+        {"Open": 100.0, "High": 101.0, "Low": 99.0, "Close": 100.5, "Volume": 1000},
+        index=dates,
+    )
+    shared_cache = {}
+    first = RealSignalStrategy(
+        symbol="TEST", timeframe=Timeframe.M5, min_bars=10, indicator_cache=shared_cache
+    )
+    second = RealSignalStrategy(
+        symbol="TEST", timeframe=Timeframe.M5, min_bars=10, indicator_cache=shared_cache
+    )
+
+    with patch("src.backtesting.strategies.calculate_indicators") as mock_calc:
+        mock_calc.return_value = MagicMock(indicators={})
+        first._engine.generate_signals = lambda *a, **k: []
+        second._engine.generate_signals = lambda *a, **k: []
+        prior = history.iloc[:-1]
+        first.on_bar(history.iloc[-1], prior)
+        second.on_bar(history.iloc[-1], prior)
+
+    assert mock_calc.call_count == 1
+    assert len(shared_cache) == 1
 
 
 # --- Strategies Tests ---

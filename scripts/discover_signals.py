@@ -9,9 +9,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.config import get_settings
-from src.market.history_manager import HistoryManager
-from src.market.indicators import Timeframe
-from src.market.stock_discovery import StockDiscovery
+from src.core.indicators import Timeframe
+from src.markets.nse.market_data.history_manager import HistoryManager
+from src.markets.nse.universe.discovery import StockDiscovery
 from src.signal_discovery.operators import build_ohlcv_panel
 from src.signal_discovery.workflow import SignalDiscoveryWorkflow
 

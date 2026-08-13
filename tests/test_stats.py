@@ -207,7 +207,13 @@ def test_dashboard_sync_positions_joins_timeframe_from_managed_positions(dashboa
     # in by position_id rather than expected directly on the paper engine's Position.
     positions = [
         _FakePaperPosition(
-            "TCS", "BUY", 10, 4000.0, position_id="POS-1", entry_time="2026-08-08T09:15:00", strategy="momentum"
+            "TCS",
+            "BUY",
+            10,
+            4000.0,
+            position_id="POS-1",
+            entry_time="2026-08-08T09:15:00",
+            strategy="momentum",
         )
     ]
     managed = [_FakeManagedPosition(position_id="POS-1", timeframe="15m")]
@@ -222,7 +228,13 @@ def test_dashboard_sync_positions_joins_timeframe_from_managed_positions(dashboa
 def test_dashboard_sync_positions_timeframe_blank_without_managed_match(dashboard):
     positions = [
         _FakePaperPosition(
-            "TCS", "BUY", 10, 4000.0, position_id="POS-1", entry_time="2026-08-08T09:15:00", strategy="momentum"
+            "TCS",
+            "BUY",
+            10,
+            4000.0,
+            position_id="POS-1",
+            entry_time="2026-08-08T09:15:00",
+            strategy="momentum",
         )
     ]
     # No managed_positions passed at all -- must not raise, timeframe defaults blank.
@@ -269,6 +281,35 @@ def test_dashboard_increment_cycle(dashboard):
     assert dashboard.stats.cycles_run == 1
 
 
+def test_begin_cycle_publishes_early_return_cycles(dashboard):
+    dashboard.begin_cycle(195)
+
+    assert dashboard.stats.cycles_run == 195
+    assert dashboard.stats.ai_review_status == "scanning"
+    assert "pre-check" in dashboard.stats.ai_review_reason
+
+
+def test_dashboard_surfaces_shared_context_without_trade_review(dashboard):
+    dashboard.update_shared_market_context(
+        {
+            "regime": "ranging",
+            "regime_confidence": 0.73,
+            "regime_reasoning": "Breadth is balanced.",
+            "news_headlines": [{"title": "Nifty steady", "sentiment": "positive"}],
+            "news_sentiment": {"avg_sentiment": 0.2},
+            "market_mood": {"mood_index": 57, "mood_label": "neutral"},
+        }
+    )
+    dashboard.set_ai_review_status("skipped_precheck", "25 candidates remained WAIT")
+
+    assert dashboard.stats.current_regime == "ranging"
+    assert dashboard.stats.regime_confidence == 0.73
+    assert dashboard.stats.news_headlines[0]["title"] == "Nifty steady"
+    assert dashboard.stats.news_sentiment == 0.2
+    assert dashboard.stats.market_mood["mood_index"] == 57
+    assert dashboard.stats.ai_review_status == "skipped_precheck"
+
+
 def test_set_cycle_stage_updates_label_and_number(dashboard):
     dashboard.set_cycle_stage("scanning", "Scanning 50 symbols", cycle=7)
 
@@ -304,6 +345,8 @@ def test_trading_stats_per_cycle_agent_detail_defaults(stats):
     assert stats.market_mood == {}
     assert stats.prediction_signals == []
     assert stats.agent_fallback_notice == ""
+    assert stats.ai_review_status == "not_started"
+    assert stats.ai_review_reason == "Waiting for the first scan"
 
 
 def test_stats_to_dict_serializes_per_cycle_agent_detail():
@@ -314,6 +357,8 @@ def test_stats_to_dict_serializes_per_cycle_agent_detail():
     stats.news_headlines = [{"title": "Sensex rallies", "sentiment": "positive"}]
     stats.market_mood = {"mood_index": 72, "mood_label": "greed"}
     stats.agent_fallback_notice = "Signal Validation: the AI reviewer hit its daily usage limit"
+    stats.ai_review_status = "skipped_precheck"
+    stats.ai_review_reason = "All candidates remained WAIT"
 
     data = stats_to_dict(stats)
 
@@ -321,3 +366,5 @@ def test_stats_to_dict_serializes_per_cycle_agent_detail():
     assert data["news_headlines"] == [{"title": "Sensex rallies", "sentiment": "positive"}]
     assert data["market_mood"]["mood_index"] == 72
     assert "daily usage limit" in data["agent_fallback_notice"]
+    assert data["ai_review_status"] == "skipped_precheck"
+    assert data["ai_review_reason"] == "All candidates remained WAIT"

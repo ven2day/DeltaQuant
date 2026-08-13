@@ -18,9 +18,9 @@ from typing import Any
 import pandas as pd
 from langchain_core.messages import HumanMessage, SystemMessage
 
-from src.agents.llm_factory import create_chat_model, primary_and_fallback_models
+from src.agents.llm_factory import create_chat_model, model_for_tier, primary_and_fallback_models
 from src.config import get_settings
-from src.finops import get_cost_tracker
+from src.finops import LLMCallReason, get_cost_tracker
 from src.finops.cost_tracker import record_llm_response
 
 from .evaluator import RankICEvaluator
@@ -61,11 +61,21 @@ class SignalDiscoveryWorkflow:
         p_value_threshold: float = 0.05,
         min_periods: int = 30,
         min_cross_section: int = 8,
-        output_directory: str = "data/discovered_signals",
+        output_directory: str = "data/nse/discovered_signals",
     ) -> None:
+        settings = get_settings()
         primary_model, _fallback_model = primary_and_fallback_models()
-        self.model_name = primary_model
-        self.llm = llm or create_chat_model(self.model_name, temperature=0.5, max_tokens=1800)
+        self.model_name = (
+            model_for_tier("REVIEW")
+            if getattr(settings, "llm_cost_optimization_enabled", False) is True
+            else primary_model
+        )
+        max_tokens = (
+            settings.qwen_max_output_tokens_discovery
+            if getattr(settings, "llm_cost_optimization_enabled", False) is True
+            else 1800
+        )
+        self.llm = llm or create_chat_model(self.model_name, temperature=0.5, max_tokens=max_tokens)
         self.num_signals = max(1, min(10, int(num_signals)))
         self.max_iterations = max(1, min(10, int(max_iterations)))
         self.ic_threshold = abs(float(ic_threshold))
@@ -119,8 +129,12 @@ class SignalDiscoveryWorkflow:
         num_tests = 0
 
         for iteration in range(1, self.max_iterations + 1):
-            raw = await self._invoke("signal_discovery_generator", self._signal_prompt(request, feedback))
-            latest_signals = [DiscoveredSignal.from_dict(item) for item in _balanced_json_objects(raw)]
+            raw = await self._invoke(
+                "signal_discovery_generator", self._signal_prompt(request, feedback)
+            )
+            latest_signals = [
+                DiscoveredSignal.from_dict(item) for item in _balanced_json_objects(raw)
+            ]
             iteration_evaluations: list[dict[str, Any]] = []
             valid_signals: list[DiscoveredSignal] = []
             for signal in latest_signals:
@@ -221,7 +235,16 @@ class SignalDiscoveryWorkflow:
                 HumanMessage(content=prompt),
             ]
         )
-        record_llm_response(agent, response, self.model_name)
+        record_llm_response(
+            agent,
+            response,
+            self.model_name,
+            "SHARED",
+            market="NSE",
+            call_reason=LLMCallReason.BACKGROUND_ANALYSIS,
+            component=f"signal_discovery_{agent}",
+            purpose="offline_signal_discovery",
+        )
         content = response.content
         if isinstance(content, list):
             return "".join(
@@ -244,9 +267,7 @@ name, formula, meaning, category, data_fields_used, operators_used.
 Use only past/current data. Do not use future shifts, Python operators, methods, or attributes.
 """
 
-    async def _optimization_feedback(
-        self, request: str, evaluations: list[dict[str, Any]]
-    ) -> str:
+    async def _optimization_feedback(self, request: str, evaluations: list[dict[str, Any]]) -> str:
         compact = json.dumps(evaluations, separators=(",", ":"))[:10000]
         prompt = f"""You are the Eval Agent optimizing cross-sectional signals for: {request}
 Acceptance requires abs(mean_ic)>={self.ic_threshold} and p_value<={self.p_value_threshold}.

@@ -1,6 +1,6 @@
 import pandas as pd
 
-from src.market.price_geometry import (
+from src.markets.nse.strategies.price_geometry import (
     atr_pct,
     ema,
     nearest_support_resistance,

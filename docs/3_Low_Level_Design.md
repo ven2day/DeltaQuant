@@ -2,7 +2,7 @@
 
 ## Runtime Entry Point
 
-`scripts/run_live_trading.py` owns the long-running session. It loads settings,
+`src/markets/nse/runtime/live.py` owns the long-running NSE session. It loads settings,
 starts the dashboard server, refreshes market data, manages exits, invokes the
 screen and agent graph, and routes approved paper orders through the execution
 service.
@@ -15,7 +15,7 @@ The loop is split into two concerns:
   state recovery, optional web server, sector movers, and scalping screener.
 
 When `SCALP_ENABLED=true`, each cycle also runs a second, self-contained scan/rank/gate/
-execute pass for the scalp horizon (`src/market/scalp_scan.py`'s `run_scalp_scan()`, called
+execute pass for the scalp horizon (`src/markets/nse/strategies/scalp_scan.py`'s `run_scalp_scan()`, called
 from the cycle body rather than being inline in this file, specifically so it's unit-testable
 without the whole live-session object graph). It shares the swing scan's quote/history
 plumbing but instantiates its own `SignalEngine` (tighter stops/targets) and invokes the same
@@ -90,7 +90,7 @@ per symbol. Unchanged ranked signal sets skip duplicate Groq/news review.
 | `validated_signals`, `rejected_signals` | Validation agent | Risk agent and signal log |
 | `approved_trades`, `risk_rejected` | Risk engine | Execution and audit |
 | `errors` | Any graph stage | Fail-closed execution guard |
-| `trade_horizon` | Runtime loop (`"SWING"` default, `"SCALP"` for the second per-cycle invocation) | Strategy-selection's H-8 gate, risk_compliance's admission check and position-size cap |
+| `trade_horizon` | Runtime loop (`"SWING"` default, `"SCALP"` for the second per-cycle invocation) | Horizon-specific signal/risk rules and decision lineage; it is not part of eligibility/model identity |
 
 `run_trading_cycle()` coerces values to native Python types before checkpointing
 so pandas and NumPy scalar values do not cross the msgpack boundary.

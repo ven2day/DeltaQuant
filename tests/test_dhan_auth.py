@@ -1,11 +1,15 @@
-"""Tests for src/market/dhan_auth.py — DhanHQ PIN+TOTP auto-login and token caching."""
+"""Tests for src/markets/nse/broker/dhan/auth.py — DhanHQ PIN+TOTP auto-login and token caching."""
 
 import json
 from datetime import timedelta
 from unittest.mock import MagicMock, patch
 
-from src.market.dhan_auth import _is_cache_valid, get_valid_access_token
-from src.utils.market_time import now_ist
+from src.markets.nse.broker.dhan.auth import (
+    _is_cache_valid,
+    get_dhan_client,
+    get_valid_access_token,
+)
+from src.markets.nse.sessions.market_time import now_ist
 
 
 def _mock_settings(
@@ -41,6 +45,15 @@ def _mock_login_response(access_token="fresh-token", expiry_time=None):
         "expiryTime": expiry_time,
     }
     return resp
+
+
+def test_get_dhan_client_uses_v2_context_and_complete_headers():
+    client = get_dhan_client("client-id", "access-token")
+
+    assert client.dhan_http.client_id == "client-id"
+    assert client.dhan_http.access_token == "access-token"
+    assert client.dhan_http.header["client-id"] == "client-id"
+    assert client.dhan_http.header["access-token"] == "access-token"
 
 
 # --- _is_cache_valid ---
@@ -80,10 +93,10 @@ def test_uses_valid_cached_token_without_hitting_network(tmp_path):
 
     with (
         patch(
-            "src.market.dhan_auth.get_settings",
+            "src.markets.nse.broker.dhan.auth.get_settings",
             return_value=_mock_settings(cache_file=str(cache_path)),
         ),
-        patch("src.market.dhan_auth.requests.post") as mock_post,
+        patch("src.markets.nse.broker.dhan.auth.requests.post") as mock_post,
     ):
         token = get_valid_access_token()
 
@@ -96,10 +109,10 @@ def test_generates_fresh_token_via_totp_when_cache_missing(tmp_path):
 
     with (
         patch(
-            "src.market.dhan_auth.get_settings",
+            "src.markets.nse.broker.dhan.auth.get_settings",
             return_value=_mock_settings(cache_file=str(cache_path)),
         ),
-        patch("src.market.dhan_auth.requests.post", return_value=_mock_login_response()),
+        patch("src.markets.nse.broker.dhan.auth.requests.post", return_value=_mock_login_response()),
     ):
         token = get_valid_access_token()
 
@@ -113,11 +126,11 @@ def test_totp_code_is_generated_from_the_configured_secret(tmp_path):
 
     with (
         patch(
-            "src.market.dhan_auth.get_settings",
+            "src.markets.nse.broker.dhan.auth.get_settings",
             return_value=_mock_settings(cache_file=str(cache_path)),
         ),
         patch(
-            "src.market.dhan_auth.requests.post", return_value=_mock_login_response()
+            "src.markets.nse.broker.dhan.auth.requests.post", return_value=_mock_login_response()
         ) as mock_post,
     ):
         get_valid_access_token()
@@ -134,12 +147,12 @@ def test_falls_back_to_static_token_when_totp_login_fails(tmp_path):
 
     with (
         patch(
-            "src.market.dhan_auth.get_settings",
+            "src.markets.nse.broker.dhan.auth.get_settings",
             return_value=_mock_settings(
                 cache_file=str(cache_path), static_token="manual-token"
             ),
         ),
-        patch("src.market.dhan_auth.requests.post", side_effect=Exception("network down")),
+        patch("src.markets.nse.broker.dhan.auth.requests.post", side_effect=Exception("network down")),
     ):
         token = get_valid_access_token()
 
@@ -151,7 +164,7 @@ def test_returns_none_when_nothing_works(tmp_path):
 
     with (
         patch(
-            "src.market.dhan_auth.get_settings",
+            "src.markets.nse.broker.dhan.auth.get_settings",
             return_value=_mock_settings(
                 cache_file=str(cache_path), pin=None, totp_secret=None, static_token=None
             ),
@@ -167,12 +180,12 @@ def test_skips_totp_flow_when_pin_not_configured_uses_static_token(tmp_path):
 
     with (
         patch(
-            "src.market.dhan_auth.get_settings",
+            "src.markets.nse.broker.dhan.auth.get_settings",
             return_value=_mock_settings(
                 cache_file=str(cache_path), pin=None, static_token="manual-token"
             ),
         ),
-        patch("src.market.dhan_auth.requests.post") as mock_post,
+        patch("src.markets.nse.broker.dhan.auth.requests.post") as mock_post,
     ):
         token = get_valid_access_token()
 
@@ -187,10 +200,10 @@ def test_never_raises_on_malformed_login_response(tmp_path):
 
     with (
         patch(
-            "src.market.dhan_auth.get_settings",
+            "src.markets.nse.broker.dhan.auth.get_settings",
             return_value=_mock_settings(cache_file=str(cache_path), static_token="fallback"),
         ),
-        patch("src.market.dhan_auth.requests.post", return_value=bad_response),
+        patch("src.markets.nse.broker.dhan.auth.requests.post", return_value=bad_response),
     ):
         token = get_valid_access_token()
 

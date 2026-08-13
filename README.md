@@ -2,7 +2,7 @@
 
 # DeltaQuant
 
-### Agentic Paper Investing for the NSE
+### Isolated NSE and Forex paper-trading domains on a shared quantitative core
 
 _A LangGraph agent team that reasons about the market — a deterministic engine that has the final word_
 
@@ -20,6 +20,12 @@ _A LangGraph agent team that reasons about the market — a deterministic engine
 
 ## About This Project
 
+DeltaQuant separates NSE and Forex into peer runtime domains. NSE remains the established
+Dhan paper workflow and Forex uses OANDA Practice; Crypto is outside the current scope.
+See the [NSE/Forex domain boundaries](docs/NSE_FOREX_DOMAIN_BOUNDARIES.md) and the
+[market-domain architecture](docs/MARKET_DOMAIN_ARCHITECTURE.md) for ownership,
+configuration precedence, service commands, and the non-destructive database migration.
+
 **DeltaQuant** is a long-only, paper-investing research workflow for the Indian NSE market.
 It uses **LangGraph** to orchestrate a team of specialized agents that classify market
 regime, select strategies, validate signals, and hand final approval to a deterministic
@@ -35,6 +41,11 @@ does not promise returns, and live order routing is disabled by default (see
 
 ### Key Capabilities
 
+- **One multi-market core** - NSE/Dhan and FOREX/OANDA use broker-neutral candles,
+  quotes, instruments, shared FeatureSnapshots, strategies, aggregation, eligibility,
+  ML, selective Qwen review, deterministic risk, journal, health, and UI contracts.
+  Forex starts with OANDA Practice market data and SHADOW strategies; live OANDA
+  orders are disabled.
 - **Universe-first scanning** — every configured symbol gets real Dhan data and strategy
   analysis every cycle; nothing is pre-filtered before the evidence exists.
 - **Bounded agent review** — a small, diversified, evidence-ranked shortlist reaches the
@@ -44,12 +55,12 @@ does not promise returns, and live order routing is disabled by default (see
 - **Real/simulated data lineage** — quotes and indicators switch live↔simulated with
   market hours, but a position's `entry_data_source` is fixed at entry so an open real
   trade is never re-evaluated against simulated prices.
-- **Walk-forward strategy admission (H-8 gate)** — a strategy only trades live once it
-  clears an out-of-sample, cost-aware `VALIDATED` verdict; unvalidated strategies are
-  blocked at both signal validation and the risk engine.
+- **Strategy Eligibility Registry** — cost-aware out-of-sample evidence is stored at
+  `market + strategy + timeframe + model version`; regime policy is evaluated at runtime, while
+  PAPER/LIVE status and deterministic risk remain fail-closed execution gates.
 - **First-class scalping horizon** — a parallel, independently-governed 5m/15m pipeline
   (multi-timeframe confirmation, deterministic entry-quality checks, its own ranking and
-  risk sizing) that shares the swing path's agent graph and H-8 gate rather than
+  risk sizing) that shares the swing path's agent graph and eligibility registry rather than
   duplicating or loosening it. Off by default; see [Scalping](#scalping-5m15m-trade-horizon).
 - **Self-improving memory** — a closed learn-from-losses loop classifies closed trades into
   lessons and tracks whether acting on them actually helped.
@@ -97,7 +108,7 @@ flowchart TB
         direction LR
         SUPPORT["Support Agents<br/>(News / Sentiment / Prediction)"]
         REGIME["Market Regime"]
-        STRATEGY["Strategy Selection<br/>(H-8 admission gate)"]
+        STRATEGY["Strategy Selection<br/>(eligible candidates only)"]
         VALIDATION["Signal Validation"]
         RISK["Risk & Compliance<br/>(deterministic)"]
         SUPPORT --> REGIME --> STRATEGY --> VALIDATION --> RISK
@@ -203,7 +214,7 @@ Each stage has a distinct responsibility:
 
 ## Safety Defaults
 
-The checked-in `.env.example` is deliberately conservative:
+The checked-in examples under `env/` are deliberately conservative:
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
@@ -253,7 +264,8 @@ uv sync --extra dev --extra web
 uv run python scripts/setup.py
 ```
 
-This creates `.env` from `.env.example` if it's missing, checks which keys are set, and
+This creates `env/.env.common` and `env/.env.nse` from their examples when missing,
+checks which keys are set, and
 prints a `[READY]` / `[ACTION]` checklist. Add your **free** Groq key
 ([console.groq.com/keys](https://console.groq.com/keys)) and Dhan credentials, then re-run it
 to confirm `[READY]`. Keep these safeguards in place while evaluating the system:
@@ -271,16 +283,55 @@ ENABLE_DHAN_QUOTES=true
 Also required: `STOCK_UNIVERSE_CSV_PATH` pointing to a CSV with a `symbol` column, and
 `DATABASE_URL` for PostgreSQL.
 
+### Local two-year candle store (recommended for ML)
+
+DeltaQuant can keep Dhan OHLCV in a dedicated local TimescaleDB database. Dhan is then
+used to seed and refresh the database; live ML scoring reads the stored candles instead
+of downloading a fresh training frame for every candidate. The store keeps native
+`5m`, `15m`, `1h`, and `1d` candles; `30m` and `4h` are derived locally.
+
+Start Docker Desktop, then run from PowerShell. Disabling Compose's automatic project
+`.env` parsing prevents unrelated application secrets from being interpreted as Compose
+variables:
+
+```powershell
+$env:COMPOSE_DISABLE_ENV_FILE = "1"
+docker compose -f compose.yml up -d market-history-db
+uv run python scripts/sync_market_history.py --years 2
+```
+
+(`compose.yml` also defines `deltaquant-postgres`, the app's main database --
+scoping to `market-history-db` here avoids needing `POSTGRES_PASSWORD` set for
+a workflow that doesn't touch it. Use `scripts/start_all.sh` to bring up both.)
+
+Use these NSE profile settings (documented in `env/.env.nse.example`):
+
+```dotenv
+MARKET_HISTORY_STORE_ENABLED=true
+MARKET_HISTORY_DATABASE_URL=postgresql://deltaquant:deltaquant_local_only@127.0.0.1:5433/deltaquant_history
+MARKET_HISTORY_AUTO_SYNC=true
+MARKET_HISTORY_LOOKBACK_DAYS=730
+MARKET_HISTORY_TIMEFRAMES=5m,15m,1h,1d
+MARKET_HISTORY_REFRESH_HOURS=6
+ML_HISTORY_BARS=3000
+```
+
+The first run is resumable and may take a long time for a 250-symbol universe. Later
+runs download only an overlapping tail and upsert revised candles. Bulk refresh waits
+until NSE is closed by default so it does not compete with live paper-trading scans.
+More history improves reproducibility and gives walk-forward validation more evidence;
+it does not by itself guarantee more accurate or profitable signals.
+
 ### 3. Run it
 
 ```bash
 uv run python scripts/check_config.py            # validate config first
-uv run --extra web python scripts/run_live_trading.py
+uv run --extra web deltaquant-nse
 ```
 
 The backend (trading loop + FastAPI/WebSocket dashboard API) runs in the foreground here —
 `Ctrl+C` stops it. It serves at `http://<WEB_UI_HOST>:<WEB_UI_PORT>` (default
-`127.0.0.1:8000`) once `ENABLE_WEB_UI=true` is set in `.env` (generate the login with
+`127.0.0.1:8000`) once `ENABLE_WEB_UI=true` is set in `env/.env.common` (generate the login with
 `scripts/set_dashboard_password.py` first — see [Scripts Reference](#scripts-reference)).
 Omit `--extra web` to run the trading loop with no dashboard backend at all — useful for a
 minimal headless install with no Node/FastAPI dependency surface.
@@ -305,10 +356,10 @@ either one without touching the other.
 
 | Action | Backend only | Frontend only | Both together |
 | --- | --- | --- | --- |
-| **Start** | `nohup uv run --extra web python scripts/run_live_trading.py > logs/backend.log 2>&1 &` | `cd web && nohup npm run dev > ../logs/frontend.log 2>&1 &` | `./scripts/start_all.sh` |
-| **Stop** | `kill $(cat run/backend.pid)` | `kill $(cat run/frontend.pid)` | `./scripts/stop_all.sh` |
-| **Status** | `kill -0 $(cat run/backend.pid) && echo running` | `kill -0 $(cat run/frontend.pid) && echo running` | same, for each PID file |
-| **Logs** | `tail -f logs/backend.log` | `tail -f logs/frontend.log` | both of the above |
+| **Start** | `nohup uv run --extra web deltaquant-nse > logs/nse/backend.log 2>&1 &` | `cd web && nohup npm run dev > ../logs/common/frontend.log 2>&1 &` | `./scripts/start_all.sh` |
+| **Stop** | `kill $(cat run/nse/backend.pid)` | `kill $(cat run/common/frontend.pid)` | `./scripts/stop_all.sh` |
+| **Status** | `kill -0 $(cat run/nse/backend.pid) && echo running` | `kill -0 $(cat run/common/frontend.pid) && echo running` | same, for each PID file |
+| **Logs** | `tail -f logs/nse/backend.log` | `tail -f logs/common/frontend.log` | both of the above |
 
 `scripts/start_all.sh` runs the same two commands as the "Backend only"/"Frontend only" start
 column, records each PID under `run/*.pid`, and is a no-op (prints "already running") if a
@@ -317,7 +368,7 @@ same PID files, sends `SIGTERM`, and removes the file; it prints "not running" (
 harmlessly) if a process already died some other way. If you ever start the backend or
 frontend manually (bypassing `start_all.sh`, e.g. by copy-pasting the "Backend only" command
 above), write the PID yourself so `stop_all.sh` can still find it later:
-`echo $! > run/backend.pid` (or `run/frontend.pid`) right after backgrounding it.
+`echo $! > run/nse/backend.pid` (or `run/common/frontend.pid`) right after backgrounding it.
 
 To pick up a code change, restart rather than reload — neither process watches for edits to
 `src/`/`scripts/` in a background run (the frontend's `npm run dev` does hot-reload its own
@@ -328,7 +379,7 @@ To pick up a code change, restart rather than reload — neither process watches
 ```
 
 **Common environment overrides at start time** (prepend to any of the start commands above,
-or set permanently in `.env`):
+or set permanently in the appropriate profile under `env/`):
 
 | Override | Effect |
 | --- | --- |
@@ -337,7 +388,7 @@ or set permanently in `.env`):
 | `FORCE_TRADING_WINDOW=true` | Bypasses the market-hours/weekday gate — **testing only**, see the loud warning it logs on startup. |
 | `TRADING_CYCLE_SECONDS=60` | Shortens the interval between agent-review cycles for faster iteration while developing. |
 
-Example: `SCALP_ENABLED=true SIGNAL_TIMEFRAMES=5m,15m,30m,1h,4h nohup uv run --extra web python scripts/run_live_trading.py > logs/backend.log 2>&1 &`
+Example: `SCALP_ENABLED=true SIGNAL_TIMEFRAMES=5m,15m,30m,1h,4h nohup uv run --extra web deltaquant-nse > logs/nse/backend.log 2>&1 &`
 
 ### Validate before you trade real money
 
@@ -357,15 +408,17 @@ can't capture circuit limits, gaps, or thin-name liquidity.
 
 | Script | Purpose |
 | --- | --- |
-| `scripts/setup.py` | Guided first-run setup: creates `.env`, checks keys, prints readiness |
-| `scripts/check_config.py` | Validates `.env` / settings without starting the trading loop |
-| `scripts/run_live_trading.py` | **Main entry point** — live/paper trading loop + dashboard |
-| `scripts/validate_strategy.py` | Out-of-sample walk-forward edge validation (H-8 admission gate) |
+| `scripts/setup.py` | Guided first-run setup: creates isolated profiles, checks keys, prints readiness |
+| `scripts/check_config.py` | Validates active env profiles/settings without starting the trading loop |
+| `uv run deltaquant-nse` | Canonical NSE live/paper worker + dashboard backend |
+| `scripts/run_live_trading.py` | Thin legacy launcher for `deltaquant-nse` only |
+| `scripts/validate_strategy.py` | Out-of-sample validation + paper-approved eligibility record |
 | `scripts/discover_signals.py` | On-demand quantitative signal-discovery run |
 | `scripts/backfill_signal_history.py` | Replays historical bars into the signal-history log |
 | `scripts/diagnose_risk.py` | Runs a synthetic signal through the risk engine to debug rejections |
 | `scripts/set_dashboard_password.py` | Generates the web UI login credentials |
 | `scripts/test_dhan_connection.py` | Verifies Dhan API credentials and connectivity |
+| `scripts/sync_market_history.py` | Resumable Dhan-to-Timescale/Postgres OHLCV backfill and refresh |
 | `scripts/start_all.sh` / `stop_all.sh` | Start/stop backend + frontend together on a VPS |
 
 ## Universe and Review Controls
@@ -396,7 +449,7 @@ budget still gates new LLM cycles regardless.
 | **Sentiment Agent** | Builds a market mood index (fear/greed). | Deterministic/hybrid |
 | **Prediction Agent** | Short-horizon ML direction estimates. | scikit-learn |
 | **Market Regime** | Classifies trending/ranging/volatile context. | Groq LLM |
-| **Strategy Selection** | Selects compatible strategies; enforces the H-8 admission gate. | Groq LLM |
+| **Strategy Selection** | Selects among candidates already passed by deterministic eligibility. | Groq LLM |
 | **Signal Validation** | Filters raw technical signals against the thesis. | Groq LLM |
 | **Risk & Compliance** | Enforces position, loss, exposure, and time rules. | Deterministic rules engine |
 
@@ -419,9 +472,9 @@ alignment matter far more on a 5-minute chart than they do for a multi-hour posi
 single strategy's long-run historical win rate matters less (regimes shift faster, sample
 sizes are smaller). Rather than bolt a `horizon` parameter onto the existing ranking formula
 and risk rules, scalping gets its **own** ranker, its **own** deterministic entry-quality
-evaluator, and its **own** admission grain in the H-8 registry — while reusing the *same*
-LangGraph agent nodes, the *same* risk-compliance checks, and the *same* execution/journal/
-exit-manager stack the swing path already relies on.
+evaluator and risk sizing, while reusing the *same* strategy/timeframe/model eligibility
+record across SCALP/SWING horizon metadata, the *same* LangGraph nodes, the *same*
+risk-compliance checks, and the *same* execution/journal/exit-manager stack.
 
 ### Pipeline
 
@@ -433,47 +486,49 @@ flowchart TB
     CONFIRM["Multi-timeframe confirmation<br/>(5m=execution 15m=primary 30m=directional<br/>1h=context 4h=optional macro)"]
     QUALITY["Entry-quality evaluator<br/>(VWAP/EMA9/ATR-extension/<br/>swing S-R/breakout-retest/volume/wicks)"]
     OPP["ScalpOpportunity"]
-    REGIME_FILTER["Regime pre-filter<br/>(cost filter only, pre-LLM)"]
+    ELIGIBILITY["StrategyEligibilityRegistry<br/>(strategy+timeframe+model version)"]
+    REGIME_FILTER["Runtime RegimePolicy<br/>(ALLOW / REDUCE / BLOCK)"]
     RANK["Scalp ranker<br/>(separate weighted formula)"]
     GRAPH["Same LangGraph pipeline<br/>trade_horizon=SCALP"]
-    H8{{"H-8 admission<br/>(strategy+timeframe+horizon+regime)"}}
+    ML["Validated ML overlay<br/>(when required/available)"]
     RISK["risk_compliance<br/>(scalp position-size cap)"]
     EXEC["ExecutionService / journal / exit_manager<br/>(unmodified, horizon-tagged idempotency key)"]
 
     SCAN --> CONSOL --> MATRIX --> CONFIRM --> QUALITY --> OPP
-    OPP --> REGIME_FILTER --> RANK --> GRAPH
-    GRAPH --> H8
-    H8 -->|"no artifact -> REJECT"| END1((End))
-    H8 -->|"admitted"| RISK --> EXEC
+    OPP --> ELIGIBILITY --> REGIME_FILTER --> RANK --> ML --> GRAPH
+    GRAPH --> RISK --> EXEC
+    ELIGIBILITY -->|"mode not approved"| END1((Record only / reject))
+    REGIME_FILTER -->|"BLOCK"| END1
 ```
 
 Every stage is visible in `dashboard.stats.scalp_funnel` each cycle — raw triggers →
-consolidated → mtf-confirmed → entry-quality-passed → regime-compatible → H-8 admitted →
+consolidated → mtf-confirmed → entry-quality-passed → registry eligible → regime policy →
 sent to AI → AI approved → execution accepted — so "why didn't this symbol trade" is always
 answerable from the dashboard, not a log dive. The web UI's **Scalp Decisions** tab renders
 the live per-symbol 5m/15m/30m/1h matrix, score, entry quality, preferred entry range, stop,
 target, expected R, and final decision.
 
-### H-8 stays fail-closed — extended, never bypassed
+### Strategy eligibility and runtime regime policy
 
-The strategy-admission registry's grain grew from just a strategy name to
-**strategy + timeframe + trade_horizon + regime + version**. Every artifact registered before
-this existed defaults to `trade_horizon="SWING"` and an unpinned timeframe, so it keeps
-admitting exactly what it always did — and can **never** match a `SCALP` request. A strategy
-only becomes eligible for live scalp trades once someone deliberately runs:
+`StrategyEligibilityRegistry` is keyed by **market + strategy + timeframe + model version**.
+`trade_horizon` remains decision/risk metadata and regime is evaluated separately against
+the record's `RegimePolicy`: `ALLOW`, `REDUCE_CONFIDENCE`, or `BLOCK`. A regime change does
+not load another admission artifact. Environment policy is explicit: research/backtest and
+simulated/shadow record non-executable outcomes; paper execution requires `PAPER_APPROVED`
+or `LIVE_APPROVED`; live execution requires `LIVE_APPROVED`.
+
+Run walk-forward validation with:
 
 ```bash
 uv run python scripts/validate_strategy.py --interval 5m --trade-horizon SCALP
 ```
 
-This walk-forward-validates the strategy on **real 5-minute bars** (previously, the
-validation path silently fetched and labeled everything as daily bars regardless of what was
-requested — fixed alongside this feature) and registers a version admissible only to matching
-`trade_horizon=SCALP` requests. Until that command has been run for a given strategy, every
-scalp candidate for it is rejected at H-8 with an explicit "no current VALIDATED registry
-artifact" reason — that's the gate working correctly, not a bug, and it's the same
-fail-closed backstop check #14 in `risk_compliance` enforces independently of
-`strategy_selection`'s own gate.
+This validates the strategy on **real 5-minute bars** and writes a `PAPER_APPROVED` record;
+promotion to `LIVE_APPROVED` is always an explicit operator action. Legacy strict-grain
+records are preserved and migrated conservatively. Conflicting horizon/regime evidence is
+never granted live approval automatically. `risk_compliance` independently rechecks the
+current eligibility and regime decision after Qwen, so an advisory model cannot promote a
+blocked strategy.
 
 ### What is and isn't horizon-specific
 
@@ -497,7 +552,7 @@ fail-closed backstop check #14 in `risk_compliance` enforces independently of
 | `SCALP_MIN_RR` / `SCALP_MIN_CONFIDENCE` | `1.5` / `0.6` | Fallback-validation bar — shipped equal to swing's hardcoded bar, never silently lower. |
 | `SCALP_MAX_ACTIVE_SYMBOLS` | `5` | Scalp analogue of `MAX_ACTIVE_STOCKS`. |
 
-See `.env.example` for the complete list, including the entry-quality thresholds
+See `env/.env.nse.example` for the complete list, including the entry-quality thresholds
 (`SCALP_VWAP_MAX_DISTANCE_PCT`, `SCALP_ATR_EXTENSION_MAX_MULTIPLE`, `SCALP_WICK_RATIO_MAX`, …)
 and the six `SCALP_RANKING_WEIGHT_*` fields (validated at startup to sum to ~1.0).
 
@@ -508,7 +563,7 @@ and the six `SCALP_RANKING_WEIGHT_*` fields (validated at startup to sum to ~1.0
 uv run python scripts/validate_strategy.py --interval 5m --trade-horizon SCALP
 
 # 2. Enable it and run.
-SCALP_ENABLED=true uv run --extra web python scripts/run_live_trading.py
+SCALP_ENABLED=true uv run --extra web deltaquant-nse
 ```
 
 Watch the activity log for `Scalp funnel: ...` lines each cycle, and open the **Scalp
@@ -532,7 +587,7 @@ local **Code Agent** compiles them as a restricted AST walk (never `exec`/`eval`
 **Eval Agent** computes cross-sectional Spearman Rank-IC against forward returns. Failed
 formulas receive Groq optimization feedback and retry. Only candidates clearing both
 `abs(IC) >= SIGNAL_DISCOVERY_IC_THRESHOLD` and a **Bonferroni-corrected** p-value bar are
-persisted under `data/discovered_signals/<timeframe>/`.
+persisted under `data/nse/discovered_signals/<timeframe>/`.
 
 When `SIGNAL_DISCOVERY_ENABLED=true`, accepted artifacts are re-validated at load, evaluated
 on the live cross-sectional Dhan panel, sign-inverted when IC is negative, standardized, and
@@ -622,7 +677,7 @@ Get trade and risk notifications on your phone:
 
 1. Create a bot via [`@BotFather`](https://t.me/BotFather) on Telegram.
 2. Get your chat ID via [`@userinfobot`](https://t.me/userinfobot).
-3. Add to `.env`:
+3. Add to `env/.env.common`:
 
 ```dotenv
 TELEGRAM_ENABLED=true
@@ -652,7 +707,7 @@ DeltaQuant/
 │   ├── agents/                    # 🧠 The "brain" — LangGraph nodes
 │   │   ├── graph.py                 # Builds the StateGraph, wires conditional edges
 │   │   ├── market_regime.py         # Groq: trending / ranging / volatile classification
-│   │   ├── strategy_selection.py    # Groq: active strategies + H-8 admission gate
+│   │   ├── strategy_selection.py    # Groq: selects among eligible candidates
 │   │   ├── signal_validation.py     # Groq: filters raw technical signals
 │   │   ├── risk_compliance.py       # Deterministic rules engine — final say on every order
 │   │   ├── news_analyst.py          # Google RSS sentiment scoring
@@ -695,6 +750,7 @@ DeltaQuant/
 │   ├── backtesting/                # 📈 Strategy testing
 │   │   ├── engine.py                # Backtest runner + compare_results scorecard
 │   │   ├── walk_forward.py          # OOS validation → VALIDATED / NOT VALIDATED verdict
+│   │   ├── strategy_eligibility.py  # Eligibility registry, regime policy, legacy migration
 │   │   └── strategies.py            # RealSignalStrategy (uses the live engine) + others
 │   ├── signal_discovery/           # 🔬 Quantitative signal-discovery workflow
 │   │   ├── workflow.py              # Signal / Code / Eval agent orchestration
@@ -733,15 +789,52 @@ DeltaQuant/
 │   └── lib/                        # WebSocket hooks, API client, IST-aware formatting
 ├── scripts/                    # 🏃 Entry points — see Scripts Reference above
 │   ├── setup.py                   # Guided one-command setup
-│   ├── run_live_trading.py        # Main application — trading loop + dashboard
-│   ├── validate_strategy.py       # OOS / walk-forward edge validation (H-8 gate)
+│   ├── run_live_trading.py        # Thin compatibility launcher for deltaquant-nse
+│   ├── validate_strategy.py       # OOS validation + eligibility record
 │   ├── check_config.py            # Config validator
 │   ├── diagnose_risk.py           # Replays a signal through the risk engine to debug rejections
 │   └── start_all.sh / stop_all.sh # VPS start/stop for backend + frontend
 ├── tests/                      # 🧪 pytest suite
 ├── docs/                       # 📖 Architecture and design documentation
-└── .env.example                # Full, documented configuration reference
+├── env/                        # Isolated common/NSE/Forex profiles and examples
 ```
+
+## Shared-Feature Production Strategies
+
+DeltaQuant evaluates ten additional technical strategy families inside the existing
+settled-candle `SignalEngine`: `ema_adx_trend`, `donchian_breakout`,
+`time_series_momentum`, `trend_pullback`, `supertrend_adx_ema`,
+`macd_trend_continuation`, `bollinger_rsi_mean_reversion`, `vwap_mean_reversion`,
+`opening_range_breakout`, and `relative_strength_momentum`.
+
+All evaluators read one cached `FeatureSnapshot`; none downloads history, recalculates an
+indicator, calls Qwen, sizes a position, or submits an order. The default matrix is:
+
+| Strategy | Timeframes |
+| --- | --- |
+| EMA + ADX trend | 15m, 30m, 1h, 4h |
+| Donchian breakout | 15m, 30m, 1h, 4h |
+| Time-series momentum | 1h, 4h |
+| Trend pullback | 15m, 30m, 1h, 4h |
+| SuperTrend + ADX + EMA | 15m, 30m, 1h, 4h |
+| MACD trend continuation | 30m, 1h, 4h |
+| Bollinger + RSI mean reversion | 15m, 30m, 1h |
+| VWAP mean reversion | 15m, 30m |
+| Opening-range breakout | 15m, 30m |
+| Relative-strength momentum | 1h, 4h |
+
+Override the matrix, thresholds, or component weights with the documented JSON settings
+in `env/.env.nse.example`. New grains are registered as `SHADOW`; implementation never grants
+paper/live eligibility. Validate locally with real settled Timescale candles:
+
+```bash
+uv run python scripts/validate_strategy.py --local-store --interval 15m --trade-horizon SCALP
+uv run python scripts/benchmark_production_strategies.py --runs 3
+```
+
+Session VWAP and opening ranges reset at the NSE boundary. Donchian bounds exclude the
+current candle. Market-relative ranks require exact timestamp alignment. Derived 30m/4h
+candles reuse the shared 09:15-anchored NSE resampler.
 
 ## Configuration Notes
 
@@ -778,8 +871,8 @@ uv run --extra dev mypy src                 # type-check (strict mode)
 
 ## Security
 
-- Never commit `.env` — it is gitignored, and `.env.example` is the tracked reference for
-  required variables.
+- Never commit actual profiles under `env/`; they are gitignored. The tracked
+  `env/*.example` files are the references for required variables.
 - All secrets (`GROQ_API_KEY`, `DHAN_ACCESS_TOKEN`, `DATABASE_URL`, etc.) are loaded via
   `pydantic-settings` `SecretStr` fields, never logged in plain text.
 - Report a vulnerability by opening a private security advisory on this repository rather

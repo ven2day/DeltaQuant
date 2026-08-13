@@ -3,13 +3,18 @@ from dataclasses import dataclass
 import pytest
 
 from src.agents.prediction import PredictionSignal
-from src.market.indicators import Timeframe
-from src.market.signal_ranking import rank_signals, select_diversified_signals
-from src.market.signals import (
+from src.core.candidates import (
     SignalStrength,
     SignalType,
     StrategyType,
     TradingSignal,
+)
+from src.core.indicators import Timeframe
+from src.markets.nse.strategies.signal_ranking import (
+    rank_signals,
+    select_diversified_signals,
+    select_stage1_candidates,
+    technical_pre_rank,
 )
 
 
@@ -48,9 +53,7 @@ def _signal(
         risk_reward_ratio=risk_reward,
         position_size_pct=5.0,
         confidence=confidence,
-        indicators={
-            "trend": {"adx": 30.0, "plus_di": 28.0, "minus_di": 12.0}
-        },
+        indicators={"trend": {"adx": 30.0, "plus_di": 28.0, "minus_di": 12.0}},
     )
 
 
@@ -117,9 +120,9 @@ def test_discovered_signal_tilt_is_scoped_to_its_timeframe():
     assert by_timeframe[Timeframe.H1].discovered_signal_tilt == 0.0
 
 
-def test_diversified_selection_limits_symbols_and_signals(monkeypatch):
+def test_ranking_does_not_discard_valid_opportunities_with_portfolio_caps(monkeypatch):
     monkeypatch.setattr(
-        "src.market.signal_ranking.get_stock_sector",
+        "src.markets.nse.strategies.signal_ranking.get_stock_sector",
         lambda symbol: {"A": "Tech", "B": "Tech", "C": "Bank"}[symbol],
     )
     signals = [_signal("A"), _signal("A"), _signal("B"), _signal("C")]
@@ -129,4 +132,22 @@ def test_diversified_selection_limits_symbols_and_signals(monkeypatch):
         ranked, max_symbols=2, max_per_sector=1, max_signals_per_symbol=1
     )
 
-    assert [item.signal.symbol for item in selected] == ["A", "C"]
+    assert [item.signal.symbol for item in selected] == ["A", "B", "C"]
+
+
+def test_stage1_keeps_all_unique_symbol_timeframe_candidates(monkeypatch):
+    monkeypatch.setattr("src.markets.nse.strategies.signal_ranking.get_stock_sector", lambda symbol: "Unknown")
+    signals = []
+    for index in range(272):
+        symbol = f"S{index:03d}"
+        signals.extend([_signal(symbol), _signal(symbol)])
+
+    selected = select_stage1_candidates(
+        technical_pre_rank(signals, _Tracker()),
+        max_candidates=25,
+        max_per_sector=3,
+    )
+
+    keys = {(item.signal.symbol, item.signal.timeframe.value) for item in selected}
+    assert len(selected) == 272
+    assert len(keys) == 272

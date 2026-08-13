@@ -22,8 +22,8 @@ package is `src` (all internal imports are `from src.<module> import ...`).
 uv sync                         # install runtime deps
 uv sync --extra dev             # install dev deps (pytest, ruff, mypy)
 
-uv run python scripts/check_config.py       # validate .env / settings (run this first)
-uv run python scripts/run_live_trading.py   # MAIN entry point: live/sim dashboard + paper execution
+uv run python scripts/check_config.py       # validate active env profiles/settings first
+uv run deltaquant-nse                       # canonical NSE dashboard + paper runtime
 uv run python src/backtesting/engine.py     # run a backtest
 
 # pytest/ruff/mypy live in the `dev` optional group — pass --extra dev (or `uv sync --extra dev` once).
@@ -104,7 +104,7 @@ consumer, read with `isinstance`/`.get(...)` guards so a stray type never crashe
 ### Configuration
 
 All config is centralized in [src/config/settings.py](src/config/settings.py): a
-pydantic-settings `Settings` model loaded from `.env`. Access it **only** through the cached
+pydantic-settings `Settings` adapter loaded from `env/.env.common` plus one market profile. Access it **only** through the cached
 `get_settings()`; use `reload_settings()` to clear the cache. Secrets are `SecretStr` —
 read them with `.get_secret_value()`. The `@model_validator` (`validate_configuration`) is
 two-tier: benign cross-field inconsistencies (risk-param sanity, market-hours ordering,
@@ -112,7 +112,7 @@ Telegram config) are collected as warnings and logged, same as before; but the n
 explicit hazardous-combination matrix (trading_mode/execution_mode/allow_live_orders/Dhan
 creds that could reach a real broker order, plus `MAX_QUOTE_STALENESS_SECONDS=0` on a
 live-quote profile) **raises `ValueError` and fails startup** instead of degrading — see
-C-2/M-5/H-10 in `DeltaQuant-Quant-Risk-Review.md`. `resolve_effective_execution_mode()`
+C-2/M-5/H-10 in `docs/audits/DeltaQuant-Quant-Risk-Review.md`. `resolve_effective_execution_mode()`
 (same module) is the single source of truth for which execution mode is actually in effect;
 `scripts/check_config.py` and `ExecutionService._resolve_mode()` both call it rather than
 re-deriving the conjunction.
@@ -123,7 +123,7 @@ reach a live route, see below), `trading_mode` (`paper`|`live`), `enable_news_an
 
 ### Pluggable data & execution layers
 
-- **Market data** — [src/market/manager.py](src/market/manager.py) `MarketDataManager`
+- **Market data** — [src/markets/nse/market_data/manager.py](src/markets/nse/market_data/manager.py) `MarketDataManager`
   auto-selects WebSocket (live Dhan) or simulated data based on `is_market_open()` and
   connection availability. Indicators (`ta` library) are computed in
   `indicators.py`; `signals.py` `SignalEngine` turns them into signals; `stock_discovery.py`
@@ -141,12 +141,12 @@ reach a live route, see below), `trading_mode` (`paper`|`live`), `enable_news_an
     `SignalEngine._directional_confidence` blends the strategy's base with how many independent
     indicators (RSI/MACD/DI/price-vs-MA) agree with the direction, not a hardcoded constant.
     The live loop sizes entries with the real `PositionSizer`
-    ([sizing.py](src/market/sizing.py)) off `risk_per_trade` + the stop distance (Kelly when a
+    ([sizing.py](src/markets/nse/risk/sizing.py)) off `risk_per_trade` + the stop distance (Kelly when a
     strategy win-rate exists), **not** a flat % of cash. Agent prompts ask for *calibrated*
     confidence and to weigh the news/mood/ML enrichment.
-- **Execution** — [src/execution/service.py](src/execution/service.py) `ExecutionService` is
+- **Execution** — [src/markets/nse/execution/service.py](src/markets/nse/execution/service.py) `ExecutionService` is
   the single mode-switched entry point the live loop uses to place orders. It wraps
-  `paper_engine.py` (and, later, the broker in [adapter.py](src/execution/adapter.py):
+  `paper_engine.py` (and, later, the broker in [adapter.py](src/markets/nse/execution/adapter.py):
   `ExecutionAdapter` for DhanHQ, imported lazily). `exit_manager.py` handles trailing stops /
   time exits / partial profits; `journal.py` logs trade history.
   - **Execution safety (do not regress):** every `submit(...)` carries an `idempotency_key`;
@@ -159,13 +159,13 @@ reach a live route, see below), `trading_mode` (`paper`|`live`), `enable_news_an
     request **never silently downgrades**: without `trading_mode=live` **and**
     `allow_live_orders=True` (default-off master gate) **and** valid Dhan creds, it resolves to
     SHADOW with a loud warning/error naming which condition failed. Live submission goes
-    through `submit_async` → `LiveBrokerExecutor` ([live_executor.py](src/execution/live_executor.py)),
+    through `submit_async` → `LiveBrokerExecutor` ([live_executor.py](src/markets/nse/execution/live_executor.py)),
     which submits then **polls `get_order_status` to a terminal fill** (never assumes PLACED ==
     filled); `reconcile_positions` checks local vs broker positions at startup (broker = source
     of truth). `ExecutionService.real_orders_active` is the one place to check whether a given
     instance can actually place a real order (effective mode LIVE + broker_executor attached).
   - **Paper engine realism (do not regress):** `LocalPaperEngine` fills through a
-    [`CostModel`](src/execution/costs.py) (slippage + NSE-style brokerage/STT/GST, all
+    [`CostModel`](src/markets/nse/execution/costs.py) (slippage + NSE-style brokerage/STT/GST, all
     configurable via `paper_*` settings; pass `CostModel.zero()` for ideal fills in unit
     tests). `place_order` does proper **long/short/partial** accounting: an opposite-side
     order closes/covers (FIFO) and only the remainder opens a new position; realized P&L is
@@ -177,9 +177,9 @@ reach a live route, see below), `trading_mode` (`paper`|`live`), `enable_news_an
 
 ### Local signal ranking (replaces the old universe screener)
 
-`src/market/universe_screener.py` (a deterministic pullback/trend/RSI filter) was **removed —
+The former legacy universe screener (a deterministic pullback/trend/RSI filter) was **removed —
 do not resurrect it or re-add the import**. The live loop now runs `SignalEngine` on every
-symbol × every `signal_timeframes` entry unconditionally, then [signal_ranking.py](src/market/signal_ranking.py)
+symbol × every `signal_timeframes` entry unconditionally, then [signal_ranking.py](src/markets/nse/strategies/signal_ranking.py)
 `rank_signals()` blends technical confidence, `PredictionAgent` ML direction agreement,
 sample-smoothed historical win rate per strategy/regime, and `expected_r = p*RR - (1-p)` into
 a rank score; `select_diversified_signals()` then applies the sector cap and
@@ -193,57 +193,58 @@ behind `settings.scalp_enabled` (default **False** — with it off, behavior is 
 to before this feature existed). The swing path above is never modified by any of this; every
 scalp module is either new or an additive extension of an existing one.
 
-**Pipeline** (`src/market/scalp_scan.py` `run_scalp_scan()`, called once per cycle from
-`scripts/run_live_trading.py`'s "Step 2b/2c/2d", separately from the swing scan): a **second**
+**Pipeline** (`src/markets/nse/strategies/scalp_scan.py` `run_scalp_scan()`, called once per cycle from
+`src/markets/nse/runtime/live.py`'s "Step 2b/2c/2d", separately from the swing scan): a **second**
 `SignalEngine` instance (tighter `scalp_stop_loss_pct`/`scalp_target_pct`) runs across the
 **full** `scalp_confirmation_timeframes` set (default `5m,15m,30m,1h,4h` — every role needs its
 own strategy-driven signals, not just the origination timeframe) →
-[signal_consolidation.py](src/market/signal_consolidation.py) `consolidate_signals()` merges
+[signal_consolidation.py](src/core/aggregation/consolidation.py) `consolidate_signals()` merges
 multiple strategies agreeing on the same symbol+timeframe+direction into one
 `ConsolidatedSignal` (confidence boosted by agreement, capped, never fabricated from
-nothing) → [assessment_matrix.py](src/market/assessment_matrix.py) `build_assessment_matrix()`
+nothing) → [assessment_matrix.py](src/markets/nse/strategies/assessment_matrix.py) `build_assessment_matrix()`
 produces one BUY/WAIT/REJECT `TimeframeAssessment` per timeframe, using **that timeframe's own
 locally-inferred regime** (via `signal_ranking.infer_signal_regime`), not one regime label
 collapsed across the whole cycle — a cell can never read "BUY" unless
-[regime_compatibility.py](src/market/regime_compatibility.py) `is_regime_compatible()` says
+[regime_compatibility.py](src/markets/nse/strategies/regime_compatibility.py) `is_regime_compatible()` says
 that strategy fits that timeframe's own regime, and can never read "BUY" for a SELL-dominant
 cell (this system only ever labels long-only entries) →
-[scalp_confirmation.py](src/market/scalp_confirmation.py) `confirm_multi_timeframe()` checks
+[scalp_confirmation.py](src/markets/nse/strategies/scalp_confirmation.py) `confirm_multi_timeframe()` checks
 role alignment (5m=execution, 15m=primary, 30m=directional, 1h=context, 4h=optional macro via
 `scalp_macro_filter_enabled`) against `scalp_required_mtf_alignment`, failing closed on any
 timeframe with no data at all (never "assume aligned") →
-[entry_quality.py](src/market/entry_quality.py) `evaluate_entry_quality()` — deterministic
+[entry_quality.py](src/markets/nse/strategies/entry_quality.py) `evaluate_entry_quality()` — deterministic
 VWAP/EMA9/ATR-extension/swing-support-resistance/breakout-retest/relative-volume/wick checks
-(reusing [price_geometry.py](src/market/price_geometry.py)'s helpers, kept separate from
+(reusing [price_geometry.py](src/markets/nse/strategies/price_geometry.py)'s helpers, kept separate from
 `candidate_policy.py` so the swing path's evaluator is never touched) — returns
 ENTER_NOW/WAIT_PULLBACK/WAIT_BREAKOUT/REJECT plus a preferred entry range → surviving
-candidates become [scalp_opportunity.py](src/market/scalp_opportunity.py) `ScalpOpportunity`
+candidates become [scalp_opportunity.py](src/markets/nse/strategies/scalp_opportunity.py) `ScalpOpportunity`
 objects (the one canonical object carried scanner → ranker → agents → UI → execution) →
-`regime_compatibility.filter_regime_compatible()` is a **cost filter only** (never a
-substitute for H-8; it has no import of `StrategyRegistry` at all) run before any LLM call →
-[scalp_ranking.py](src/market/scalp_ranking.py) `rank_scalp_opportunities()` — a **separate**
+`regime_compatibility.filter_regime_compatible()` is an advisory compatibility helper; the
+authoritative runtime regime decision comes from `StrategyEligibilityRegistry` before any
+candidate-specific LLM call →
+[scalp_ranking.py](src/markets/nse/strategies/scalp_ranking.py) `rank_scalp_opportunities()` — a **separate**
 weighted formula from swing's `rank_signals()` (`settings.scalp_ranking_weight_*`, validated
 to sum to ~1.0 at startup), not a horizon parameter bolted onto the swing formula.
 
-**H-8 stays fail-closed, extended not bypassed**
-([strategy_registry.py](src/backtesting/strategy_registry.py)): `StrategyVersion` gained
-`timeframe`/`trade_horizon` fields (trailing defaults `""`/`"SWING"`, so every pre-existing
-on-disk artifact loads unchanged and can only ever match a SWING request — it can never
-silently admit a SCALP one). `strategy_selection_node`'s gate and `risk_compliance_node`'s
-check #14 both now pass the cycle's `trade_horizon` through. Scalp survivors are sent through
+**Strategy eligibility stays environment-aware and fail-closed for live execution**
+([strategy_eligibility.py](src/backtesting/strategy_eligibility.py)): registry identity is
+`strategy_name + timeframe + model_version`. Trade horizon is diagnostic metadata, and
+current regime is evaluated separately using `ALLOW`, `REDUCE_CONFIDENCE`, or `BLOCK` policy.
+`strategy_selection_node` and `risk_compliance_node` both enforce the eligibility decision;
+only `LIVE_APPROVED` can execute in LIVE and only `PAPER_APPROVED`/`LIVE_APPROVED` can execute
+in PAPER. Research/simulated candidates continue as non-executable evidence. Legacy strict-
+grain records remain readable only as migration input and can never be promoted silently to
+live approval. Scalp survivors are sent through
 the **existing** LangGraph pipeline a second time per cycle (`run_trading_cycle(...,
 trade_horizon="SCALP")`) — zero new graph nodes. `signal_validation.py`'s LLM-unavailable
 fallback threshold (`rr_ratio`/`confidence`) is horizon-selectable
 (`scalp_min_rr`/`scalp_min_confidence`) but ships **numerically equal** to swing's hardcoded
 1.5/0.6 — this only makes the bar parameterizable, it never silently lowers it.
 `RiskLimits.from_settings(trade_horizon=...)` swaps in `scalp_max_position_pct` for check #3
-only; every other check (exposure, daily caps, drawdown, correlation, and H-8 itself) is
-identical regardless of horizon. **No `SCALP`-horizon registry artifact exists until someone
-deliberately runs** `uv run python scripts/validate_strategy.py --interval 5m --trade-horizon
-SCALP` (an operational step, not a code change — see `RealSignalStrategy`'s `timeframe` param
-and `BacktestEngine`'s `interval`-aware Sharpe annualization, both previously hardcoded to
-daily) — until then every scalp candidate fails closed at H-8 with an explicit "no current
-VALIDATED registry artifact" reason, which is the gate working correctly, not a bug.
+only; every other check (exposure, daily caps, drawdown, correlation, eligibility, and kill
+switches) remains deterministic. Run `uv run python scripts/validate_strategy.py --interval
+5m --trade-horizon SCALP` to produce a versioned eligibility record; the horizon is retained
+for validation lineage but is not part of mandatory registry or model identity.
 
 **Execution** reuses `ExecutionService.submit_async`/`lifecycle_store`/`exit_manager`/`journal`
 exactly as swing does — none of those modules were modified. Position sizing uses
@@ -258,7 +259,7 @@ namespaced free-text key is the correct fix for keeping scalp/swing track record
 colliding, not a schema change.
 
 **Funnel observability**: `dashboard.stats.scalp_funnel` (raw_triggers → consolidated →
-mtf_candidates → entry_quality_passed → regime_compatible → h8_admitted → sent_to_ai →
+mtf_candidates → entry_quality_passed → registry_eligible → regime_allowed → sent_to_ai →
 ai_approved → execution_accepted) and `scalp_opportunities` (top-ranked, per-cycle) are plain
 `TradingStats` fields, auto-serialized by the existing `stats_to_dict()` — surfaced in the web
 UI's "Scalp Decisions" tab ([ScalpDecisionTable.tsx](web/components/ScalpDecisionTable.tsx)).
@@ -382,7 +383,7 @@ the `rich` terminal UI. `notifications/telegram.py` sends trade alerts.
   include the `sys.path` line so it works regardless of the working directory.
 - **Graph nodes return partial state dicts**, never the full state; let LangGraph merge.
 - **Never let an LLM/agent failure propagate** — return a fallback, matching existing agents.
-- **Market-hour decisions use IST, not host-local time.** Use `src/utils/market_time.py`
+- **Market-hour decisions use IST, not host-local time.** Use `src/core/utils/market_time.py`
   (`now_ist()`, `is_market_hours()`, `IST`) — never bare `datetime.now()` — for `is_market_open()`
   and the risk engine's trading-hours check. IST is a fixed UTC+05:30 offset (NSE has no DST), so
   this stays correct on a UTC cloud host / CI runner.

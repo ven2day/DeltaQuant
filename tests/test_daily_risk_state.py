@@ -2,8 +2,8 @@
 
 from datetime import datetime
 
-from src.risk import daily_state as daily_state_module
-from src.risk.daily_state import DailyRiskStore
+from src.markets.nse.risk import daily_state as daily_state_module
+from src.markets.nse.risk.daily_state import DailyRiskStore
 
 
 def test_get_today_on_fresh_store_returns_zeros(tmp_path):

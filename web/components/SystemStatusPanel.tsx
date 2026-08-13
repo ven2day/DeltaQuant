@@ -5,13 +5,18 @@ import {
   Brain,
   Database,
   LineChart,
+  ListChecks,
   type LucideIcon,
   RefreshCw,
+  Server,
   ShieldCheck,
 } from "lucide-react";
+import { useEffect, useState } from "react";
+import { apiFetch } from "@/lib/api";
 import { useSystemHealth } from "@/lib/useSystemHealth";
+import { useSystemJobs } from "@/lib/useSystemJobs";
 import { formatLocalTime } from "@/lib/formatTime";
-import type { ServiceHealthEntry } from "@/lib/types";
+import type { BackgroundJobStatus, LocalServiceEntry, ServiceHealthEntry } from "@/lib/types";
 import { Badge } from "./ui/Badge";
 import { Card } from "./ui/Card";
 
@@ -85,8 +90,174 @@ function ServiceTile({ name, entry }: { name: string; entry: ServiceHealthEntry 
   );
 }
 
+const LOCAL_SERVICE_META: Record<string, { label: string; hint: string }> = {
+  backend: { label: "Backend", hint: "Trading loop + FastAPI/WebSocket" },
+  frontend: { label: "Frontend", hint: "Next.js dashboard" },
+  postgres: { label: "PostgreSQL", hint: "Wallet, positions, trade journal" },
+  timescaledb: { label: "TimescaleDB", hint: "Market history candles" },
+};
+
+function LocalServiceTile({ entry }: { entry: LocalServiceEntry }) {
+  const meta = LOCAL_SERVICE_META[entry.name] ?? { label: entry.name, hint: "" };
+  const tone: "good" | "warning" | "critical" = entry.running
+    ? "good"
+    : entry.required
+      ? "critical"
+      : "warning";
+  return (
+    <div className="flex items-start justify-between gap-2 rounded-lg border border-border p-3">
+      <div className="min-w-0">
+        <div className="text-sm font-medium text-ink-primary">{meta.label}</div>
+        <div className="truncate text-xs text-ink-muted" title={entry.detail}>
+          {entry.detail}
+        </div>
+      </div>
+      <Badge label={entry.running ? "RUNNING" : "STOPPED"} tone={tone} />
+    </div>
+  );
+}
+
+const JOB_META: Record<string, { label: string; hint: string }> = {
+  strategy_validation: { label: "Strategy Validation", hint: "Walk-forward eligibility gate" },
+  scalp_training: { label: "Scalp ML Training", hint: "Candidate prediction artifacts" },
+  signal_discovery: { label: "Signal Discovery", hint: "LLM-driven alpha research" },
+};
+
+function JobStateBadge({ job }: { job: BackgroundJobStatus }) {
+  if (job.state === "running") return <Badge label="RUNNING" tone="warning" dot pulse />;
+  if (job.state === "never_run") return <Badge label="NEVER RUN" tone="neutral" />;
+  if (job.last_run_failed) return <Badge label="FAILED" tone="critical" />;
+  return <Badge label={job.stale ? "STALE" : "UP TO DATE"} tone={job.stale ? "warning" : "good"} />;
+}
+
+function jobDetail(job: BackgroundJobStatus): string {
+  if (job.hours_since_run == null) return "Never run";
+  const age =
+    job.hours_since_run < 1
+      ? `${Math.round(job.hours_since_run * 60)}m ago`
+      : `${job.hours_since_run.toFixed(1)}h ago`;
+  return `Last run ${age} · auto every ${job.refresh_interval_hours}h (${job.enabled ? "on" : "off"})`;
+}
+
+function JobRow({
+  name,
+  job,
+  onRun,
+}: {
+  name: string;
+  job: BackgroundJobStatus;
+  onRun: (name: string) => void;
+}) {
+  const meta = JOB_META[name] ?? { label: name, hint: "" };
+  const running = job.state === "running";
+  return (
+    <div className="flex items-start justify-between gap-2 rounded-lg border border-border p-3">
+      <div className="min-w-0">
+        <div className="text-sm font-medium text-ink-primary">{meta.label}</div>
+        <div className="truncate text-xs text-ink-muted">{jobDetail(job)}</div>
+        {job.intervals && (
+          <div className="mt-1 flex flex-wrap gap-1">
+            {Object.entries(job.intervals).map(([interval, status]) => (
+              <span
+                key={interval}
+                className="rounded bg-white/5 px-1.5 py-0.5 text-[10px] text-ink-muted"
+                title={status}
+              >
+                {interval}
+              </span>
+            ))}
+          </div>
+        )}
+      </div>
+      <div className="flex shrink-0 flex-col items-end gap-1.5">
+        <JobStateBadge job={job} />
+        <button
+          type="button"
+          onClick={() => onRun(name)}
+          disabled={running}
+          className="text-[11px] text-ink-muted underline decoration-dotted transition-colors hover:text-ink-primary disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          Run now
+        </button>
+      </div>
+    </div>
+  );
+}
+
+interface RegistryRow {
+  validation_status?: string;
+}
+
+function BackgroundJobsSection() {
+  const { jobs, runJobNow } = useSystemJobs();
+  const [swingModelCount, setSwingModelCount] = useState<number | null>(null);
+  const [validationCounts, setValidationCounts] = useState<Record<string, number> | null>(null);
+
+  useEffect(() => {
+    apiFetch("/api/models/status")
+      .then((res) => (res.ok ? (res.json() as Promise<RegistryRow[]>) : []))
+      .then((rows) => setSwingModelCount(rows.length))
+      .catch(() => setSwingModelCount(null));
+    apiFetch("/api/validation/status")
+      .then((res) => (res.ok ? (res.json() as Promise<RegistryRow[]>) : []))
+      .then((rows) => {
+        const counts: Record<string, number> = {};
+        for (const row of rows) {
+          const status = row.validation_status ?? "UNKNOWN";
+          counts[status] = (counts[status] ?? 0) + 1;
+        }
+        setValidationCounts(counts);
+      })
+      .catch(() => setValidationCounts(null));
+  }, [jobs?.background_jobs.strategy_validation.last_run_at]);
+
+  if (!jobs) return null;
+  const { background_jobs: bg } = jobs;
+
+  return (
+    <div>
+      <div className="mb-2 flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-ink-muted">
+        <ListChecks size={12} />
+        Background Jobs
+      </div>
+      <div className="space-y-2">
+        <JobRow name="strategy_validation" job={bg.strategy_validation} onRun={runJobNow} />
+        {validationCounts && (
+          <div className="flex flex-wrap gap-x-3 pl-3 text-[11px] text-ink-muted">
+            {Object.entries(validationCounts).map(([status, count]) => (
+              <span key={status}>
+                {status}: {count}
+              </span>
+            ))}
+          </div>
+        )}
+        <JobRow name="scalp_training" job={bg.scalp_training} onRun={runJobNow} />
+        <div className="flex items-start justify-between gap-2 rounded-lg border border-border p-3">
+          <div className="min-w-0">
+            <div className="text-sm font-medium text-ink-primary">Swing ML Training</div>
+            <div className="text-xs text-ink-muted">
+              {swingModelCount === null
+                ? "Loading…"
+                : swingModelCount === 0
+                  ? "Never trained — run scripts/train_prediction_artifact.py manually " +
+                    "with a prepared dataset (not auto-run)"
+                  : `${swingModelCount} active model(s)`}
+            </div>
+          </div>
+          <Badge
+            label={swingModelCount ? "TRAINED" : "NEVER TRAINED"}
+            tone={swingModelCount ? "good" : "neutral"}
+          />
+        </div>
+        <JobRow name="signal_discovery" job={bg.signal_discovery} onRun={runJobNow} />
+      </div>
+    </div>
+  );
+}
+
 export function SystemStatusPanel() {
   const { health, loading, error, runFullCheck } = useSystemHealth();
+  const { jobs } = useSystemJobs();
 
   const byName = new Map((health?.services ?? []).map((s) => [s.name, s]));
   const overallTone = health ? (STATUS_TONE[health.status] ?? "neutral") : "neutral";
@@ -142,6 +313,19 @@ export function SystemStatusPanel() {
           )}
 
           <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+            {jobs && (
+              <div>
+                <div className="mb-2 flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-ink-muted">
+                  <Server size={12} />
+                  Local Services
+                </div>
+                <div className="space-y-2">
+                  {jobs.local_services.map((entry) => (
+                    <LocalServiceTile key={entry.name} entry={entry} />
+                  ))}
+                </div>
+              </div>
+            )}
             {CATEGORIES.map((category) => {
               const Icon = category.icon;
               return (
@@ -159,6 +343,8 @@ export function SystemStatusPanel() {
               );
             })}
           </div>
+
+          <BackgroundJobsSection />
         </div>
       )}
     </Card>

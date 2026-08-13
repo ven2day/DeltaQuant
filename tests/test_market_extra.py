@@ -2,14 +2,14 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from src.market.indicators import (
+from src.core.candidates import SignalEngine, SignalType, StrategyType
+from src.core.indicators import (
     IndicatorConfig,
     IndicatorResult,
     Timeframe,
     aggregate_candles,
     calculate_indicators,
 )
-from src.market.signals import SignalEngine, SignalType, StrategyType
 
 # --- Indicators Tests ---
 

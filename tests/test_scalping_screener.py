@@ -1,4 +1,4 @@
-"""Tests for the zigzag-based scalping screener (src/market/scalping_screener.py)."""
+"""Tests for the zigzag-based scalping screener (src/markets/nse/universe/scalping_screener.py)."""
 
 import asyncio
 import contextlib
@@ -7,8 +7,8 @@ from unittest.mock import patch
 import pandas as pd
 import pytest
 
-from src.market.indicators import Timeframe
-from src.market.scalping_screener import (
+from src.core.indicators import Timeframe
+from src.markets.nse.universe.scalping_screener import (
     ScalpingScreenerTracker,
     compute_scalping_candidates,
     compute_zigzag_swings,
@@ -157,7 +157,7 @@ def test_h1_scores_on_the_continuous_series_not_per_day():
     # per-day grouping would exclude every single day (this is exactly the bug found
     # live). Continuous scoring must still produce a result by walking the whole series
     # at once.
-    from src.market.scalping_screener import _score_timeframe
+    from src.markets.nse.universe.scalping_screener import _score_timeframe
 
     # Chain across days: 2000 -> 2020 -> 2000 -> 2020 -> ... completes a swing every 2 days.
     closes = [2000.0, 2020.0] * len(_DAYS)
@@ -303,7 +303,7 @@ async def test_tracker_reports_success_via_on_status():
         refresh_seconds=999,
         on_status=lambda msg, level: calls.append((msg, level)),
     )
-    with patch("src.market.scalping_screener.compute_scalping_candidates", return_value=[]):
+    with patch("src.markets.nse.universe.scalping_screener.compute_scalping_candidates", return_value=[]):
         await _run_one_cycle(tracker)
 
     assert calls
@@ -318,7 +318,7 @@ async def test_tracker_reports_failure_via_on_status():
         on_status=lambda msg, level: calls.append((msg, level)),
     )
     with patch(
-        "src.market.scalping_screener.compute_scalping_candidates",
+        "src.markets.nse.universe.scalping_screener.compute_scalping_candidates",
         side_effect=RuntimeError("boom"),
     ):
         await _run_one_cycle(tracker)
@@ -336,7 +336,7 @@ async def test_tracker_accepts_simulated_historical_feed():
         feed=feed,
         data_source="simulated",
     )
-    with patch("src.market.scalping_screener.compute_scalping_candidates", return_value=[]) as scan:
+    with patch("src.markets.nse.universe.scalping_screener.compute_scalping_candidates", return_value=[]) as scan:
         await _run_one_cycle(tracker)
 
     assert scan.call_args.args[0] is feed

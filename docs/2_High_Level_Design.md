@@ -157,15 +157,16 @@ flowchart LR
     G2 --> H2[Regime pre-filter, cost only]
     H2 --> I2[Scalp ranker]
     I2 --> J[Same agent graph, trade_horizon=SCALP]
-    J --> K[H-8 admission: strategy+timeframe+horizon+regime]
+    J --> K[Strategy eligibility: strategy+timeframe+model version]
     K --> L[Same risk and execution gates]
 ```
 
-The H-8 strategy-admission registry gained real grain for this — **strategy + timeframe +
-trade_horizon + regime + version** instead of just a strategy name — so a strategy validated
-only on swing/daily bars can never silently admit a scalp trade. No `SCALP`-horizon artifact
-exists until `scripts/validate_strategy.py --interval 5m --trade-horizon SCALP` is run
-deliberately; until then every scalp candidate fails closed at admission.
+The `StrategyEligibilityRegistry` uses **strategy + timeframe + model version**. Trade horizon
+is retained as decision/validation lineage but does not create another mandatory artifact.
+Current regime is evaluated independently at runtime through an `ALLOW`,
+`REDUCE_CONFIDENCE`, or `BLOCK` policy stored with regime-specific validation statistics.
+Environment policy controls executability: simulated/research evidence stays non-executable,
+PAPER requires paper/live approval, and LIVE requires explicit live approval.
 
 ## Operations
 

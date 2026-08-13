@@ -21,7 +21,7 @@ except ValidationError as exc:
     print("\n[BLOCKED] Configuration failed a fail-closed safety check and refused to start:\n")
     print(str(exc))
     print("\n" + "=" * 50)
-    print("[ERROR] Fix the setting(s) above in .env, then re-run this check.")
+    print("[ERROR] Fix the setting(s) in env/.env.common or the active market profile.")
     print("=" * 50)
     sys.exit(1)
 
@@ -37,6 +37,7 @@ print(f"DhanHQ API:       {'[OK]' if dhan_ok else '[Not configured - optional]'}
 print(f"\nData Source:      {s.market_data_source}")
 print(f"Trading Mode:     {s.trading_mode}")
 print(f"Execution Mode:   {s.execution_mode}  (requested)")
+print(f"Paper Data Mode:  {s.paper_execution_mode}")
 
 # Resolved effective mode: the same conjunction ExecutionService applies at runtime
 # (trading_mode=live AND allow_live_orders AND Dhan credentials), so an operator can
@@ -54,6 +55,10 @@ print(f"REAL ORDERS:      {'[YES] -- genuine broker orders CAN be placed' if rea
 print(f"Paper Wallet:     Rs.{s.paper_wallet_balance:,.0f}")
 print(f"News Analysis:    {'[Enabled]' if s.enable_news_analysis else '[Disabled]'}")
 print(f"Scalping:         {'[Enabled]' if s.scalp_enabled else '[Disabled]'}")
+print(f"ML Predictions:   {'[Enabled]' if s.ml_predictions_enabled else '[Disabled] (soft signal only -- eligibility gate is unaffected)'}")
+print(
+    f"Paper Stat Gate:  {'[Enabled] only PAPER_APPROVED/LIVE_APPROVED strategies can trade' if s.strategy_eligibility_paper_gate_enabled else '[DISABLED] -- ALL strategies trade paper capital regardless of walk-forward verdict'}"
+)
 
 # Telegram
 telegram_ok = bool(getattr(s, "telegram_bot_token", None) and getattr(s, "telegram_chat_id", None))
@@ -75,5 +80,5 @@ if groq_ok:
     else:
         print("[READY] System ready to run!")
 else:
-    print("[ERROR] Please set GROQ_API_KEY in .env")
+    print("[ERROR] Please set GROQ_API_KEY in env/.env.common")
 print("=" * 50)

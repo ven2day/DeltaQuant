@@ -10,20 +10,22 @@ Tests for PR-4 data efficiency & fusion:
 
 import math
 from datetime import timedelta
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
+import pytest
 
-from src.market.history_manager import HistoryManager
-from src.market.indicators import (
+from src.core.indicators import (
     Timeframe,
     _safe_float,
     calculate_indicators,
     get_indicator_cache,
     reset_indicator_cache,
 )
-from src.market.manager import MarketQuote
-from src.utils.market_time import now_ist
+from src.markets.nse.market_data.history_manager import HistoryManager
+from src.markets.nse.market_data.manager import MarketQuote
+from src.markets.nse.sessions.market_time import now_ist
 
 
 def _ohlcv(dates, base=100.0):
@@ -127,6 +129,65 @@ def test_calculate_indicators_emits_no_nan():
         assert not (isinstance(number, float) and math.isnan(number)), "indicator emitted NaN"
 
 
+def test_fast_indicator_snapshot_matches_ta_reference():
+    """The optimized 250-symbol path must preserve the old ``ta`` calculations."""
+    from ta.momentum import RSIIndicator, StochasticOscillator
+    from ta.trend import MACD, ADXIndicator, CCIIndicator, EMAIndicator, PSARIndicator
+    from ta.volatility import AverageTrueRange, BollingerBands
+    from ta.volume import VolumeWeightedAveragePrice
+
+    rng = np.random.default_rng(17)
+    count = 200
+    close = 100 * np.cumprod(1 + rng.normal(0, 0.008, count))
+    open_price = close * (1 + rng.normal(0, 0.002, count))
+    frame = pd.DataFrame(
+        {
+            "open": open_price,
+            "high": np.maximum(open_price, close) * (1 + rng.uniform(0, 0.01, count)),
+            "low": np.minimum(open_price, close) * (1 - rng.uniform(0, 0.01, count)),
+            "close": close,
+            "volume": rng.integers(1_000, 100_000, count),
+        }
+    )
+    result = calculate_indicators(frame, "X", Timeframe.M5)
+
+    for period in (9, 20, 21, 40, 55, 200):
+        expected = EMAIndicator(frame["close"], window=period).ema_indicator().iloc[-1]
+        assert result.ema[period] == pytest.approx(expected, abs=1e-10)
+
+    stochastic = StochasticOscillator(frame["high"], frame["low"], frame["close"], 14, 3)
+    macd = MACD(frame["close"], window_slow=26, window_fast=12, window_sign=9)
+    adx = ADXIndicator(frame["high"], frame["low"], frame["close"], window=14)
+    bands = BollingerBands(frame["close"], window=20, window_dev=2)
+    expected = {
+        "rsi": RSIIndicator(frame["close"], window=14).rsi().iloc[-1],
+        "stoch_k": stochastic.stoch().iloc[-1],
+        "stoch_d": stochastic.stoch_signal().iloc[-1],
+        "macd": macd.macd().iloc[-1],
+        "macd_signal": macd.macd_signal().iloc[-1],
+        "macd_histogram": macd.macd_diff().iloc[-1],
+        "adx": adx.adx().iloc[-1],
+        "plus_di": adx.adx_pos().iloc[-1],
+        "minus_di": adx.adx_neg().iloc[-1],
+        "atr": AverageTrueRange(frame["high"], frame["low"], frame["close"], 14)
+        .average_true_range()
+        .iloc[-1],
+        "bb_upper": bands.bollinger_hband().iloc[-1],
+        "bb_middle": bands.bollinger_mavg().iloc[-1],
+        "bb_lower": bands.bollinger_lband().iloc[-1],
+        "bb_percent": bands.bollinger_pband().iloc[-1],
+        "vwap": VolumeWeightedAveragePrice(
+            frame["high"], frame["low"], frame["close"], frame["volume"]
+        )
+        .volume_weighted_average_price()
+        .iloc[-1],
+        "cci": CCIIndicator(frame["high"], frame["low"], frame["close"], 14).cci().iloc[-1],
+        "psar": PSARIndicator(frame["high"], frame["low"], frame["close"]).psar().iloc[-1],
+    }
+    for field, expected_value in expected.items():
+        assert getattr(result, field) == pytest.approx(expected_value, abs=1e-10)
+
+
 # ---------------------------------------------------------------------------
 # IndicatorCache
 # ---------------------------------------------------------------------------
@@ -158,6 +219,32 @@ def test_indicator_cache_misses_when_last_close_changes():
     cache.get_or_compute(df2, "X", timeframe=Timeframe.D1)
 
     assert cache.misses == 2
+
+
+def test_indicator_cache_retains_a_full_250_symbol_five_timeframe_generation():
+    """Regression guard for the old 256-entry full-universe cache thrash."""
+    reset_indicator_cache()
+    cache = get_indicator_cache()
+    dates = pd.date_range("2024-01-01", periods=60, freq="D")
+    df = _ohlcv(dates)
+
+    with patch("src.core.indicators.calculate_indicators", return_value=object()):
+        for symbol_index in range(250):
+            for timeframe in (
+                Timeframe.M5,
+                Timeframe.M15,
+                Timeframe.M30,
+                Timeframe.H1,
+                Timeframe.H4,
+            ):
+                cache.get_or_compute(df, f"SYM{symbol_index}", timeframe=timeframe)
+
+        misses_after_first_generation = cache.misses
+        cache.get_or_compute(df, "SYM0", timeframe=Timeframe.M5)
+
+    assert misses_after_first_generation == 1250
+    assert cache.misses == misses_after_first_generation
+    assert cache.hits == 1
 
 
 # ---------------------------------------------------------------------------

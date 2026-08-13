@@ -16,8 +16,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.agents.graph import create_trading_graph, run_trading_cycle
 from src.config import get_settings
-from src.market.indicators import IndicatorResult, Timeframe
-from src.market.signals import SignalEngine
+from src.core.candidates import SignalEngine
+from src.core.indicators import IndicatorResult, Timeframe
 from src.memory.database import AgentMemoryDB
 from src.memory.injection import MemoryInjector
 from src.observability.tracing import setup_tracing, trading_trace

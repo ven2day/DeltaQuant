@@ -194,6 +194,210 @@ def add_trace_metadata(key: str, value: Any) -> None:
         logger.debug("Could not add Langfuse trace metadata: %s", exc)
 
 
+def record_llm_call_trace(metadata: dict[str, Any]) -> str:
+    """Attach one structured LLM-call attribution span to the active trace.
+
+    Prompt and response bodies are deliberately excluded. The returned trace id is
+    stored beside the FinOps event when the SDK exposes it; observability failure is
+    always non-fatal.
+    """
+    if _langfuse_client is None:
+        return ""
+    safe_keys = {
+        "market",
+        "call_reason",
+        "component",
+        "agent",
+        "runtime_id",
+        "session_id",
+        "cycle_id",
+        "candidate_id",
+        "symbol",
+        "timeframe",
+        "model",
+        "input_tokens",
+        "output_tokens",
+        "total_tokens",
+        "cost_usd",
+    }
+    safe = {key: value for key, value in metadata.items() if key in safe_keys}
+    trace_id = ""
+    try:
+        current_trace_id = getattr(_langfuse_client, "get_current_trace_id", None)
+        if callable(current_trace_id):
+            trace_id = str(current_trace_id() or "")
+        with _langfuse_client.start_as_current_observation(
+            as_type="span",
+            name="llm_call_attribution",
+            metadata=safe,
+        ) as span:
+            if not trace_id:
+                trace_id = str(getattr(span, "trace_id", "") or "")
+            span.update(
+                output={
+                    "market": safe.get("market", "UNKNOWN_LEGACY"),
+                    "call_reason": safe.get("call_reason", "UNKNOWN_LEGACY"),
+                    "total_tokens": safe.get("total_tokens", 0),
+                }
+            )
+    except Exception as exc:
+        logger.debug("Could not record LLM attribution span: %s", exc)
+    return trace_id
+
+
+def record_candidate_review(metadata: dict[str, Any]) -> None:
+    """Emit a bounded per-candidate span for fresh and cached Qwen verdicts.
+
+    Only structured identifiers and decisions are accepted by callers; prompts,
+    credentials, and model prose are deliberately excluded.
+    """
+    if _langfuse_client is None:
+        return
+    safe_keys = {
+        "market",
+        "provider",
+        "provider_environment",
+        "instrument",
+        "symbol",
+        "strategy",
+        "trade_horizon",
+        "timeframe",
+        "model_version",
+        "validation_status",
+        "current_regime",
+        "regime_policy",
+        "original_confidence",
+        "regime_adjusted_confidence",
+        "ml_confidence",
+        "registry_decision",
+        "risk_decision",
+        "final_outcome",
+        "rejection_reason",
+        "candidate_fingerprint",
+        "cache_hit",
+        "model",
+        "context_version",
+        "decision",
+        "execution_result",
+    }
+    safe = {key: value for key, value in metadata.items() if key in safe_keys}
+    try:
+        with _langfuse_client.start_as_current_observation(
+            as_type="span", name="qwen_candidate_review", metadata=safe
+        ) as span:
+            span.update(output={"decision": safe.get("decision", "unknown")})
+    except Exception as exc:
+        logger.debug("Could not record candidate-review span: %s", exc)
+
+
+def record_candidate_execution(metadata: dict[str, Any]) -> None:
+    """Emit the post-review execution result keyed by the same fingerprint."""
+    if _langfuse_client is None:
+        return
+    safe_keys = {
+        "market",
+        "provider",
+        "provider_environment",
+        "instrument",
+        "symbol",
+        "strategy",
+        "trade_horizon",
+        "timeframe",
+        "model_version",
+        "validation_status",
+        "current_regime",
+        "regime_policy",
+        "original_confidence",
+        "regime_adjusted_confidence",
+        "ml_confidence",
+        "registry_decision",
+        "risk_decision",
+        "final_outcome",
+        "rejection_reason",
+        "candidate_fingerprint",
+        "cache_hit",
+        "model",
+        "context_version",
+        "decision",
+        "execution_result",
+    }
+    safe = {key: value for key, value in metadata.items() if key in safe_keys}
+    try:
+        with _langfuse_client.start_as_current_observation(
+            as_type="span", name="candidate_execution", metadata=safe
+        ) as span:
+            span.update(output={"execution_result": safe.get("execution_result", "unknown")})
+    except Exception as exc:
+        logger.debug("Could not record candidate-execution span: %s", exc)
+
+
+def record_runtime_stage(
+    stage: str,
+    duration_seconds: float,
+    metadata: dict[str, int | float | str | bool] | None = None,
+) -> None:
+    """Emit one small completed-stage span without attaching frames or model payloads."""
+    safe = dict(metadata or {})
+    safe["duration_ms"] = round(max(0.0, duration_seconds) * 1000, 2)
+    if _langfuse_client is None:
+        return
+    try:
+        with _langfuse_client.start_as_current_observation(
+            as_type="span",
+            name=f"runtime_{stage}",
+            metadata=safe,
+        ) as span:
+            span.update(output={"status": "complete"})
+    except Exception as exc:
+        logger.debug("Could not record runtime-stage span: %s", exc)
+
+
+def record_trading_cycle(metadata: dict[str, Any]) -> None:
+    """Emit one bounded parent trace for a material settled-candle cycle.
+
+    Raw candles, prompts, and model payloads are intentionally excluded. LangFuse is
+    observability-only: every failure is swallowed after a debug log.
+    """
+    allowed = {
+        "market",
+        "provider",
+        "provider_environment",
+        "cycle_id",
+        "execution_mode",
+        "trade_horizon",
+        "changed_timeframes",
+        "symbols_considered",
+        "symbols_scanned",
+        "raw_strategy_signals",
+        "technical_setups",
+        "technical_candidates",
+        "ml_candidates",
+        "ml_evaluated",
+        "ml_cache_hits",
+        "ml_cache_misses",
+        "all_llm_calls",
+        "candidate_qwen_calls",
+        "market_context_calls",
+        "support_agent_calls",
+        "qwen_reviewed",
+        "qwen_cache_hits",
+        "signals_validated",
+        "risk_approved",
+        "orders_created",
+        "cycle_duration_ms",
+    }
+    safe = {key: value for key, value in metadata.items() if key in allowed}
+    if _langfuse_client is None:
+        return
+    try:
+        with _langfuse_client.start_as_current_observation(
+            as_type="span", name="trading_cycle", metadata=safe
+        ) as trace:
+            trace.update(output={"status": "complete"})
+    except Exception as exc:
+        logger.debug("Could not record trading-cycle trace: %s", exc)
+
+
 def tag_trace(
     trade_id: str | None = None,
     decision: str | None = None,

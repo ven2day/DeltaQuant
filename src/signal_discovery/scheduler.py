@@ -10,8 +10,8 @@ from collections.abc import Callable
 from pathlib import Path
 
 from src.config import get_settings
-from src.market.history_manager import HistoryManager
-from src.market.indicators import Timeframe
+from src.core.indicators import Timeframe
+from src.markets.nse.market_data.history_manager import HistoryManager
 
 from .operators import build_ohlcv_panel
 from .workflow import SignalDiscoveryWorkflow
@@ -29,7 +29,16 @@ class AutomaticDiscoveryScheduler:
     def maybe_start(self, history_manager: HistoryManager, symbols: list[str]) -> bool:
         if not self.settings.signal_discovery_auto_run or not self._is_due():
             return False
-        if self._task is not None and not self._task.done():
+        return self.force_run(history_manager, symbols)
+
+    @property
+    def is_running(self) -> bool:
+        return self._task is not None and not self._task.done()
+
+    def force_run(self, history_manager: HistoryManager, symbols: list[str]) -> bool:
+        """Start a discovery run immediately, bypassing the staleness check.
+        Still refuses to double-start a run that's already in progress."""
+        if self.is_running:
             return False
         self._task = asyncio.create_task(self._run(history_manager, list(symbols)))
         return True

@@ -17,7 +17,7 @@ from src.agents.llm_factory import (
     primary_and_fallback_models,
 )
 from src.config.settings import Settings
-from src.utils.circuit_breaker import CircuitBreaker, CircuitBreakerOpenError, CircuitState
+from src.core.utils.circuit_breaker import CircuitBreaker, CircuitBreakerOpenError, CircuitState
 
 
 def _base_kwargs(**overrides):
@@ -169,7 +169,7 @@ class TestCreateChatModel:
 class TestProviderLimiterAndCircuitBreaker:
     @patch("src.agents.llm_factory.get_settings")
     def test_groq_limiter_is_the_singleton_groq_limiter(self, mock_get_settings):
-        from src.utils.rate_limiter import get_groq_limiter
+        from src.core.utils.rate_limiter import get_groq_limiter
 
         mock_get_settings.return_value = MagicMock(llm_provider="groq")
         assert get_llm_limiter() is get_groq_limiter()

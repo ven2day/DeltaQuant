@@ -14,8 +14,8 @@ from typing import Any
 from sqlalchemy import Boolean, Column, DateTime, Float, Integer, String
 from sqlalchemy.orm import Session
 
+from src.core.candidates import StrategyType
 from src.db.base import Base, get_session
-from src.market.signals import StrategyType
 
 logger = logging.getLogger(__name__)
 

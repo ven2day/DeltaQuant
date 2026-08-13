@@ -8,8 +8,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from src.execution.costs import CostModel
-from src.execution.paper_engine import LocalPaperEngine
+from src.markets.nse.execution.paper_engine import LocalPaperEngine
+from src.markets.nse.risk.costs import CostModel
 
 # ---------------------------------------------------------------------------
 # CostModel

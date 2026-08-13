@@ -13,6 +13,8 @@ from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
 
 import pandas as pd
+import pytest
+from pydantic import ValidationError
 
 from src.agents.market_regime import _build_regime_context_enriched
 from src.agents.prediction import prediction_node
@@ -20,7 +22,7 @@ from src.agents.risk_compliance import RiskLimits, check_kill_switch
 from src.agents.signal_validation import _build_validation_context_enriched
 from src.agents.state import create_initial_state
 from src.config.settings import Settings
-from src.utils.market_time import IST, is_market_hours, is_trading_window, now_ist
+from src.markets.nse.sessions.market_time import IST, is_market_hours, is_trading_window, now_ist
 
 # ---------------------------------------------------------------------------
 # C3 — IST market hours (host-timezone independent)
@@ -33,18 +35,16 @@ def test_now_ist_is_fixed_utc_plus_530():
 
 
 def test_is_market_hours_weekday_open():
-    # 2024-01-01 is a Monday.
-    assert is_market_hours(datetime(2024, 1, 1, 10, 0, tzinfo=IST)) is True
+    assert is_market_hours(datetime(2026, 8, 10, 10, 0, tzinfo=IST)) is True
 
 
 def test_is_market_hours_weekend_closed():
-    # 2024-01-06 is a Saturday.
-    assert is_market_hours(datetime(2024, 1, 6, 10, 0, tzinfo=IST)) is False
+    assert is_market_hours(datetime(2026, 8, 15, 10, 0, tzinfo=IST)) is False
 
 
 def test_is_market_hours_before_open_and_after_close():
-    assert is_market_hours(datetime(2024, 1, 1, 8, 0, tzinfo=IST)) is False
-    assert is_market_hours(datetime(2024, 1, 1, 16, 0, tzinfo=IST)) is False
+    assert is_market_hours(datetime(2026, 8, 10, 8, 0, tzinfo=IST)) is False
+    assert is_market_hours(datetime(2026, 8, 10, 16, 0, tzinfo=IST)) is False
 
 
 def test_is_market_hours_uses_ist_not_host_clock():
@@ -53,14 +53,14 @@ def test_is_market_hours_uses_ist_not_host_clock():
     open; a buggy one comparing UTC wall-clock (04:30) against IST open (09:15)
     would report closed.
     """
-    instant = datetime(2024, 1, 1, 4, 30, tzinfo=UTC)
+    instant = datetime(2026, 8, 10, 4, 30, tzinfo=UTC)
     assert is_market_hours(instant.astimezone(IST)) is True
 
 
 def test_is_trading_window_respects_entry_cutoff_and_weekends():
-    assert is_trading_window("09:15", "15:15", datetime(2024, 1, 1, 15, 15, tzinfo=IST))
-    assert not is_trading_window("09:15", "15:15", datetime(2024, 1, 1, 15, 16, tzinfo=IST))
-    assert not is_trading_window("09:15", "15:15", datetime(2024, 1, 6, 12, 0, tzinfo=IST))
+    assert is_trading_window("09:15", "15:15", datetime(2026, 8, 10, 15, 15, tzinfo=IST))
+    assert not is_trading_window("09:15", "15:15", datetime(2026, 8, 10, 15, 16, tzinfo=IST))
+    assert not is_trading_window("09:15", "15:15", datetime(2026, 8, 15, 12, 0, tzinfo=IST))
 
 
 # ---------------------------------------------------------------------------
@@ -142,7 +142,7 @@ def test_prediction_node_sources_from_signals_and_dedupes():
     state["validated_signals"] = []  # empty at support-agent stage
 
     with (
-        patch("src.market.historical_feed.HistoricalDataFeed") as mock_feed_cls,
+        patch("src.markets.nse.market_data.historical_feed.HistoricalDataFeed") as mock_feed_cls,
         patch("src.agents.prediction.PredictionAgent.predict") as mock_predict,
     ):
         mock_feed_cls.return_value.get_historical.return_value = pd.DataFrame(
@@ -162,7 +162,7 @@ def test_prediction_node_ignores_validated_signals():
     state["signals"] = []
     state["validated_signals"] = [{"symbol": "RELIANCE"}]
 
-    with patch("src.market.historical_feed.HistoricalDataFeed") as mock_feed_cls:
+    with patch("src.markets.nse.market_data.historical_feed.HistoricalDataFeed") as mock_feed_cls:
         mock_feed_cls.return_value.get_historical.return_value = pd.DataFrame({"Close": [1.0]})
         result = prediction_node(state)
 
@@ -204,12 +204,12 @@ def test_kill_switch_safe_when_within_limits():
 
 
 def test_config_warnings_flag_inconsistent_risk_params():
-    s = Settings(
-        groq_api_key="x",
-        risk_per_trade=0.5,  # exceeds max_position_pct -> warning
-        max_position_pct=0.1,
-    )
-    assert any("risk_per_trade" in w for w in s.config_warnings)
+    with pytest.raises(ValidationError, match="MAX_TOTAL_RISK"):
+        Settings(
+            groq_api_key="x",
+            risk_per_trade=0.5,
+            max_position_pct=0.1,
+        )
 
 
 def test_config_warnings_clean_defaults():

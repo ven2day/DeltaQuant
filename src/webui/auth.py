@@ -2,7 +2,7 @@
 login-attempt rate limiting.
 
 The dashboard exposes wallet balance, positions, and trading activity over the
-network (see M-8, DeltaQuant-Quant-Risk-Review.md: "API protection relies mainly on
+network (see M-8, docs/audits/DeltaQuant-Quant-Risk-Review.md: "API protection relies mainly on
 localhost binding... any remote binding... would require authentication"). This
 module is that authentication layer. It deliberately avoids adding new third-party
 crypto dependencies (bcrypt/passlib/PyJWT) -- everything here is stdlib `hashlib`,

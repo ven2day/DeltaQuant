@@ -1,6 +1,5 @@
 "use client";
 
-import { useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 import { checkAuthenticated } from "./api";
 
@@ -10,7 +9,6 @@ import { checkAuthenticated } from "./api";
  * redirect-loop).
  */
 export function useAuthGuard(): { checking: boolean } {
-  const router = useRouter();
   const [checking, setChecking] = useState(true);
 
   useEffect(() => {
@@ -19,7 +17,12 @@ export function useAuthGuard(): { checking: boolean } {
     checkAuthenticated().then((authenticated) => {
       if (cancelled) return;
       if (!authenticated) {
-        router.replace("/login");
+        // This is an authentication boundary, not an in-app navigation.  A
+        // full replacement is intentionally more robust than a soft router
+        // transition here: if Next's client router is stale after a rebuild or
+        // deployment, the old transition can fail and leave this page showing
+        // "Checking session…" forever.
+        window.location.replace("/login");
         return;
       }
       setChecking(false);
@@ -28,7 +31,7 @@ export function useAuthGuard(): { checking: boolean } {
     return () => {
       cancelled = true;
     };
-  }, [router]);
+  }, []);
 
   return { checking };
 }

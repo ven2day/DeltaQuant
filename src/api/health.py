@@ -57,6 +57,7 @@ class SystemHealth:
     uptime_seconds: float
     version: str = "2.0.0"
     checked_at: datetime = field(default_factory=datetime.now)
+    markets: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -64,12 +65,53 @@ class SystemHealth:
             "version": self.version,
             "uptime_seconds": round(self.uptime_seconds, 2),
             "services": [s.to_dict() for s in self.services],
+            "markets": self.markets,
             "checked_at": self.checked_at.isoformat(),
         }
 
 
 # Track system start time
 _system_start_time = time.time()
+
+
+async def market_health_summary(*, include_network: bool = False) -> dict[str, dict[str, Any]]:
+    """Return isolated provider health without exposing credentials."""
+
+    settings = get_settings()
+    nse_enabled = bool(getattr(settings, "nse_enabled", True))
+    forex_enabled = bool(getattr(settings, "forex_enabled", False))
+    markets: dict[str, dict[str, Any]] = {
+        "NSE": {
+            "provider": "DHAN",
+            "market_data": "configured" if nse_enabled else "disabled",
+            "execution": "disabled" if not settings.nse_execution_enabled else "configured",
+            "kill_switch": bool(settings.global_kill_switch or settings.nse_kill_switch),
+        },
+        "FOREX": {
+            "provider": "OANDA",
+            "environment": settings.oanda_environment.upper(),
+            "market_data": "configured" if forex_enabled else "disabled",
+            "pricing_stream": "not_started" if forex_enabled else "disabled",
+            "execution": "disabled",
+            "kill_switch": bool(settings.global_kill_switch or settings.forex_kill_switch),
+        },
+        "CRYPTO": {
+            "provider": "FUTURE",
+            "market_data": "disabled",
+            "execution": "disabled",
+            "kill_switch": bool(settings.global_kill_switch or settings.crypto_kill_switch),
+        },
+    }
+    if include_network and forex_enabled:
+        from src.markets.provider_factory import create_market_data_provider
+
+        provider = create_market_data_provider(settings)
+        if provider is not None:
+            try:
+                markets["FOREX"] = (await provider.validate_connectivity()).to_dict()
+            finally:
+                await provider.close()
+    return markets
 
 
 async def check_database() -> ServiceHealth:
@@ -113,14 +155,30 @@ async def check_groq_api() -> ServiceHealth:
     try:
         from langchain_core.messages import HumanMessage
 
-        from src.agents.llm_factory import create_chat_model, primary_and_fallback_models
+        from src.agents.llm_factory import (
+            create_chat_model,
+            model_for_tier,
+            primary_and_fallback_models,
+        )
+        from src.finops import LLMCallReason, record_llm_response
 
         _primary_model, fallback_model = primary_and_fallback_models()
 
         # Simple ping using the smaller/cheaper fallback-tier model
-        llm = create_chat_model(fallback_model, temperature=0, max_tokens=5)
+        model = model_for_tier("FAST") if provider == "qwen" else fallback_model
+        llm = create_chat_model(model, temperature=0, max_tokens=5)
 
-        llm.invoke([HumanMessage(content="Say OK")])
+        response = llm.invoke([HumanMessage(content="Say OK")])
+        record_llm_response(
+            "health_check",
+            response,
+            model=model,
+            trade_horizon="SHARED",
+            purpose="operator_health_check",
+            market="COMMON",
+            call_reason=LLMCallReason.HEALTH_CHECK,
+            component="api_health_check",
+        )
 
         latency = (time.time() - start) * 1000
         return ServiceHealth(
@@ -128,7 +186,7 @@ async def check_groq_api() -> ServiceHealth:
             status=HealthStatus.HEALTHY,
             latency_ms=latency,
             message=f"{provider} API responding",
-            details={"model": fallback_model},
+            details={"model": model},
         )
     except Exception as e:
         latency = (time.time() - start) * 1000
@@ -167,8 +225,8 @@ async def check_market_data() -> ServiceHealth:
         )
 
     try:
-        from src.market.dhan_auth import get_dhan_client, get_valid_access_token
-        from src.utils.rate_limiter import get_dhan_data_api_limiter
+        from src.markets.nse.broker.dhan.auth import get_dhan_client, get_valid_access_token
+        from src.markets.nse.broker.dhan.rate_limits import get_dhan_data_api_limiter
 
         token = get_valid_access_token()
         client = get_dhan_client(settings.dhan_client_id, token)
@@ -236,7 +294,7 @@ async def check_circuit_breakers() -> ServiceHealth:
     start = time.time()
 
     try:
-        from src.utils.circuit_breaker import get_all_circuit_breaker_stats
+        from src.core.utils.circuit_breaker import get_all_circuit_breaker_stats
 
         stats = get_all_circuit_breaker_stats()
 
@@ -329,7 +387,7 @@ async def check_dhan_broker() -> ServiceHealth:
 
     # A working credential is either a manually-pasted static token, or a client ID
     # + PIN + TOTP secret (get_valid_access_token() auto-generates a fresh token from
-    # those — see src/market/dhan_auth.py). Checking dhan_access_token alone was a
+    # those — see src/markets/nse/broker/dhan/auth.py). Checking dhan_access_token alone was a
     # false-UNHEALTHY: the auto-login flow deliberately leaves it unset since a fresh
     # token gets generated and cached on demand instead of pasted by hand.
     has_static_token = bool(settings.dhan_access_token)
@@ -353,8 +411,7 @@ async def check_dhan_broker() -> ServiceHealth:
             name="dhan_broker",
             status=HealthStatus.UNHEALTHY,
             latency_ms=latency,
-            message=f"Required by execution_mode={settings.execution_mode} but no "
-            "credentials set",
+            message=f"Required by execution_mode={settings.execution_mode} but no credentials set",
         )
     return ServiceHealth(
         name="dhan_broker",
@@ -391,7 +448,7 @@ async def check_paper_wallet() -> ServiceHealth:
     start = time.time()
 
     try:
-        from src.execution.paper_engine import LocalPaperEngine
+        from src.markets.nse.execution.paper_engine import LocalPaperEngine
 
         engine = LocalPaperEngine()
 
@@ -483,6 +540,7 @@ async def health_check(
         status=overall_status,
         services=processed_services,
         uptime_seconds=uptime,
+        markets=await market_health_summary(include_network=include_slow_checks),
     )
 
 

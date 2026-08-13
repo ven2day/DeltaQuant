@@ -1,130 +1,169 @@
 "use client";
 
 import { Zap } from "lucide-react";
-import { useState } from "react";
-import type { ScalpingCandidate, TradingStats } from "@/lib/types";
+import { useMemo, useState } from "react";
+import type { ScalpOpportunity, TradingStats } from "@/lib/types";
 import { Card } from "./ui/Card";
 
-// Column order matches src/market/scalping_screener.py's DEFAULT_TIMEFRAMES (finest first).
-const TIMEFRAME_COLUMNS = ["15m", "30m", "1h"];
+type CandidateFilter = "ALL" | ScalpOpportunity["final_decision"];
 
-// Price tiers a symbol's last_price is bucketed into — the swing/day counts alone don't
-// tell you if a symbol is actually affordable to trade in size; a ₹14,000 stock and a
-// ₹300 stock can have the same swing count but need very different capital per lot.
-const PRICE_TIERS: { label: string; min: number; max: number }[] = [
-  { label: "Small (< Rs.500)", min: 0, max: 500 },
-  { label: "Medium (Rs.500 – Rs.2,000)", min: 500, max: 2000 },
-  { label: "Large (Rs.2,000 – Rs.5,000)", min: 2000, max: 5000 },
-  { label: "Very Large (> Rs.5,000)", min: 5000, max: Infinity },
+const FILTERS: { label: string; value: CandidateFilter }[] = [
+  { label: "All", value: "ALL" },
+  { label: "Enter now", value: "ENTER_NOW" },
+  { label: "Wait pullback", value: "WAIT_PULLBACK" },
+  { label: "Wait breakout", value: "WAIT_BREAKOUT" },
+  { label: "Rejected", value: "REJECT" },
 ];
 
-function TimeframeCell({ stats }: { stats: ScalpingCandidate["timeframes"][string] | undefined }) {
-  if (!stats) {
-    return <span className="text-ink-muted">—</span>;
-  }
-  return (
-    <div className="tabular text-right">
-      <span className="font-medium text-status-good">{stats.avg_swings_per_day.toFixed(1)}</span>
-      <span className="ml-1 text-[10px] text-ink-muted">Rs.{stats.avg_swing_size.toFixed(0)}</span>
-    </div>
-  );
+function money(value: number): string {
+  return `Rs.${value.toFixed(2)}`;
 }
 
-function CandidatesTable({ candidates }: { candidates: ScalpingCandidate[] }) {
-  if (candidates.length === 0) {
-    return <div className="py-3 italic text-ink-muted">No candidates in this price range.</div>;
-  }
-  return (
-    <table className="w-full border-collapse text-xs">
-      <thead>
-        <tr className="border-b border-border text-left uppercase tracking-wide text-ink-muted">
-          <th className="py-2 pr-3 font-medium">Symbol</th>
-          {TIMEFRAME_COLUMNS.map((tf) => (
-            <th key={tf} className="py-2 pr-3 text-right font-medium">
-              {tf}
-            </th>
-          ))}
-          <th className="py-2 pr-3 text-right font-medium">Avg Range</th>
-          <th className="py-2 text-right font-medium">Last Price</th>
-        </tr>
-      </thead>
-      <tbody>
-        {candidates.map((c) => (
-          <tr key={c.symbol} className="border-b border-border/50">
-            <td className="py-1.5 pr-3 font-medium text-ink-primary">{c.symbol}</td>
-            {TIMEFRAME_COLUMNS.map((tf) => (
-              <td key={tf} className="py-1.5 pr-3">
-                <TimeframeCell stats={c.timeframes?.[tf]} />
-              </td>
-            ))}
-            <td className="tabular py-1.5 pr-3 text-right text-ink-secondary">
-              Rs.{(c.avg_daily_range ?? 0).toFixed(2)}
-            </td>
-            <td className="tabular py-1.5 text-right text-ink-secondary">
-              Rs.{(c.last_price ?? 0).toFixed(2)}
-            </td>
-          </tr>
-        ))}
-      </tbody>
-    </table>
-  );
+function decisionColour(decision: ScalpOpportunity["final_decision"]): string {
+  if (decision === "ENTER_NOW") return "text-status-good";
+  if (decision === "REJECT") return "text-status-bad";
+  return "text-status-warn";
 }
 
 export function ScalpingCandidatesPanel({ stats }: { stats: TradingStats }) {
-  const candidates = stats.scalping_candidates ?? [];
-  const scanStatus = stats.scalping_screener_status ?? "pending";
-  const dataSource = stats.scalping_screener_data_source || stats.data_source;
-  const [activeTier, setActiveTier] = useState(0);
+  const candidates = Array.isArray(stats.scalp_opportunities) ? stats.scalp_opportunities : [];
+  const [activeFilter, setActiveFilter] = useState<CandidateFilter>("ALL");
 
-  const emptyMessage =
-    scanStatus === "ready"
-      ? `Latest ${dataSource} scan completed; no symbols met the configured 0.5% swing-frequency threshold.`
-      : scanStatus === "error"
-        ? `Scalping scanner is unavailable in ${dataSource} mode. See Activity Log for details.`
-        : "Waiting for the first scalping scan…";
-
-  const tierCandidates = candidates.filter(
-    (c) =>
-      (c.last_price ?? 0) >= PRICE_TIERS[activeTier].min &&
-      (c.last_price ?? 0) < PRICE_TIERS[activeTier].max
+  const counts = useMemo(
+    () => ({
+      ALL: candidates.length,
+      ENTER_NOW: candidates.filter((candidate) => candidate.final_decision === "ENTER_NOW")
+        .length,
+      WAIT_PULLBACK: candidates.filter(
+        (candidate) => candidate.final_decision === "WAIT_PULLBACK"
+      ).length,
+      WAIT_BREAKOUT: candidates.filter(
+        (candidate) => candidate.final_decision === "WAIT_BREAKOUT"
+      ).length,
+      REJECT: candidates.filter((candidate) => candidate.final_decision === "REJECT").length,
+    }),
+    [candidates]
   );
 
+  const visibleCandidates = useMemo(
+    () =>
+      activeFilter === "ALL"
+        ? candidates
+        : candidates.filter((candidate) => candidate.final_decision === activeFilter),
+    [activeFilter, candidates]
+  );
+
+  const emptyMessage = !stats.market_open
+    ? "NSE is closed. Candidates will update after the next settled Dhan candle during the verified trading window."
+    : stats.scalp_scan_completed_at
+      ? "The latest settled-candle scan completed with no eligible scalp candidates."
+      : "Waiting for the first settled-candle scalp scan.";
+
   return (
-    <Card title="Scalping Candidates" icon={Zap} accent="var(--cat-3)">
+    <Card title={`Scalping Candidates (${candidates.length})`} icon={Zap} accent="var(--cat-3)">
+      <div className="mb-3 text-[11px] text-ink-muted">
+        Event-driven candidates that passed the current technical, eligibility, and regime stages.
+        ML and Qwen may still abstain or be skipped; deterministic risk remains final.
+        {stats.scalp_scan_completed_at && (
+          <span> Last completed: {new Date(stats.scalp_scan_completed_at).toLocaleString()}.</span>
+        )}
+      </div>
+
+      <div className="mb-3 flex flex-wrap gap-2">
+        {FILTERS.map((filter) => {
+          const active = activeFilter === filter.value;
+          return (
+            <button
+              key={filter.value}
+              type="button"
+              onClick={() => setActiveFilter(filter.value)}
+              className={`rounded border px-2.5 py-1 text-xs font-medium transition-colors ${
+                active
+                  ? "border-[var(--cat-3)] bg-white/5 text-ink-primary"
+                  : "border-border text-ink-muted hover:text-ink-secondary"
+              }`}
+            >
+              {filter.label} ({counts[filter.value]})
+            </button>
+          );
+        })}
+      </div>
+
       {candidates.length === 0 ? (
         <div className="italic text-ink-muted">{emptyMessage}</div>
+      ) : visibleCandidates.length === 0 ? (
+        <div className="italic text-ink-muted">No candidates match this filter.</div>
       ) : (
-        <div>
-          <div className="mb-3 flex gap-1 border-b border-border">
-            {PRICE_TIERS.map((tier, i) => {
-              const count = candidates.filter(
-                (c) => (c.last_price ?? 0) >= tier.min && (c.last_price ?? 0) < tier.max
-              ).length;
-              const active = i === activeTier;
-              return (
-                <button
-                  key={tier.label}
-                  type="button"
-                  onClick={() => setActiveTier(i)}
-                  className={`border-b-2 px-3 py-1.5 text-xs font-semibold uppercase tracking-wide transition-colors ${
-                    active
-                      ? "border-[var(--cat-3)] text-ink-primary"
-                      : "border-transparent text-ink-muted hover:text-ink-secondary"
-                  }`}
+        <div className="max-h-[680px] overflow-auto">
+          <table className="w-full min-w-[1120px] border-collapse text-xs">
+            <thead className="sticky top-0 bg-surface">
+              <tr className="border-b border-border text-left uppercase tracking-wide text-ink-muted">
+                <th className="py-2 pr-3 font-medium">Symbol</th>
+                <th className="py-2 pr-3 font-medium">Side</th>
+                <th className="py-2 pr-3 font-medium">Strategy</th>
+                <th className="py-2 pr-3 font-medium">TF</th>
+                <th className="py-2 pr-3 font-medium">Decision</th>
+                <th className="py-2 pr-3 text-right font-medium">Score</th>
+                <th className="py-2 pr-3 text-right font-medium">ML</th>
+                <th className="py-2 pr-3 text-right font-medium">Entry</th>
+                <th className="py-2 pr-3 text-right font-medium">Stop</th>
+                <th className="py-2 pr-3 text-right font-medium">Target</th>
+                <th className="py-2 pr-3 text-right font-medium">Expected R</th>
+                <th className="py-2 font-medium">Reason</th>
+              </tr>
+            </thead>
+            <tbody>
+              {visibleCandidates.map((candidate) => (
+                <tr
+                  key={`${candidate.symbol}-${candidate.primary_timeframe}-${candidate.direction}`}
+                  className="border-b border-border/50"
                 >
-                  {tier.label} ({count})
-                </button>
-              );
-            })}
-          </div>
-          <div className="overflow-x-auto">
-            <CandidatesTable candidates={tierCandidates} />
-          </div>
-          <div className="mt-3 text-[10px] text-ink-muted">
-            Each cell: swings/day at that timeframe, and the average ₹ size of each swing.
-            Ranked by 15m swing frequency within each price tier — the fastest-moving
-            symbols first.
-          </div>
+                  <td className="py-1.5 pr-3 font-medium text-ink-primary">{candidate.symbol}</td>
+                  <td
+                    className={`py-1.5 pr-3 font-semibold ${
+                      candidate.direction === "BUY" ? "text-status-good" : "text-status-bad"
+                    }`}
+                  >
+                    {candidate.direction}
+                  </td>
+                  <td className="py-1.5 pr-3 text-ink-secondary">
+                    {candidate.primary_strategy}
+                  </td>
+                  <td className="py-1.5 pr-3 text-ink-secondary">
+                    {candidate.primary_timeframe}
+                  </td>
+                  <td
+                    className={`py-1.5 pr-3 font-medium ${decisionColour(candidate.final_decision)}`}
+                  >
+                    {candidate.final_decision.replaceAll("_", " ")}
+                  </td>
+                  <td className="tabular py-1.5 pr-3 text-right text-ink-secondary">
+                    {candidate.score.toFixed(3)}
+                  </td>
+                  <td className="tabular py-1.5 pr-3 text-right text-ink-secondary">
+                    {candidate.ml_probability == null
+                      ? "ABSTAIN"
+                      : `${(candidate.ml_probability * 100).toFixed(1)}%`}
+                  </td>
+                  <td className="tabular py-1.5 pr-3 text-right text-ink-secondary">
+                    {money(candidate.entry_price)}
+                  </td>
+                  <td className="tabular py-1.5 pr-3 text-right text-ink-secondary">
+                    {money(candidate.stop_loss)}
+                  </td>
+                  <td className="tabular py-1.5 pr-3 text-right text-ink-secondary">
+                    {money(candidate.target_price)}
+                  </td>
+                  <td className="tabular py-1.5 pr-3 text-right text-ink-secondary">
+                    {candidate.expected_r.toFixed(3)}
+                  </td>
+                  <td className="max-w-72 py-1.5 text-ink-muted">
+                    {candidate.reason.join(", ") || "Qualified technical setup"}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         </div>
       )}
     </Card>

@@ -8,6 +8,12 @@ with patch("src.config.get_settings") as mock_get_settings:
     mock_settings = MagicMock()
     mock_settings.groq_api_key.get_secret_value.return_value = "token"
     mock_settings.groq_model_fallback = "llama"
+    # A concrete int, not an unconfigured MagicMock attribute -- prediction_node compares
+    # this against len(seen_symbols) with `>`, which TypeErrors against a bare MagicMock.
+    # This mock leaks into src.agents.prediction's own `get_settings` reference too (its
+    # `from src.config import get_settings` executes inside this same patched block), so
+    # prediction_node's real numeric-comparison code path needs a real number here.
+    mock_settings.llm_prediction_context_max_symbols = 10
     mock_get_settings.return_value = mock_settings
 
     from src.agents.graph import (
@@ -15,6 +21,7 @@ with patch("src.config.get_settings") as mock_get_settings:
         run_trading_cycle,
         should_continue_after_regime,
         should_continue_after_validation,
+        support_agents_node,
     )
     from src.agents.news_analyst import NewsAnalyst, NewsItem, NewsSentiment
     from src.agents.prediction import PredictionAgent, PredictionSignal
@@ -201,7 +208,7 @@ def test_prediction_node():
 
     # Mock HistoricalDataFeed where it is imported (inside the function)
     # Since we can't easily mock local imports with patch, we will mock sys.modules
-    with patch("src.market.historical_feed.HistoricalDataFeed") as MockFeed:
+    with patch("src.markets.nse.market_data.historical_feed.HistoricalDataFeed") as MockFeed:
         mock_feed_instance = MockFeed.return_value
         mock_feed_instance.get_historical.return_value = pd.DataFrame(
             {
@@ -219,6 +226,31 @@ def test_prediction_node():
 
             result = prediction_node(state)
             assert len(result["prediction_signals"]) == 1
+
+
+def test_support_agents_node_skips_prediction_when_ml_disabled():
+    # Master switch off: prediction_node must not run at all (no sklearn inference),
+    # regardless of whether shared_market_context is present.
+    state = {"signals": [{"symbol": "AAPL"}], "shared_market_context": {}}
+    with patch("src.agents.graph.get_settings") as mock_settings:
+        mock_settings.return_value.ml_predictions_enabled = False
+        with patch("src.agents.graph.prediction_node") as mock_prediction_node:
+            result = support_agents_node(state)
+            mock_prediction_node.assert_not_called()
+    assert "prediction_signals" not in result
+
+
+def test_support_agents_node_runs_prediction_when_ml_enabled():
+    state = {"signals": [{"symbol": "AAPL"}]}
+    with patch("src.agents.graph.get_settings") as mock_settings:
+        mock_settings.return_value.ml_predictions_enabled = True
+        with patch("src.agents.graph.prediction_node") as mock_prediction_node:
+            mock_prediction_node.return_value = {"prediction_signals": [{"symbol": "AAPL"}]}
+            with patch("src.agents.graph._news_analyst_node", return_value={}):
+                with patch("src.agents.graph.sentiment_analysis_node", return_value={}):
+                    result = support_agents_node(state)
+            mock_prediction_node.assert_called_once()
+    assert result["prediction_signals"] == [{"symbol": "AAPL"}]
 
 
 # --- MarketSentimentAgent Tests ---

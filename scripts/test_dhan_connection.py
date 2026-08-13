@@ -107,9 +107,9 @@ def test_dhan_connection():
 
 if __name__ == "__main__":
     print("\n[INFO] If using SANDBOX token (from developer.dhan.co):")
-    print("       Set DHAN_BASE_URL=https://sandbox.dhan.co/v2 in .env")
+    print("       Set DHAN_BASE_URL=https://sandbox.dhan.co/v2 in env/.env.nse")
     print("\n[INFO] If using PRODUCTION token (from web.dhan.co):")
-    print("       Set DHAN_BASE_URL=https://api.dhan.co/v2 in .env")
+    print("       Set DHAN_BASE_URL=https://api.dhan.co/v2 in env/.env.nse")
     print()
 
     test_dhan_connection()

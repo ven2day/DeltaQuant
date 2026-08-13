@@ -4,7 +4,7 @@ Audit, H-2 Quant-Risk Review): one trade_id spanning wallet -> exit manager -> j
 performance tracker -> learning, durable across a crash at every boundary.
 
 Each test simulates a crash by deliberately calling only a *prefix* of the calls a real
-cycle in scripts/run_live_trading.py would make, then exercises the recovery path
+cycle in src/markets/nse/runtime/live.py would make, then exercises the recovery path
 (``PaperTradeLifecycleStore.reconcile`` / ``TradeFinalizer.replay_unfinalized``) and asserts
 the system lands in the correct, non-ambiguous state.
 """
@@ -17,12 +17,12 @@ from typing import Any
 import pytest
 
 from src.config.settings import Settings
-from src.execution.costs import CostModel
-from src.execution.finalize import TradeFinalizer
-from src.execution.journal import TradeJournal
-from src.execution.lifecycle import MOCK_NAMESPACE, PaperTradeLifecycleStore
-from src.execution.paper_engine import LocalPaperEngine
-from src.execution.service import ExecutionMode, ExecutionService, IdempotencyStore
+from src.markets.nse.execution.finalize import TradeFinalizer
+from src.markets.nse.execution.journal import TradeJournal
+from src.markets.nse.execution.lifecycle import MOCK_NAMESPACE, PaperTradeLifecycleStore
+from src.markets.nse.execution.paper_engine import LocalPaperEngine
+from src.markets.nse.execution.service import ExecutionMode, ExecutionService, IdempotencyStore
+from src.markets.nse.risk.costs import CostModel
 from src.memory.performance_tracker import PerformanceTracker
 
 
@@ -38,8 +38,8 @@ def _fake_settings(monkeypatch):
     other test file's import order to have already warmed the lru_cache.
     """
     settings = Settings(groq_api_key="test-key", _env_file=None)
-    monkeypatch.setattr("src.execution.paper_engine.get_settings", lambda: settings)
-    monkeypatch.setattr("src.execution.service.get_settings", lambda: settings)
+    monkeypatch.setattr("src.markets.nse.execution.paper_engine.get_settings", lambda: settings)
+    monkeypatch.setattr("src.markets.nse.execution.service.get_settings", lambda: settings)
 
 
 def _db_url(tmp_path, name: str = "") -> str:
@@ -463,7 +463,7 @@ def test_finalize_replay_after_crash_between_close_and_fanout_is_idempotent(tmp_
     # Seed an "active lesson" the way run_live_trading.py's create_intent call does (there
     # is no public setter post-creation, so reach into the row directly), so we can prove
     # crediting happens exactly once across the crash + replay.
-    from src.execution.lifecycle import PaperTradeLifecycleRecord
+    from src.markets.nse.execution.lifecycle import PaperTradeLifecycleRecord
 
     session = lifecycle._session()
     try:
@@ -520,7 +520,7 @@ def test_kill_switch_reason_produces_same_finalize_shape_as_normal_close(tmp_pat
     """TradeFinalizer.finalize is reason-agnostic: a trade closed with reason="kill_switch"
     must be journaled, performance-recorded, and lesson-credited exactly like one closed
     with reason="target_hit" — no shortcut that skips the fan-out for an emergency flatten
-    (the C-5 finding). scripts/run_live_trading.py routes both normal exits and the
+    (the C-5 finding). src/markets/nse/runtime/live.py routes both normal exits and the
     kill-switch flatten loop through the same _execute_managed_exit -> TradeFinalizer.finalize
     call (see the shared helper there); this test proves that shared call path itself treats
     both reasons identically."""

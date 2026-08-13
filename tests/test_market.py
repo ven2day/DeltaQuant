@@ -6,15 +6,15 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from src.market.indicators import (
-    IndicatorResult,
-    Timeframe,
-    calculate_indicators,
-)
-from src.market.signals import (
+from src.core.candidates import (
     SignalEngine,
     SignalType,
     StrategyType,
+)
+from src.core.indicators import (
+    IndicatorResult,
+    Timeframe,
+    calculate_indicators,
 )
 
 
@@ -310,7 +310,7 @@ class TestSignalEngine:
 
         assert signals == []
 
-    # --- EMA-CCI (TraderVersity-EMACCI.tpl: 200 EMA + CCI(14), +-100 levels) ---
+    # EMA-CCI (research/nse/external_strategies/TraderVersity-EMACCI.tpl).
 
     def test_ema_cci_buy_above_ema200_with_bullish_momentum_breakout(self, sample_indicators):
         """Price above EMA200 + CCI above +100: BUY."""

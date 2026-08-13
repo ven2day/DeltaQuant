@@ -2,7 +2,7 @@ import json
 import time
 from types import SimpleNamespace
 
-from src.market.indicators import Timeframe
+from src.core.indicators import Timeframe
 from src.signal_discovery.scheduler import AutomaticDiscoveryScheduler
 
 

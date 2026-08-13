@@ -3,8 +3,8 @@ Guided one-command setup for DeltaQuant.
 
 Run this first:  uv run python scripts/setup.py
 
-It creates your .env from the template if needed, checks the required free API keys, surfaces
-any configuration warnings, and prints a readiness checklist with the exact next command.
+It creates the isolated common/NSE profiles from their templates if needed, checks
+the required API keys, surfaces configuration warnings, and prints a readiness checklist.
 ASCII-only output so it works on any terminal.
 """
 
@@ -15,8 +15,11 @@ from pathlib import Path
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
-ENV = ROOT / ".env"
-ENV_EXAMPLE = ROOT / ".env.example"
+ENV_DIR = ROOT / "env"
+ENV_PROFILES = (
+    (ENV_DIR / ".env.common", ENV_DIR / ".env.common.example"),
+    (ENV_DIR / ".env.nse", ENV_DIR / ".env.nse.example"),
+)
 LINE = "=" * 64
 
 
@@ -31,15 +34,25 @@ def main() -> None:
     print(f"[i] Python {sys.version_info.major}.{sys.version_info.minor} "
           f"({'OK' if sys.version_info >= (3, 11) else 'needs 3.11+'})")
 
-    # 1. Ensure a .env exists.
-    if not ENV.exists():
-        if ENV_EXAMPLE.exists():
-            shutil.copy(ENV_EXAMPLE, ENV)
-            print("[+] Created .env from .env.example")
-        else:
-            print("[!] .env.example not found - cannot create .env")
+    # 1. Ensure the isolated NSE profiles exist.
+    missing_templates = [
+        example
+        for target, example in ENV_PROFILES
+        if not target.exists() and not example.exists()
+    ]
+    if missing_templates:
+        print("[!] Missing env templates: " + ", ".join(str(path) for path in missing_templates))
+        print(LINE)
+        return
+    created: list[Path] = []
+    for target, example in ENV_PROFILES:
+        if not target.exists():
+            shutil.copy(example, target)
+            created.append(target)
+            print(f"[+] Created {target.relative_to(ROOT)} from {example.name}")
+    if created:
         print()
-        print("[ACTION] Open .env and set your FREE API keys:")
+        print("[ACTION] Open env/.env.common and env/.env.nse and set the required keys:")
         print("   - GROQ_API_KEY        https://console.groq.com/keys")
         print("   - LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY   https://cloud.langfuse.com")
         print()
@@ -47,7 +60,7 @@ def main() -> None:
         print(LINE)
         return
 
-    print("[+] .env present")
+    print("[+] env/.env.common and env/.env.nse present")
 
     # 2. Load settings (catches missing required keys gracefully).
     try:
@@ -56,7 +69,7 @@ def main() -> None:
         settings = get_settings()
     except Exception as exc:
         print(f"[!] Configuration could not load: {exc}")
-        print("    Set GROQ_API_KEY in .env and optionally configure Langfuse tracing.")
+        print("    Set GROQ_API_KEY in env/.env.common and optionally configure Langfuse.")
         print(LINE)
         return
 
@@ -90,9 +103,9 @@ def main() -> None:
     print()
     if groq_ok:
         print("[READY] Start the dashboard:")
-        print("        uv run python scripts/run_live_trading.py")
+        print("        uv run deltaquant-nse")
     else:
-        print("[ACTION] Set GROQ_API_KEY in .env (https://console.groq.com/keys), then re-run.")
+        print("[ACTION] Set GROQ_API_KEY in env/.env.common, then re-run.")
     print(LINE)
 
 

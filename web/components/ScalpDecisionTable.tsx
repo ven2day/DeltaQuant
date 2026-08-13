@@ -1,14 +1,11 @@
 "use client";
 
-import { Gauge } from "lucide-react";
-import type { ScalpOpportunity, TimeframeAssessment, TradingStats } from "@/lib/types";
+import { Gauge, Search } from "lucide-react";
+import { useMemo, useState } from "react";
+import type { ScalpSymbolStatus, TimeframeAssessment, TradingStats } from "@/lib/types";
 import { Badge } from "./ui/Badge";
 import { Card } from "./ui/Card";
 
-// req 10's role order: 5m=execution, 15m=primary, 30m=directional, 1h=context.
-// 4h (optional macro filter) is shown in the expanded reason row instead of its
-// own column -- it's the one role that can be disabled entirely
-// (scalp_macro_filter_enabled), so a permanently-empty column would be noise.
 const TIMEFRAME_COLUMNS = ["5m", "15m", "30m", "1h"];
 
 const DECISION_DOT: Record<TimeframeAssessment["decision"], string> = {
@@ -17,21 +14,21 @@ const DECISION_DOT: Record<TimeframeAssessment["decision"], string> = {
   REJECT: "var(--status-critical)",
 };
 
-const FINAL_DECISION_TONE: Record<ScalpOpportunity["final_decision"], "good" | "warning" | "critical"> = {
-  ENTER_NOW: "good",
-  WAIT_PULLBACK: "warning",
-  WAIT_BREAKOUT: "warning",
-  REJECT: "critical",
-};
+const FILTERS: { value: "ALL" | ScalpSymbolStatus["decision"]; label: string }[] = [
+  { value: "ALL", label: "All" },
+  { value: "BUY", label: "Buy" },
+  { value: "NO_BUY", label: "No Buy" },
+  { value: "NO_DATA", label: "No Data" },
+];
 
 function TimeframeCell({ assessment }: { assessment: TimeframeAssessment | undefined }) {
   if (!assessment) {
-    return <span className="text-ink-muted">—</span>;
+    return <span className="text-ink-muted">-</span>;
   }
   return (
     <div
       className="flex items-center justify-end gap-1.5"
-      title={assessment.reasons.join(" · ") || assessment.decision}
+      title={assessment.reasons.join(" | ") || assessment.decision}
     >
       <span
         className="inline-block h-1.5 w-1.5 rounded-full"
@@ -42,63 +39,62 @@ function TimeframeCell({ assessment }: { assessment: TimeframeAssessment | undef
   );
 }
 
-function OpportunityRow({ opportunity }: { opportunity: ScalpOpportunity }) {
-  const eq = opportunity.entry_quality;
+function PriceCell({ value, tone }: { value: number; tone?: string }) {
+  return (
+    <td className={`tabular py-1.5 pr-3 text-right ${tone ?? "text-ink-secondary"}`}>
+      {value > 0 ? `Rs.${value.toFixed(2)}` : "-"}
+    </td>
+  );
+}
+
+function StatusRow({ status }: { status: ScalpSymbolStatus }) {
+  const tone =
+    status.decision === "BUY" ? "good" : status.decision === "NO_DATA" ? "critical" : "warning";
+  const reason = status.reasons[0] ?? "No reason recorded.";
+
   return (
     <tr className="border-b border-border/50 align-top">
       <td className="py-1.5 pr-3">
-        <div className="font-medium text-ink-primary">{opportunity.symbol}</div>
+        <div className="font-medium text-ink-primary">{status.symbol}</div>
         <div className="text-[10px] text-ink-muted">
-          {opportunity.primary_strategy || "—"} · {opportunity.primary_timeframe || "—"}
+          {status.primary_strategy || "no setup"}
+          {status.primary_timeframe ? ` | ${status.primary_timeframe}` : ""}
         </div>
+      </td>
+      <td className="py-1.5 pr-3">
+        <Badge label={status.decision.replace(/_/g, " ")} tone={tone} dot />
+        {status.selected_for_review && (
+          <div className="mt-1 text-[9px] uppercase tracking-wide text-ink-muted">
+            review shortlist
+          </div>
+        )}
+      </td>
+      <td className="max-w-[150px] py-1.5 pr-3 text-[10px] uppercase text-ink-secondary">
+        {status.stage.replace(/_/g, " ")}
       </td>
       {TIMEFRAME_COLUMNS.map((tf) => (
         <td key={tf} className="py-1.5 pr-3">
-          <TimeframeCell assessment={opportunity.timeframe_states?.[tf]} />
+          <TimeframeCell assessment={status.timeframe_states?.[tf]} />
         </td>
       ))}
+      <td className="tabular py-1.5 pr-3 text-right text-ink-secondary">
+        {status.raw_buy_signals}
+      </td>
       <td className="tabular py-1.5 pr-3 text-right font-medium text-ink-primary">
-        {opportunity.score.toFixed(2)}
-      </td>
-      <td className="py-1.5 pr-3">
-        {eq ? (
-          <span
-            className="whitespace-nowrap text-[11px]"
-            style={{ color: DECISION_DOT[eq.status === "ENTER_NOW" ? "BUY" : eq.status === "REJECT" ? "REJECT" : "WAIT"] }}
-            title={eq.reasons.join(" · ")}
-          >
-            {eq.status.replace("_", " ")}
-          </span>
-        ) : (
-          <span className="text-ink-muted">—</span>
-        )}
+        {status.score > 0 ? status.score.toFixed(2) : "-"}
       </td>
       <td className="tabular py-1.5 pr-3 text-right text-ink-secondary">
-        Rs.{opportunity.preferred_entry_low.toFixed(2)}–{opportunity.preferred_entry_high.toFixed(2)}
+        {status.ml_probability == null ? "-" : `${(status.ml_probability * 100).toFixed(1)}%`}
       </td>
-      <td className="tabular py-1.5 pr-3 text-right text-status-critical">
-        Rs.{opportunity.stop_loss.toFixed(2)}
-      </td>
-      <td className="tabular py-1.5 pr-3 text-right text-status-good">
-        Rs.{opportunity.target_price.toFixed(2)}
-      </td>
-      <td className="tabular py-1.5 pr-3 text-right text-ink-secondary">
-        {opportunity.expected_r.toFixed(2)}R
-      </td>
-      <td className="py-1.5 pr-3">
-        <Badge
-          label={opportunity.final_decision.replace("_", " ")}
-          tone={FINAL_DECISION_TONE[opportunity.final_decision]}
-        />
-      </td>
-      <td className="max-w-[220px] py-1.5 text-[11px] text-ink-muted">
-        {opportunity.reason[0] ?? "—"}
-        {opportunity.reason.length > 1 && (
-          <span title={opportunity.reason.slice(1).join(" · ")}>
-            {" "}
-            +{opportunity.reason.length - 1} more
-          </span>
-        )}
+      <PriceCell value={status.entry_price} />
+      <PriceCell value={status.stop_loss} tone="text-status-critical" />
+      <PriceCell value={status.target_price} tone="text-status-good" />
+      <td
+        className="max-w-[260px] py-1.5 text-[11px] text-ink-muted"
+        title={status.reasons.join(" | ")}
+      >
+        {reason}
+        {status.reasons.length > 1 && ` +${status.reasons.length - 1} more`}
       </td>
     </tr>
   );
@@ -110,20 +106,21 @@ function FunnelSummary({ funnel }: { funnel: TradingStats["scalp_funnel"] }) {
     ["consolidated", funnel.consolidated],
     ["mtf-confirmed", funnel.mtf_candidates],
     ["entry-quality", funnel.entry_quality_passed],
+    ["ML-scored", funnel.ml_scored],
     ["regime-ok", funnel.regime_compatible],
-    ["H-8 admitted", funnel.h8_admitted],
+    ["registry eligible", funnel.registry_eligible],
     ["sent to AI", funnel.sent_to_ai],
     ["AI approved", funnel.ai_approved],
     ["executed", funnel.execution_accepted],
   ];
-  if (steps.every(([, v]) => !v)) {
+  if (steps.every(([, value]) => !value)) {
     return null;
   }
   return (
     <div className="mb-3 flex flex-wrap items-center gap-x-1 gap-y-1 text-[11px] text-ink-muted">
-      {steps.map(([label, value], i) => (
+      {steps.map(([label, value], index) => (
         <span key={label} className="flex items-center gap-1">
-          {i > 0 && <span className="text-ink-muted/50">→</span>}
+          {index > 0 && <span className="text-ink-muted/50">-&gt;</span>}
           <span className="tabular font-medium text-ink-secondary">{value ?? 0}</span>
           <span>{label}</span>
         </span>
@@ -133,52 +130,125 @@ function FunnelSummary({ funnel }: { funnel: TradingStats["scalp_funnel"] }) {
 }
 
 export function ScalpDecisionTable({ stats }: { stats: TradingStats }) {
-  const opportunities = stats.scalp_opportunities ?? [];
+  const statuses = stats.scalp_symbol_statuses ?? [];
   const funnel = stats.scalp_funnel ?? {};
+  const [activeFilter, setActiveFilter] = useState<"ALL" | ScalpSymbolStatus["decision"]>(
+    "ALL"
+  );
+  const [query, setQuery] = useState("");
+
+  const counts = useMemo(
+    () => ({
+      ALL: statuses.length,
+      BUY: statuses.filter((status) => status.decision === "BUY").length,
+      NO_BUY: statuses.filter((status) => status.decision === "NO_BUY").length,
+      NO_DATA: statuses.filter((status) => status.decision === "NO_DATA").length,
+    }),
+    [statuses]
+  );
+
+  const visibleStatuses = useMemo(() => {
+    const normalizedQuery = query.trim().toUpperCase();
+    return statuses.filter(
+      (status) =>
+        (activeFilter === "ALL" || status.decision === activeFilter) &&
+        (!normalizedQuery || status.symbol.toUpperCase().includes(normalizedQuery))
+    );
+  }, [activeFilter, query, statuses]);
 
   return (
-    <Card title="Scalp Decisions" icon={Gauge} accent="var(--cat-4)">
+    <Card title={`All Scalp Signals (${counts.ALL})`} icon={Gauge} accent="var(--cat-4)">
+      <div className="mb-2 text-[11px] text-ink-muted">
+        Full configured NSE universe. BUY means a deterministic technical setup exists;
+        paper-order approval and risk checks remain separate.
+        {stats.scalp_scan_completed_at && (
+          <span> Last completed: {new Date(stats.scalp_scan_completed_at).toLocaleString()}.</span>
+        )}
+      </div>
       <FunnelSummary funnel={funnel} />
-      {opportunities.length === 0 ? (
-        <div className="italic text-ink-muted">
-          No scalp opportunities this cycle — either scalping is disabled, or nothing
-          cleared entry-quality/regime/multi-timeframe confirmation yet.
+
+      {(stats.scalp_rejection_reasons ?? []).length > 0 && (
+        <div className="mb-3 rounded border border-border bg-white/[0.02] px-3 py-2">
+          <div className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-ink-muted">
+            Top scalp rejection reasons this cycle
+          </div>
+          <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs">
+            {(stats.scalp_rejection_reasons ?? []).slice(0, 6).map((row) => (
+              <span key={`${row.stage}-${row.reason}`} className="text-ink-secondary">
+                {row.reason} <strong className="text-ink-primary">{row.count}</strong>
+                <span className="ml-1 text-ink-muted">({row.percentage.toFixed(1)}%)</span>
+              </span>
+            ))}
+          </div>
         </div>
+      )}
+
+      <div className="mb-3 flex flex-wrap items-center gap-2">
+        {FILTERS.map((filter) => {
+          const active = activeFilter === filter.value;
+          return (
+            <button
+              key={filter.value}
+              type="button"
+              onClick={() => setActiveFilter(filter.value)}
+              className={`rounded border px-2.5 py-1 text-xs font-medium transition-colors ${
+                active
+                  ? "border-[var(--cat-4)] bg-white/5 text-ink-primary"
+                  : "border-border text-ink-muted hover:text-ink-secondary"
+              }`}
+            >
+              {filter.label} ({counts[filter.value]})
+            </button>
+          );
+        })}
+        <label className="ml-auto flex min-w-48 items-center gap-2 rounded border border-border px-2 py-1">
+          <Search size={13} className="text-ink-muted" />
+          <input
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            placeholder="Find symbol"
+            className="w-full bg-transparent text-xs text-ink-primary outline-none placeholder:text-ink-muted"
+          />
+        </label>
+      </div>
+
+      {statuses.length === 0 ? (
+        <div className="italic text-ink-muted">
+          Waiting for the first full-universe scalp scan. Confirm that SCALP_ENABLED is true
+          and that historical candles are available.
+        </div>
+      ) : visibleStatuses.length === 0 ? (
+        <div className="italic text-ink-muted">No symbols match this filter.</div>
       ) : (
-        <div className="overflow-x-auto">
-          <table className="w-full min-w-[860px] border-collapse text-xs">
-            <thead>
+        <div className="max-h-[680px] overflow-auto">
+          <table className="w-full min-w-[1120px] border-collapse text-xs">
+            <thead className="sticky top-0 bg-surface">
               <tr className="border-b border-border text-left uppercase tracking-wide text-ink-muted">
                 <th className="py-2 pr-3 font-medium">Symbol</th>
+                <th className="py-2 pr-3 font-medium">Signal</th>
+                <th className="py-2 pr-3 font-medium">Stage</th>
                 {TIMEFRAME_COLUMNS.map((tf) => (
                   <th key={tf} className="py-2 pr-3 text-right font-medium">
                     {tf}
                   </th>
                 ))}
+                <th className="py-2 pr-3 text-right font-medium">Triggers</th>
                 <th className="py-2 pr-3 text-right font-medium">Score</th>
-                <th className="py-2 pr-3 font-medium">Entry Quality</th>
-                <th className="py-2 pr-3 text-right font-medium">Preferred Entry</th>
+                <th className="py-2 pr-3 text-right font-medium">ML P(up)</th>
+                <th className="py-2 pr-3 text-right font-medium">Entry</th>
                 <th className="py-2 pr-3 text-right font-medium">Stop</th>
                 <th className="py-2 pr-3 text-right font-medium">Target</th>
-                <th className="py-2 pr-3 text-right font-medium">Exp. R</th>
-                <th className="py-2 pr-3 font-medium">Decision</th>
                 <th className="py-2 font-medium">Reason</th>
               </tr>
             </thead>
             <tbody>
-              {opportunities.map((o) => (
-                <OpportunityRow key={o.symbol} opportunity={o} />
+              {visibleStatuses.map((status) => (
+                <StatusRow key={status.symbol} status={status} />
               ))}
             </tbody>
           </table>
         </div>
       )}
-      <div className="mt-3 text-[10px] text-ink-muted">
-        Dots show each timeframe&apos;s decision (green=BUY, amber=WAIT, red=REJECT);
-        hover a cell or the reason column for the full explanation. A row reading here
-        still has to independently clear the H-8 strategy-admission gate and every
-        risk check before it can become a real order.
-      </div>
     </Card>
   );
 }

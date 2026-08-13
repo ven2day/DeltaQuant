@@ -1,5 +1,5 @@
 """
-Strategy admission registry (H-8, DeltaQuant-Quant-Risk-Review.md).
+Legacy strict-grain strategy validation registry.
 
 ``walk_forward.edge_verdict()`` is a solid offline go/no-go, but before this module it was
 consulted only by ``scripts/validate_strategy.py`` -- an operator had to remember to run it,
@@ -28,6 +28,8 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -69,7 +71,7 @@ class StrategyVersion:
     # via from_dict()). timeframe="" means "not pinned to one timeframe" (the honest
     # label for every artifact validated before this field existed, since
     # scripts/validate_strategy.py historically always fetched daily bars regardless of
-    # what interval was nominally requested -- see DeltaQuant-Quant-Risk-Review.md H-8).
+    # what interval was nominally requested by the legacy validation workflow).
     # trade_horizon defaults to "SWING", matching every artifact ever registered so far.
     timeframe: str = ""
     trade_horizon: str = "SWING"
@@ -173,13 +175,28 @@ def build_strategy_version(
     now: datetime | None = None,
     timeframe: str = "",
     trade_horizon: str = "SWING",
+    p_value: float | None = None,
+    num_tests: int = 1,
+    require_significance: bool = False,
 ) -> StrategyVersion:
     """Build a ``StrategyVersion`` whose verdict comes directly from ``edge_verdict()``.
 
     This is the single entry point that produces a verdict for the registry; it never
-    re-derives VALIDATED/NOT VALIDATED criteria of its own.
+    re-derives VALIDATED/NOT VALIDATED criteria of its own. ``p_value``/``num_tests``/
+    ``require_significance`` are forwarded straight to ``edge_verdict`` -- see there for
+    the Bonferroni-correction rationale. A caller computing its own aggregate verdict via
+    ``walk_forward.aggregate_reports`` must pass the SAME values here, or this call
+    silently re-derives an uncorrected verdict independent of that one.
     """
-    verdict = edge_verdict(oos_trades, oos_expectancy, oos_return_pct, fold_consistency)
+    verdict = edge_verdict(
+        oos_trades,
+        oos_expectancy,
+        oos_return_pct,
+        fold_consistency,
+        p_value=p_value,
+        num_tests=num_tests,
+        require_significance=require_significance,
+    )
     now = now or datetime.now(UTC)
     return StrategyVersion(
         strategy_name=strategy_name,
@@ -215,19 +232,36 @@ class StrategyRegistry:
 
     def __init__(self, directory: str | Path):
         self.directory = Path(directory)
+        self._cache_lock = threading.RLock()
+        self._cached_versions: list[StrategyVersion] | None = None
+        self._cache_expires_monotonic = 0.0
 
     def register(self, version: StrategyVersion) -> Path:
         self.directory.mkdir(parents=True, exist_ok=True)
         slug = re.sub(r"[^a-z0-9]+", "_", version.strategy_name.lower()).strip("_")
-        path = self.directory / f"{slug or 'strategy'}__{version.version}.json"
+        horizon = re.sub(r"[^a-z0-9]+", "_", version.trade_horizon.lower()).strip("_")
+        timeframe = re.sub(r"[^a-z0-9]+", "_", version.timeframe.lower()).strip("_")
+        path = self.directory / (
+            f"{slug or 'strategy'}__{horizon or 'swing'}__{timeframe or 'any'}"
+            f"__{version.version}.json"
+        )
         temporary = path.with_suffix(".json.tmp")
         temporary.write_text(
             json.dumps(version.to_dict(), indent=2, sort_keys=True), encoding="utf-8"
         )
         temporary.replace(path)
+        with self._cache_lock:
+            self._cached_versions = None
+            self._cache_expires_monotonic = 0.0
         return path
 
     def load_all(self) -> list[StrategyVersion]:
+        with self._cache_lock:
+            if (
+                self._cached_versions is not None
+                and time.monotonic() < self._cache_expires_monotonic
+            ):
+                return list(self._cached_versions)
         if not self.directory.exists():
             return []
         versions: list[StrategyVersion] = []
@@ -237,6 +271,12 @@ class StrategyRegistry:
                 versions.append(StrategyVersion.from_dict(payload))
             except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as e:
                 logger.warning(f"Skipping unreadable strategy registry entry {path}: {e}")
+        with self._cache_lock:
+            self._cached_versions = list(versions)
+            # Runtime admission checks are frequent; artifact writers are offline.
+            # A short TTL keeps new validated versions discoverable without rereading
+            # every JSON file once per strategy/symbol/candle.
+            self._cache_expires_monotonic = time.monotonic() + 5.0
         return versions
 
     def latest(

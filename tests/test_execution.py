@@ -16,7 +16,7 @@ with patch("src.config.get_settings") as mock_get_settings:
     mock_settings.dhan_access_token.get_secret_value.return_value = "test_token"
     mock_get_settings.return_value = mock_settings
 
-    from src.execution.adapter import (
+    from src.markets.nse.broker.dhan.execution import (
         ExecutionAdapter,
         LocalExecutionAdapter,
         OrderRequest,
@@ -24,9 +24,9 @@ with patch("src.config.get_settings") as mock_get_settings:
         OrderStatus,
         execute_trades,
     )
-    from src.execution.costs import CostModel
-    from src.execution.journal import DecisionLog, TradeJournal
-    from src.execution.paper_engine import LocalPaperEngine
+    from src.markets.nse.execution.journal import DecisionLog, TradeJournal
+    from src.markets.nse.execution.paper_engine import LocalPaperEngine
+    from src.markets.nse.risk.costs import CostModel
 
 # --- LocalPaperEngine Tests ---
 
@@ -168,6 +168,67 @@ def test_persistence(tmp_path):
     assert len(engine2.get_positions()) == 1
 
 
+def test_current_price_survives_restart_via_trade_resync(tmp_path):
+    # A restart while the market is closed has no fresh quote to mark against (see
+    # MarketDataManager.start()'s documented fail-closed behavior) -- the dashboard
+    # must show the last known mark instead of resetting to entry price/zero P&L.
+    database_url = f"sqlite:///{tmp_path}/current_price.db"
+    engine1 = LocalPaperEngine(
+        initial_balance=10000.0, database_url=database_url, cost_model=CostModel.zero()
+    )
+    engine1.place_order("AAPL", "BUY", 10, 150.0)
+    engine1.update_positions_pnl({"AAPL": 160.0})
+    # Any subsequent trade event resyncs every open position, including AAPL's now-
+    # updated mark, even though this trade is on a different symbol.
+    engine1.place_order("MSFT", "BUY", 1, 50.0)
+
+    engine2 = LocalPaperEngine(database_url=database_url, cost_model=CostModel.zero())
+    restored = next(p for p in engine2.get_positions() if p.symbol == "AAPL")
+    assert restored.current_price == 160.0
+    assert restored.unrealized_pnl == 100.0
+
+
+def test_snapshot_current_prices_persists_without_a_trade(tmp_path):
+    # Positions can sit open a long time between fills with only price moving --
+    # snapshot_current_prices() is the throttled periodic path (called from the live
+    # loop's fast position-management tick) that keeps current_price durable even when
+    # no trade event happens to trigger the normal resync.
+    database_url = f"sqlite:///{tmp_path}/snapshot.db"
+    engine1 = LocalPaperEngine(
+        initial_balance=10000.0, database_url=database_url, cost_model=CostModel.zero()
+    )
+    engine1.place_order("AAPL", "BUY", 10, 150.0)
+    engine1.update_positions_pnl({"AAPL": 145.0})
+    engine1.snapshot_current_prices()
+
+    engine2 = LocalPaperEngine(database_url=database_url, cost_model=CostModel.zero())
+    restored = engine2.get_positions()[0]
+    assert restored.current_price == 145.0
+    assert restored.unrealized_pnl == -50.0
+
+
+def test_legacy_position_without_current_price_falls_back_to_entry(tmp_path):
+    # Rows persisted before the current_price column existed have it NULL -- must load
+    # exactly as before this change (current_price=entry_price, zero P&L), not crash or
+    # show a bogus mark.
+    from src.markets.nse.execution.paper_engine import PaperPositionRecord
+
+    database_url = f"sqlite:///{tmp_path}/legacy.db"
+    engine1 = LocalPaperEngine(
+        initial_balance=10000.0, database_url=database_url, cost_model=CostModel.zero()
+    )
+    engine1.place_order("AAPL", "BUY", 10, 150.0)
+    session = engine1._session()
+    session.query(PaperPositionRecord).update({"current_price": None})
+    session.commit()
+    session.close()
+
+    engine2 = LocalPaperEngine(database_url=database_url, cost_model=CostModel.zero())
+    restored = engine2.get_positions()[0]
+    assert restored.current_price == 150.0
+    assert restored.unrealized_pnl == 0.0
+
+
 def test_closed_trade_history_reconstructs_persisted_net_pnl(tmp_path):
     database_url = f"sqlite:///{tmp_path}/trade_history.db"
     engine1 = LocalPaperEngine(
@@ -307,14 +368,14 @@ def test_log_decision(trade_journal):
 
 @pytest.fixture
 def mock_dhan():
-    with patch("src.execution.adapter.get_dhan_client") as mock_get_client:
+    with patch("src.markets.nse.broker.dhan.execution.get_dhan_client") as mock_get_client:
         client = MagicMock()
         mock_get_client.return_value = client
         yield client
 
 
 def test_execution_adapter_place_order(mock_dhan):
-    with patch("src.execution.adapter.get_settings") as mock_settings:
+    with patch("src.markets.nse.broker.dhan.execution.get_settings") as mock_settings:
         mock_settings.return_value.dhan_client_id = "id"
         mock_settings.return_value.dhan_access_token.get_secret_value.return_value = "token"
         mock_settings.return_value.trading_mode = "paper"
@@ -333,7 +394,7 @@ def test_execution_adapter_place_order(mock_dhan):
 
 
 def test_execution_adapter_place_order_retry(mock_dhan):
-    with patch("src.execution.adapter.get_settings") as mock_settings:
+    with patch("src.markets.nse.broker.dhan.execution.get_settings") as mock_settings:
         mock_settings.return_value.dhan_client_id = "id"
         mock_settings.return_value.dhan_access_token.get_secret_value.return_value = "token"
 
@@ -354,7 +415,7 @@ def test_execution_adapter_place_order_retry(mock_dhan):
 
 
 def test_execution_adapter_get_order_status(mock_dhan):
-    with patch("src.execution.adapter.get_settings") as mock_settings:
+    with patch("src.markets.nse.broker.dhan.execution.get_settings") as mock_settings:
         mock_settings.return_value.dhan_client_id = "id"
         mock_settings.return_value.dhan_access_token.get_secret_value.return_value = "token"
 
@@ -382,7 +443,7 @@ def test_execution_adapter_get_order_status(mock_dhan):
 
 
 def test_execution_adapter_cancel_order(mock_dhan):
-    with patch("src.execution.adapter.get_settings") as mock_settings:
+    with patch("src.markets.nse.broker.dhan.execution.get_settings") as mock_settings:
         mock_settings.return_value.dhan_client_id = "id"
         mock_settings.return_value.dhan_access_token.get_secret_value.return_value = "token"
 
@@ -397,7 +458,7 @@ def test_execution_adapter_cancel_order(mock_dhan):
 
 
 def test_execution_adapter_get_positions(mock_dhan):
-    with patch("src.execution.adapter.get_settings") as mock_settings:
+    with patch("src.markets.nse.broker.dhan.execution.get_settings") as mock_settings:
         mock_settings.return_value.dhan_client_id = "id"
         mock_settings.return_value.dhan_access_token.get_secret_value.return_value = "token"
 
@@ -413,7 +474,7 @@ def test_execution_adapter_get_positions(mock_dhan):
 
 
 def test_execution_adapter_get_holdings(mock_dhan):
-    with patch("src.execution.adapter.get_settings") as mock_settings:
+    with patch("src.markets.nse.broker.dhan.execution.get_settings") as mock_settings:
         mock_settings.return_value.dhan_client_id = "id"
         mock_settings.return_value.dhan_access_token.get_secret_value.return_value = "token"
 
@@ -467,7 +528,7 @@ def test_local_adapter_methods(tmp_path):
 
 
 def test_execute_trades_helper(tmp_path):
-    with patch("src.execution.adapter.get_settings") as mock_settings:
+    with patch("src.markets.nse.broker.dhan.execution.get_settings") as mock_settings:
         mock_settings.return_value.max_position_size = 10000
         mock_settings.return_value.paper_wallet_balance = 1_000_000
         mock_settings.return_value.execution_mode = "local_paper"

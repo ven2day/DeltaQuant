@@ -13,6 +13,7 @@ Features:
 """
 
 import asyncio
+import hashlib
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -27,12 +28,14 @@ from src.agents.llm_factory import (
     current_provider,
     get_llm_circuit_breaker,
     get_llm_limiter,
+    invoke_with_fallback,
+    model_for_tier,
     primary_and_fallback_models,
 )
 from src.config import get_settings
-from src.finops import record_llm_response
-from src.utils.cache import get_news_cache, get_sentiment_cache
-from src.utils.circuit_breaker import CircuitBreakerOpenError
+from src.core.utils.cache import get_news_cache, get_sentiment_cache
+from src.core.utils.circuit_breaker import CircuitBreakerOpenError
+from src.finops import LLMCallReason, record_llm_response
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +103,10 @@ Consider:
 Respond with ONLY a JSON object:
 {"sentiment": <float between -1.0 and 1.0>, "reasoning": "<brief explanation>"}"""
 
+COMPACT_SENTIMENT_SYSTEM_PROMPT = """Score the supplied financial headlines from -1.0 bearish
+to +1.0 bullish. Return JSON only: {"sentiment":0.0,"reasoning":"one short sentence"}.
+Do not repeat headlines and do not provide trading, sizing, stop, or target advice."""
+
 
 class NewsAnalyst:
     """
@@ -123,7 +130,17 @@ class NewsAnalyst:
             # Use the smaller/cheaper fallback-tier model for news -- sentiment scoring
             # from a handful of headlines doesn't need the primary model's capability.
             _primary_model, fallback_model = primary_and_fallback_models()
-            self._llm = create_chat_model(fallback_model, temperature=0.1, max_tokens=256)
+            model = (
+                model_for_tier("FAST")
+                if getattr(self.settings, "llm_cost_optimization_enabled", False) is True
+                else fallback_model
+            )
+            max_tokens = (
+                self.settings.qwen_max_output_tokens_news
+                if getattr(self.settings, "llm_cost_optimization_enabled", False) is True
+                else 256
+            )
+            self._llm = create_chat_model(model, temperature=0.1, max_tokens=max_tokens)
         return self._llm
 
     def fetch_news(self, query: str, max_items: int = 10) -> list[NewsItem]:
@@ -168,7 +185,16 @@ class NewsAnalyst:
                 )
 
             # Cache the result
-            ttl = self.settings.cache_news_ttl
+            if query == "Indian stock market NIFTY SENSEX":
+                ttl = getattr(
+                    self.settings, "market_news_ttl_seconds", self.settings.cache_news_ttl
+                )
+            elif " sector " in f" {query.lower()} ":
+                ttl = getattr(
+                    self.settings, "sector_context_ttl_seconds", self.settings.cache_news_ttl
+                )
+            else:
+                ttl = self.settings.cache_news_ttl
             self._news_cache.set(cache_key, items, ttl)
 
             logger.info(f"Fetched {len(items)} news items for '{query}'")
@@ -178,7 +204,15 @@ class NewsAnalyst:
             logger.error(f"Error fetching news: {e}")
             return []
 
-    async def analyze_sentiment(self, headlines: list[str]) -> tuple[float, str]:
+    async def analyze_sentiment(
+        self,
+        headlines: list[str],
+        *,
+        market: str = "NSE",
+        cycle_id: str = "",
+        symbol: str = "",
+        call_reason: LLMCallReason = LLMCallReason.NEWS_ANALYSIS,
+    ) -> tuple[float, str]:
         """
         Analyze sentiment of headlines using LLM with caching.
 
@@ -193,7 +227,8 @@ class NewsAnalyst:
 
         # Check cache first
         headlines_key = "|".join(sorted(headlines[:10]))
-        cache_key = f"sentiment:{hash(headlines_key)}"
+        content_version = hashlib.sha256(headlines_key.encode("utf-8")).hexdigest()
+        cache_key = f"sentiment:{content_version}"
         cached = self._sentiment_cache.get(cache_key)
         if cached is not None:
             logger.debug("Sentiment cache hit")
@@ -210,22 +245,56 @@ class NewsAnalyst:
             if self.settings.enable_rate_limiting:
                 self._rate_limiter.acquire_sync()
 
-            llm = self._get_llm()
-
             # Format headlines for analysis
             headlines_text = "\n".join([f"- {h}" for h in headlines[:10]])
 
+            optimized = getattr(self.settings, "llm_cost_optimization_enabled", False) is True
+
             messages = [
-                SystemMessage(content=SENTIMENT_SYSTEM_PROMPT),
+                SystemMessage(
+                    content=(
+                        COMPACT_SENTIMENT_SYSTEM_PROMPT if optimized else SENTIMENT_SYSTEM_PROMPT
+                    )
+                ),
                 HumanMessage(content=f"Analyze these headlines:\n\n{headlines_text}"),
             ]
 
-            def invoke_llm():
-                return llm.invoke(messages)
+            if optimized:
+                model_used = model_for_tier("FAST")
 
-            response = self._circuit_breaker.call(invoke_llm)
-            _primary_model, fallback_model = primary_and_fallback_models()
-            record_llm_response("news_analyst", response, model=fallback_model)
+                def _record_model(name: str) -> None:
+                    nonlocal model_used
+                    model_used = name
+
+                response = invoke_with_fallback(
+                    messages,
+                    circuit_breaker=self._circuit_breaker,
+                    temperature=0.1,
+                    max_tokens=self.settings.qwen_max_output_tokens_news,
+                    models_to_try=(model_used, primary_and_fallback_models()[1]),
+                    trade_horizon="SHARED",
+                    on_model_selected=_record_model,
+                )
+            else:
+                llm = self._get_llm()
+
+                def invoke_llm():
+                    return llm.invoke(messages)
+
+                response = self._circuit_breaker.call(invoke_llm)
+                _primary_model, model_used = primary_and_fallback_models()
+            record_llm_response(
+                "news_analyst",
+                response,
+                model=model_used,
+                trade_horizon="SHARED",
+                purpose="background_news_context",
+                market=market,
+                call_reason=call_reason,
+                component="news_analyst",
+                cycle_id=cycle_id,
+                symbol=symbol,
+            )
             content = response.content.strip()
 
             # Parse JSON response
@@ -277,6 +346,11 @@ class NewsAnalyst:
         self,
         query: str,
         max_items: int = 10,
+        *,
+        market: str = "NSE",
+        cycle_id: str = "",
+        symbol: str = "",
+        call_reason: LLMCallReason = LLMCallReason.NEWS_ANALYSIS,
     ) -> NewsSentiment:
         """
         Fetch news and analyze sentiment for a query.
@@ -302,7 +376,13 @@ class NewsAnalyst:
         headlines = [item.title for item in items]
 
         # Analyze sentiment
-        sentiment, reasoning = await self.analyze_sentiment(headlines)
+        sentiment, reasoning = await self.analyze_sentiment(
+            headlines,
+            market=market,
+            cycle_id=cycle_id,
+            symbol=symbol,
+            call_reason=call_reason,
+        )
 
         # Update items with sentiment
         for item in items:
@@ -325,14 +405,26 @@ class NewsAnalyst:
             sentiment_label=label,
         )
 
-    async def get_market_sentiment(self) -> NewsSentiment:
+    async def get_market_sentiment(
+        self, *, market: str = "NSE", cycle_id: str = ""
+    ) -> NewsSentiment:
         """Get overall Indian stock market sentiment."""
-        return await self.get_sentiment("Indian stock market NIFTY SENSEX")
+        return await self.get_sentiment(
+            "Indian stock market NIFTY SENSEX", market=market, cycle_id=cycle_id
+        )
 
-    async def get_stock_sentiment(self, symbol: str) -> NewsSentiment:
+    async def get_stock_sentiment(
+        self, symbol: str, *, market: str = "NSE", cycle_id: str = ""
+    ) -> NewsSentiment:
         """Get sentiment for a specific stock."""
         query = f"{symbol} stock NSE India"
-        return await self.get_sentiment(query)
+        if market.upper() == "NSE" and not cycle_id:
+            # Preserve the original call contract for compatibility callers. The
+            # downstream analyze method still defaults to explicit NSE attribution.
+            return await self.get_sentiment(query)
+        return await self.get_sentiment(
+            query, market=market, cycle_id=cycle_id, symbol=symbol
+        )
 
 
 async def test_news_analyst():

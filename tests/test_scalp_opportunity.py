@@ -1,6 +1,6 @@
-from src.market.assessment_matrix import TimeframeAssessment
-from src.market.indicators import Timeframe
-from src.market.scalp_opportunity import ScalpOpportunity
+from src.core.indicators import Timeframe
+from src.markets.nse.strategies.assessment_matrix import TimeframeAssessment
+from src.markets.nse.strategies.scalp_opportunity import ScalpOpportunity
 
 
 def test_default_opportunity_is_a_reject_with_no_evidence():

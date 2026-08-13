@@ -1,15 +1,15 @@
-from src.market.indicators import Timeframe
-from src.market.signal_consolidation import (
+from src.core.aggregation import (
     AGREEMENT_CONFIDENCE_CAP,
     AGREEMENT_CONFIDENCE_STEP,
     consolidate_signals,
 )
-from src.market.signals import (
+from src.core.candidates import (
     SignalStrength,
     SignalType,
     StrategyType,
     TradingSignal,
 )
+from src.core.indicators import Timeframe
 
 
 def _signal(

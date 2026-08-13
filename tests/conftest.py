@@ -13,14 +13,14 @@ database, never production.
 import pytest
 
 import src.db.base as db_base
-import src.execution.adapter as adapter_module
-import src.market.data_feed as data_feed_module
-import src.market.dhan_auth as dhan_auth_module
-import src.market.dhan_historical_feed as dhan_historical_feed_module
-import src.market.dhan_quotes_feed as dhan_quotes_feed_module
-import src.market.live_data as live_data_module
-import src.market.websocket_feed as websocket_feed_module
-from src.utils.circuit_breaker import reset_all_circuit_breakers
+import src.markets.nse.broker.dhan.auth as dhan_auth_module
+import src.markets.nse.broker.dhan.execution as adapter_module
+import src.markets.nse.broker.dhan.historical as dhan_historical_feed_module
+import src.markets.nse.broker.dhan.legacy_stream as data_feed_module
+import src.markets.nse.broker.dhan.live_data as live_data_module
+import src.markets.nse.broker.dhan.quotes as dhan_quotes_feed_module
+import src.markets.nse.broker.dhan.websocket as websocket_feed_module
+from src.core.utils.circuit_breaker import reset_all_circuit_breakers
 
 
 @pytest.fixture(autouse=True, scope="session")
@@ -41,12 +41,12 @@ def _prevent_real_database_access(tmp_path_factory):
 def _prevent_real_dhan_auth():
     """No test may ever trigger a real DhanHQ login.
 
-    get_valid_access_token() (src/market/dhan_auth.py) will hit DhanHQ's real
+    get_valid_access_token() (src/markets/nse/broker/dhan/auth.py) will hit DhanHQ's real
     generateAccessToken endpoint with real PIN+TOTP credentials from .env if
     called unmocked — this account now has live credentials configured, not
     just a static (often-expired) token, so an accidental real call here is a
     real login attempt, not a harmless no-op. Every module that imported the
-    function via `from src.market.dhan_auth import get_valid_access_token`
+    function via `from src.markets.nse.broker.dhan.auth import get_valid_access_token`
     holds its own binding (patching the source module alone would miss them),
     so each is patched individually here — the same class of gap the database
     safety net above exists to close.

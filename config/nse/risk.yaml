@@ -1,0 +1,7 @@
+schema_version: 1
+market: NSE
+quantity_semantics: shares
+cost_model: nse
+market_kill_switch: NSE_KILL_SWITCH
+risk_limits_source: environment
+

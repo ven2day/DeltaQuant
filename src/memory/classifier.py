@@ -14,7 +14,9 @@ from uuid import uuid4
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
-from src.agents.llm_factory import create_chat_model, primary_and_fallback_models
+from src.agents.llm_factory import create_chat_model, model_for_tier, primary_and_fallback_models
+from src.config import get_settings
+from src.finops import LLMCallReason, record_llm_response
 
 from .analyzer import TradeOutcome
 
@@ -72,6 +74,10 @@ Respond with JSON:
 
 Be specific and practical. Focus on what the SYSTEM could do differently, not market luck."""
 
+COMPACT_CLASSIFIER_SYSTEM_PROMPT = """Classify one completed trade using one category from the
+provided taxonomy. Return JSON only with category, severity, description, lesson, and at most
+three context_factors. Keep description and lesson to one sentence each."""
+
 
 @dataclass
 class ClassifiedMistake:
@@ -111,6 +117,7 @@ class MistakeClassifier:
     """
 
     _llm: Any = None
+    _model_name: str = ""
 
     def __post_init__(self):
         self._initialize_llm()
@@ -118,8 +125,19 @@ class MistakeClassifier:
     def _initialize_llm(self) -> None:
         """Initialize the LLM for classification (currently configured provider)."""
         # Use the faster/cheaper fallback-tier model for classification.
+        settings = get_settings()
         _primary_model, fallback_model = primary_and_fallback_models()
-        self._llm = create_chat_model(fallback_model, temperature=0.2, max_tokens=512)
+        self._model_name = (
+            model_for_tier("FAST")
+            if getattr(settings, "llm_cost_optimization_enabled", False) is True
+            else fallback_model
+        )
+        max_tokens = (
+            settings.qwen_max_output_tokens_learning
+            if getattr(settings, "llm_cost_optimization_enabled", False) is True
+            else 512
+        )
+        self._llm = create_chat_model(self._model_name, temperature=0.2, max_tokens=max_tokens)
 
     def classify(self, outcome: TradeOutcome) -> ClassifiedMistake | None:
         """
@@ -236,8 +254,30 @@ class MistakeClassifier:
         """Get LLM classification for additional context."""
 
         try:
+            settings = get_settings()
             # Build context for LLM
-            context = f"""
+            if getattr(settings, "llm_cost_optimization_enabled", False) is True:
+                context = json.dumps(
+                    {
+                        "trade_id": outcome.trade_id,
+                        "symbol": outcome.symbol,
+                        "strategy": outcome.strategy,
+                        "regime": outcome.regime,
+                        "winner": outcome.is_winner,
+                        "pnl_pct": round(outcome.profit_loss_pct, 3),
+                        "hold_minutes": outcome.hold_duration_minutes,
+                        "mae": round(outcome.mae, 3),
+                        "mfe": round(outcome.mfe, 3),
+                        "efficiency": round(outcome.efficiency, 3),
+                        "hit_stop": outcome.hit_stop_loss,
+                        "hit_target": outcome.hit_target,
+                        "premature": outcome.was_premature_exit,
+                        "late": outcome.was_late_exit,
+                    },
+                    separators=(",", ":"),
+                )
+            else:
+                context = f"""
 ## Trade Outcome to Classify
 
 - Trade ID: {outcome.trade_id}
@@ -263,11 +303,28 @@ Analyze what went wrong and provide a lesson.
 """
 
             messages = [
-                SystemMessage(content=CLASSIFIER_SYSTEM_PROMPT),
+                SystemMessage(
+                    content=(
+                        COMPACT_CLASSIFIER_SYSTEM_PROMPT
+                        if getattr(settings, "llm_cost_optimization_enabled", False) is True
+                        else CLASSIFIER_SYSTEM_PROMPT
+                    )
+                ),
                 HumanMessage(content=context),
             ]
 
             response = self._llm.invoke(messages)
+            record_llm_response(
+                "memory_classifier",
+                response,
+                model=self._model_name,
+                trade_horizon="SHARED",
+                purpose="post_trade_memory_classification",
+                symbol=str(getattr(outcome, "symbol", "")),
+                market="NSE",
+                call_reason=LLMCallReason.BACKGROUND_ANALYSIS,
+                component="memory_classifier",
+            )
             return self._parse_llm_response(response.content)
 
         except Exception as e:

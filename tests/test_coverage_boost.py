@@ -5,8 +5,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from src.market.data_feed import Exchange, MarketDataFeed, MarketTick
-from src.market.websocket_feed import (
+from src.markets.nse.broker.dhan.legacy_stream import Exchange, MarketDataFeed, MarketTick
+from src.markets.nse.broker.dhan.websocket import (
     DhanWebSocketFeed,
     ExchangeSegment,
     QuoteData,
@@ -23,9 +23,9 @@ def market_data_feed():
 
 @pytest.mark.asyncio
 async def test_market_feed_connect(market_data_feed):
-    with patch("src.market.data_feed.get_valid_access_token", return_value="token"):
+    with patch("src.markets.nse.broker.dhan.legacy_stream.get_valid_access_token", return_value="token"):
         with patch(
-            "src.market.data_feed.websockets.connect", new_callable=AsyncMock
+            "src.markets.nse.broker.dhan.legacy_stream.websockets.connect", new_callable=AsyncMock
         ) as mock_connect:
             await market_data_feed.connect()
             assert market_data_feed._running is True
@@ -45,10 +45,10 @@ async def test_market_feed_disconnect(market_data_feed):
 
 @pytest.mark.asyncio
 async def test_market_feed_connect_retry(market_data_feed):
-    with patch("src.market.data_feed.get_valid_access_token", return_value="token"):
+    with patch("src.markets.nse.broker.dhan.legacy_stream.get_valid_access_token", return_value="token"):
         # Mock websockets.connect to fail once then succeed
         with patch(
-            "src.market.data_feed.websockets.connect", new_callable=AsyncMock
+            "src.markets.nse.broker.dhan.legacy_stream.websockets.connect", new_callable=AsyncMock
         ) as mock_connect:
             mock_connect.side_effect = [Exception("Fail"), AsyncMock()]
 
@@ -158,7 +158,7 @@ async def test_market_feed_streaming(market_data_feed):
 
 @pytest.fixture
 def dhan_feed():
-    with patch("src.market.websocket_feed.get_settings") as mock:
+    with patch("src.markets.nse.broker.dhan.websocket.get_settings") as mock:
         mock.return_value.dhan_access_token.get_secret_value.return_value = "t"
         mock.return_value.dhan_client_id = "c"
         return DhanWebSocketFeed()

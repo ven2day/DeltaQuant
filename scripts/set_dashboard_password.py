@@ -4,12 +4,12 @@ Generate the dashboard login credentials required by ENABLE_WEB_UI=true.
     uv run python scripts/set_dashboard_password.py
 
 Prompts for a password (hidden input, confirmed twice), then prints two lines to paste
-into .env:
+into env/.env.common:
 
     WEB_UI_PASSWORD_HASH=pbkdf2_sha256$600000$...$...
     WEB_UI_SESSION_SECRET=<random>
 
-Never writes to .env itself -- .env is operator-edited by convention throughout this
+Never writes to the profile itself -- operator configuration is edited by convention throughout this
 project (see src/config/settings.py), and a script silently mutating it would be a
 surprising side effect for something this security-sensitive. Run this again any time
 you want to change the password; it prints a fresh WEB_UI_SESSION_SECRET too, which
@@ -17,7 +17,7 @@ invalidates every existing dashboard login session (a deliberate side effect of 
 password change, not a bug).
 
 See src/webui/auth.py for the hashing/session-signing implementation, and M-8 in
-DeltaQuant-Quant-Risk-Review.md for why this exists: the dashboard exposes wallet
+docs/audits/DeltaQuant-Quant-Risk-Review.md for why this exists: the dashboard exposes wallet
 balance, positions, and trading activity, and ENABLE_WEB_UI=true now fails closed at
 startup (validate_configuration) without WEB_UI_PASSWORD_HASH and WEB_UI_SESSION_SECRET
 both being set.
@@ -57,12 +57,12 @@ def main() -> None:
     password_hash = hash_password(password)
     session_secret = secrets.token_urlsafe(48)
 
-    print("\nPaste these into .env (replacing any existing values):\n")
+    print("\nPaste these into env/.env.common (replacing any existing values):\n")
     print(f"WEB_UI_PASSWORD_HASH={password_hash}")
     print(f"WEB_UI_SESSION_SECRET={session_secret}")
     print(
-        "\nWEB_UI_USERNAME defaults to 'admin' — set WEB_UI_USERNAME in .env too if you "
-        "want a different login name."
+        "\nWEB_UI_USERNAME defaults to 'admin' — configure WEB_UI_USERNAME in "
+        "env/.env.common if you want a different login name."
     )
     print(
         "\nNote: generating a new WEB_UI_SESSION_SECRET invalidates every existing "

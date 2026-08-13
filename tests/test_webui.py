@@ -4,6 +4,7 @@ from unittest.mock import patch
 import pytest
 
 from src.dashboard.stats import TradingStats
+from src.finops.cost_tracker import CostTracker
 from src.webui.auth import hash_password
 from src.webui.schema import stats_to_dict
 from src.webui.server import ConnectionHub, WebUIServer, create_app
@@ -92,6 +93,28 @@ def test_stats_to_dict_preserves_nested_fields(stats):
     assert data["activity_log"][-1]["message"] == "hello"
 
 
+def test_finops_api_exposes_structured_totals_without_prompts():
+    tracker = CostTracker()
+    tracker.record_usage(
+        "market_regime",
+        "qwen3.7-plus",
+        30,
+        5,
+        market="NSE",
+        call_reason="REGIME_CONTEXT",
+        component="market_regime",
+    )
+    with patch("src.webui.server.get_cost_tracker", return_value=tracker):
+        client = _logged_in_client()
+        summary = client.get("/api/finops/summary?market=NSE").json()
+        calls = client.get("/api/finops/calls?market=NSE").json()
+    assert summary["calls"] == 1
+    assert summary["candidate_review_calls"] == 0
+    assert calls[0]["market"] == "NSE"
+    assert calls[0]["call_reason"] == "REGIME_CONTEXT"
+    assert "prompt" not in calls[0]
+
+
 def test_stats_to_dict_round_trips_scalp_fields(stats):
     # Stage 5: scalp_opportunities/scalp_funnel are plain list/dict fields on
     # TradingStats -- must survive dataclasses.asdict() + json.dumps() unmangled,
@@ -99,12 +122,16 @@ def test_stats_to_dict_round_trips_scalp_fields(stats):
     stats.scalp_opportunities = [
         {"symbol": "RELIANCE", "direction": "BUY", "final_decision": "ENTER_NOW"}
     ]
-    stats.scalp_funnel = {"raw_triggers": 42, "h8_admitted": 0}
+    stats.scalp_symbol_statuses = [{"symbol": "RELIANCE", "decision": "BUY", "stage": "BUY_SETUP"}]
+    stats.scalp_scan_completed_at = "2026-08-10T12:00:00+05:30"
+    stats.scalp_funnel = {"raw_triggers": 42, "registry_eligible": 0}
 
     data = stats_to_dict(stats)
     dumped = json.loads(json.dumps(data))  # must be JSON round-trippable too
 
     assert dumped["scalp_opportunities"][0]["symbol"] == "RELIANCE"
+    assert dumped["scalp_symbol_statuses"][0]["decision"] == "BUY"
+    assert dumped["scalp_scan_completed_at"] == "2026-08-10T12:00:00+05:30"
     assert dumped["scalp_funnel"]["raw_triggers"] == 42
 
 
@@ -113,6 +140,8 @@ def test_stats_to_dict_scalp_fields_default_empty():
     # the UI can render "no scalp activity" instead of a KeyError.
     data = stats_to_dict(TradingStats())
     assert data["scalp_opportunities"] == []
+    assert data["scalp_symbol_statuses"] == []
+    assert data["scalp_scan_completed_at"] == ""
     assert data["scalp_funnel"] == {}
 
 
@@ -178,27 +207,21 @@ def test_login_with_correct_credentials_sets_cookie_and_succeeds():
 
 def test_login_with_wrong_password_rejected():
     client = _make_app()
-    response = client.post(
-        "/api/login", json={"username": TEST_USERNAME, "password": "wrong"}
-    )
+    response = client.post("/api/login", json={"username": TEST_USERNAME, "password": "wrong"})
     assert response.status_code == 401
     assert "dq_session" not in response.cookies
 
 
 def test_login_with_wrong_username_rejected():
     client = _make_app()
-    response = client.post(
-        "/api/login", json={"username": "nobody", "password": TEST_PASSWORD}
-    )
+    response = client.post("/api/login", json={"username": "nobody", "password": TEST_PASSWORD})
     assert response.status_code == 401
 
 
 def test_login_lockout_after_max_attempts():
     client = _make_app(login_max_attempts=3, login_lockout_minutes=15)
     for _ in range(3):
-        response = client.post(
-            "/api/login", json={"username": TEST_USERNAME, "password": "wrong"}
-        )
+        response = client.post("/api/login", json={"username": TEST_USERNAME, "password": "wrong"})
         assert response.status_code == 401
 
     # Correct credentials are now also rejected — the lockout is by IP, not by
@@ -444,6 +467,24 @@ def test_websocket_accepted_with_valid_session_cookie():
     with client.websocket_connect("/ws") as ws:
         message = ws.receive_json()
         assert message == {"type": "state", "data": {"ok": True}}
+
+
+def test_websocket_polling_pushes_fresh_worker_snapshot():
+    snapshots = iter(
+        [
+            {"type": "markets", "data": {}},
+            {"type": "state", "data": {"current_balance": 1_000_000.0}},
+        ]
+    )
+    client = _logged_in_client(
+        get_snapshot=lambda: next(snapshots), websocket_poll_seconds=0.01
+    )
+    with client.websocket_connect("/ws") as ws:
+        assert ws.receive_json()["type"] == "markets"
+        assert ws.receive_json() == {
+            "type": "state",
+            "data": {"current_balance": 1_000_000.0},
+        }
 
 
 # --- WebUIServer startup-failure isolation ---

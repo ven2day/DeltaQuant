@@ -9,13 +9,17 @@ Features:
 - Walk-forward (rolling-origin) out-of-sample validation, not a single tiny holdout
 - Probability calibration (Platt scaling) instead of a raw R^2-weighted vote
 - Strict train/validation/live-inference time separation (see H-7,
-  DeltaQuant-Quant-Risk-Review.md): the row used for live inference is never a row
+  docs/audits/DeltaQuant-Quant-Risk-Review.md): the row used for live inference is never a row
   that also has a known target.
 """
 
 import logging
+import threading
+from collections import OrderedDict
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime
+from time import perf_counter
 from typing import Any
 
 import numpy as np
@@ -38,6 +42,11 @@ except ImportError:
     TimeSeriesSplit = None
 
 from src.config import get_settings
+from src.core.ml import (
+    ArtifactRejectedError,
+    PredictionArtifactKey,
+    PredictionArtifactRegistry,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -139,18 +148,32 @@ class _ValidationResult:
     folds_used: int
 
 
+@dataclass(frozen=True)
+class PredictionCacheMetrics:
+    hits: int
+    misses: int
+    training_runs: int
+    walk_forward_runs: int
+    inference_count: int
+    inference_duration_ms: float
+    inference_seconds: float
+    entries: int
+
+
 class PredictionAgent:
     """
-    Predicts price direction using ensemble ML.
+    Live inference facade for the validated ensemble artifact registry.
 
-    Uses multiple models (LinearRegression, RandomForest, GradientBoosting), validates
-    them out-of-sample via rolling-origin walk-forward folds (not a single 5-row
-    holdout), refits on all available labeled data before producing the live inference,
-    and calibrates the ensemble's raw regression output into a probability via Platt
-    scaling fit on the pooled out-of-sample predictions.
+    The research helpers remain on this class for backward-compatible offline tools,
+    but ``predict_cached`` is the production entry point and cannot train or validate.
     """
 
-    def __init__(self, lookback_periods: int = 20):
+    def __init__(
+        self,
+        lookback_periods: int = 20,
+        cache_size: int = 512,
+        artifact_registry: PredictionArtifactRegistry | None = None,
+    ):
         """
         Initialize prediction agent.
 
@@ -159,6 +182,202 @@ class PredictionAgent:
         """
         self.lookback = lookback_periods
         self.settings = get_settings()
+        self._cache_size = max(1, cache_size)
+        self.artifact_registry = artifact_registry or PredictionArtifactRegistry()
+        self._cache: OrderedDict[tuple[str, ...], PredictionSignal] = OrderedDict()
+        self._cache_lock = threading.Lock()
+        self._inflight: dict[tuple[str, ...], threading.Event] = {}
+        self._cache_hits = 0
+        self._cache_misses = 0
+        # These remain zero by construction in the live agent.  Offline training is
+        # owned by OfflinePredictionTrainer and exposes its own counters.
+        self._training_runs = 0
+        self._walk_forward_runs = 0
+        self._inference_count = 0
+        self._inference_seconds = 0.0
+
+    @staticmethod
+    def _last_candle_token(data: pd.DataFrame | dict[str, Any]) -> str:
+        if isinstance(data, pd.DataFrame):
+            if data.empty:
+                return "empty"
+            value = data.index[-1]
+            return value.isoformat() if hasattr(value, "isoformat") else str(value)
+        for key in ("timestamp", "Timestamp", "date", "Date"):
+            values = data.get(key)
+            if values is not None and len(values):
+                value = values[-1]
+                return value.isoformat() if hasattr(value, "isoformat") else str(value)
+        closes = data.get("Close", data.get("close", []))
+        return f"row-{len(closes)}"
+
+    def cache_metrics(self) -> PredictionCacheMetrics:
+        """Return a consistent snapshot of per-process ML-cache telemetry."""
+        with self._cache_lock:
+            return PredictionCacheMetrics(
+                hits=self._cache_hits,
+                misses=self._cache_misses,
+                training_runs=self._training_runs,
+                walk_forward_runs=self._walk_forward_runs,
+                inference_count=self._inference_count,
+                inference_duration_ms=self._inference_seconds * 1000.0,
+                inference_seconds=self._inference_seconds,
+                entries=len(self._cache),
+            )
+
+    def clear_cache(self) -> None:
+        with self._cache_lock:
+            self._cache.clear()
+
+    def predict_cached(
+        self,
+        historical_data: pd.DataFrame | dict[str, Any],
+        symbol: str,
+        *,
+        timeframe: str,
+        trade_horizon: str,
+        strategy_version: str = "shared_prediction_v1",
+        regime: str = "all",
+        market: str = "NSE",
+        instrument_scope: str = "*",
+        model_version: str = MODEL_VERSION,
+    ) -> PredictionSignal:
+        """Inference once per settled candle/artifact and coalesce duplicate callers.
+
+        This live method never calls ``fit`` or ``_walk_forward_validate``.  Missing or
+        semantically mismatched artifacts produce an explicit abstention.
+        """
+        artifact_key = PredictionArtifactKey(
+            strategy_version=strategy_version,
+            timeframe=timeframe,
+            trade_horizon=trade_horizon,
+            regime=regime,
+            model_version=model_version,
+            feature_version=FEATURE_VERSION,
+            market=market,
+            instrument_scope=instrument_scope,
+        ).normalized()
+        key = (
+            artifact_key.market,
+            artifact_key.instrument_scope,
+            symbol,
+            artifact_key.timeframe,
+            artifact_key.strategy_version,
+            artifact_key.model_version,
+            artifact_key.feature_version,
+            self._last_candle_token(historical_data),
+        )
+        while True:
+            with self._cache_lock:
+                cached = self._cache.get(key)
+                if cached is not None:
+                    self._cache.move_to_end(key)
+                    self._cache_hits += 1
+                    return deepcopy(cached)
+                event = self._inflight.get(key)
+                if event is None:
+                    event = threading.Event()
+                    self._inflight[key] = event
+                    self._cache_misses += 1
+                    break
+            event.wait()
+
+        started = perf_counter()
+        try:
+            prediction, model_invoked = self.predict_live(
+                historical_data, symbol, artifact_key=artifact_key
+            )
+            elapsed = perf_counter() - started
+            with self._cache_lock:
+                if model_invoked:
+                    self._inference_count += 1
+                    self._inference_seconds += elapsed
+                self._cache[key] = deepcopy(prediction)
+                self._cache.move_to_end(key)
+                while len(self._cache) > self._cache_size:
+                    self._cache.popitem(last=False)
+            return prediction
+        finally:
+            with self._cache_lock:
+                completed = self._inflight.pop(key, None)
+                if completed is not None:
+                    completed.set()
+
+    def predict_live(
+        self,
+        historical_data: pd.DataFrame | dict[str, Any],
+        symbol: str,
+        *,
+        artifact_key: PredictionArtifactKey,
+    ) -> tuple[PredictionSignal, bool]:
+        """Run only feature extraction and ``predict`` on a validated artifact."""
+        if not SKLEARN_AVAILABLE:
+            return self._abstain(symbol, "scikit-learn unavailable for live inference"), False
+        try:
+            artifact = self.artifact_registry.load(artifact_key)
+        except (ArtifactRejectedError, OSError, ValueError) as exc:
+            return self._abstain(symbol, f"validated model artifact unavailable: {exc}"), False
+
+        try:
+            df = (
+                pd.DataFrame(historical_data)
+                if isinstance(historical_data, dict)
+                else historical_data.copy()
+            )
+            aliases = {str(column).lower(): column for column in df.columns}
+            required = ["open", "high", "low", "close", "volume"]
+            if not all(name in aliases for name in required):
+                return self._abstain(symbol, "live feature frame is missing OHLCV columns"), False
+            df = df.rename(columns={aliases[name]: name.title() for name in required})
+            frame = self._compute_feature_frame(df)
+            if frame is None:
+                return self._abstain(symbol, "insufficient live feature history"), False
+            live_rows = frame[frame["target"].isna()]
+            if live_rows.empty:
+                return self._abstain(symbol, "no unseen settled row for live inference"), False
+            live_features = live_rows[FEATURE_COLS].iloc[-1:].to_numpy()
+            live_scaled = artifact.scaler.transform(live_features)
+            predictions = {
+                name: float(model.predict(live_scaled)[0])
+                for name, model in artifact.models.items()
+                if name in artifact.weights
+            }
+            available_weight = sum(
+                weight for name, weight in artifact.weights.items() if name in predictions
+            )
+            if not predictions or available_weight < WEIGHT_COLLAPSE_EPS:
+                return self._abstain(symbol, "validated artifact has no usable model weight"), False
+            ensemble_raw = sum(
+                predictions[name] * artifact.weights[name] for name in predictions
+            ) / available_weight
+            probability_up = self._calibrated_probability(artifact.calibrator, ensemble_raw)
+            direction = "up" if probability_up >= 0.5 else "down"
+            confidence = max(probability_up, 1.0 - probability_up)
+            metadata = artifact.metadata
+            return (
+                PredictionSignal(
+                    symbol=symbol,
+                    direction=direction,
+                    confidence=confidence,
+                    predicted_change_pct=ensemble_raw * 100.0,
+                    reasoning=(
+                        f"Inference-only artifact {metadata.artifact_version}; "
+                        f"calibrated P(up)={probability_up:.2f}; "
+                        f"{metadata.oos_samples} offline OOS samples."
+                    ),
+                    abstained=False,
+                    feature_version=metadata.key.feature_version,
+                    model_version=(
+                        f"{metadata.key.model_version}:{metadata.artifact_version}"
+                    ),
+                    oos_samples=metadata.oos_samples,
+                    calibration_by_regime=metadata.calibration_by_regime,
+                ),
+                True,
+            )
+        except Exception as exc:
+            logger.exception("Live inference failed for %s", symbol)
+            return self._abstain(symbol, f"validated artifact inference failed: {exc}"), False
 
     def _compute_feature_frame(self, df: pd.DataFrame) -> pd.DataFrame | None:
         """
@@ -244,7 +463,9 @@ class PredictionAgent:
                 n_estimators=50,
                 max_depth=5,
                 random_state=42,
-                n_jobs=-1,
+                # Outer candidate inference is already bounded-concurrent. Nested
+                # process-wide parallelism here causes severe CPU oversubscription.
+                n_jobs=1,
             ),
             "gradient_boost": lambda: GradientBoostingRegressor(
                 n_estimators=50,
@@ -281,13 +502,14 @@ class PredictionAgent:
         """Rolling-origin (expanding window) out-of-sample validation.
 
         Replaces the old "withhold the last 5 rows" holdout: each fold trains only on
-        data strictly before the fold's test window (sklearn TimeSeriesSplit), so the
+        data strictly before the fold's test window (sklearn TimeSeriesSplit), with a
+        one-row embargo for the next-bar target, so the
         per-model weight is an average over several genuinely out-of-sample windows
         instead of one small, arbitrary slice.
         """
         n = len(x_matrix)
         n_splits = min(N_WALK_FORWARD_SPLITS, max(2, n // MIN_FOLD_TEST_SIZE - 1))
-        tscv = TimeSeriesSplit(n_splits=n_splits)
+        tscv = TimeSeriesSplit(n_splits=n_splits, gap=1)
 
         per_model_r2: dict[str, list[float]] = {name: [] for name in model_factories}
         oos_rows: list[_OOSRow] = []
@@ -402,7 +624,10 @@ class PredictionAgent:
         symbol: str = "UNKNOWN",
     ) -> PredictionSignal:
         """
-        Predict next candle direction using a walk-forward-validated, calibrated ensemble.
+        Offline one-shot train/validate/predict helper.
+
+        Live code must call ``predict_cached``.  Artifact production should use
+        ``OfflinePredictionTrainer`` so the validated result is versioned and admitted.
 
         Args:
             historical_data: DataFrame with OHLCV columns or dict
@@ -588,6 +813,7 @@ def prediction_node(state: dict[str, Any]) -> dict[str, Any]:
     invocations in tests or scripts/run_trading.py).
     """
     agent = PredictionAgent()
+    settings = get_settings()
     precomputed = state.get("precomputed_predictions") or {}
 
     signals = state.get("signals", [])
@@ -599,7 +825,7 @@ def prediction_node(state: dict[str, Any]) -> dict[str, Any]:
         if not symbol or symbol in seen_symbols:
             continue
         seen_symbols.add(symbol)
-        if len(seen_symbols) > 3:  # Limit to top 3 distinct symbols
+        if len(seen_symbols) > settings.llm_prediction_context_max_symbols:
             break
 
         cached = precomputed.get(f"{symbol}|{signal.get('timeframe', '')}")
@@ -609,13 +835,22 @@ def prediction_node(state: dict[str, Any]) -> dict[str, Any]:
 
         try:
             # Fetch historical data
-            from src.market.historical_feed import HistoricalDataFeed
+            from src.markets.nse.market_data.historical_feed import HistoricalDataFeed
 
             feed = HistoricalDataFeed(symbols=[symbol])
             hist = feed.get_historical(symbol, period="1mo")
 
             if hist is not None and not hist.empty:
-                pred = agent.predict(hist, symbol)
+                pred = agent.predict_cached(
+                    hist,
+                    symbol,
+                    timeframe=str(signal.get("timeframe", "1d")),
+                    trade_horizon=str(signal.get("trade_horizon", "SWING")),
+                    strategy_version=str(
+                        signal.get("strategy_version", signal.get("strategy", "shared_prediction_v1"))
+                    ),
+                    regime=str(state.get("market_regime", "all") or "all"),
+                )
                 predictions.append(pred.to_dict())
         except Exception as e:
             logger.warning(f"Could not generate prediction for {symbol}: {e}")

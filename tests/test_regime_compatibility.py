@@ -1,9 +1,9 @@
-from src.market.regime_compatibility import (
+from src.markets.nse.strategies.regime_compatibility import (
     REGIME_STRATEGY_COMPATIBILITY,
     filter_regime_compatible,
     is_regime_compatible,
 )
-from src.market.scalp_opportunity import ScalpOpportunity
+from src.markets.nse.strategies.scalp_opportunity import ScalpOpportunity
 
 
 def test_momentum_compatible_with_trending_up():
@@ -100,10 +100,11 @@ def test_filter_handles_empty_input():
     assert rejected == []
 
 
-def test_filter_never_touches_h8_registry_import():
+def test_legacy_filter_never_touches_strategy_eligibility_import():
     """Structural guardrail: this module must have no import relationship with the
-    H-8 registry at all, so it cannot be silently 'extended' into an admission
-    decision -- confirmed by inspecting the module's own imports."""
-    import src.market.regime_compatibility as module
+    strategy eligibility registry, so the legacy advisory helper cannot become a
+    second runtime admission decision."""
+    import src.markets.nse.strategies.regime_compatibility as module
 
     assert "StrategyRegistry" not in dir(module)
+    assert "StrategyEligibilityRegistry" not in dir(module)

@@ -32,24 +32,43 @@ with patch("src.config.get_settings") as mock_get_settings:
 
 
 def _register_validated_strategy(
-    directory, strategy_name: str, *, timeframe: str = "", trade_horizon: str = "SWING"
+    directory, strategy_name: str, *, timeframe: str = "15m", trade_horizon: str = "SWING"
 ) -> None:
-    """Seed a current VALIDATED H-8 registry artifact for ``strategy_name`` in
-    ``directory`` -- test helper for strategy_selection_node's admission gate."""
-    from src.backtesting.strategy_registry import StrategyRegistry, build_strategy_version
-
-    version = build_strategy_version(
-        strategy_name,
-        owner="test",
-        dataset_id="test-dataset",
-        oos_trades=100,
-        oos_expectancy=2.0,
-        oos_return_pct=10.0,
-        fold_consistency=0.8,
-        timeframe=timeframe,
-        trade_horizon=trade_horizon,
+    """Seed one paper-approved strategy-eligibility record."""
+    from src.backtesting.strategy_eligibility import (
+        EligibilityStatus,
+        StrategyEligibility,
+        StrategyEligibilityRegistry,
     )
-    StrategyRegistry(directory).register(version)
+
+    record = StrategyEligibility(
+        strategy_name=strategy_name,
+        timeframe=timeframe,
+        model_version=f"{strategy_name}-v1",
+        validation_status=EligibilityStatus.PAPER_APPROVED,
+        validated_at="2026-08-01T00:00:00+00:00",
+        validation_window={"dataset_id": "test-dataset", "legacy_horizon": trade_horizon},
+        oos_trade_count=100,
+        oos_profit_factor=1.4,
+        oos_max_drawdown=0.08,
+        oos_win_rate=0.58,
+        minimum_model_confidence=0.0,
+    )
+    StrategyEligibilityRegistry(directory).register(record)
+
+
+def _eligible_signal(strategy: str, *, timeframe: str = "15m") -> dict:
+    return {
+        "symbol": "RELIANCE",
+        "signal_type": "BUY",
+        "strategy": strategy,
+        "supporting_strategies": [strategy],
+        "timeframe": timeframe,
+        "confidence": 0.8,
+        "risk_reward_ratio": 2.0,
+        "registry_decision": "ALLOW",
+        "registry_qwen_allowed": True,
+    }
 
 
 # --- Market Regime Tests ---
@@ -249,7 +268,7 @@ def test_compute_return_correlations():
 def test_risk_compliance_pairwise_correlation_blocks():
     # A already holds RELIANCE; a new candidate that is 0.95-correlated with it must be
     # REJECTED even though they're in different sectors (sector caps alone would miss
-    # this). H-3 (DeltaQuant-Quant-Risk-Review.md): pairwise_correlation was hardened
+    # this). H-3 (docs/audits/DeltaQuant-Quant-Risk-Review.md): pairwise_correlation was hardened
     # from a warning to a block -- a correlated-cluster cap that can't actually block
     # let the system pyramid the same macro bet under a formally "risk approved" trade.
     state = create_initial_state()
@@ -341,10 +360,10 @@ def test_parse_validation_response_genuine_parse_failure_is_plain_english():
 
 @patch("src.agents.llm_factory.create_chat_model")
 @patch("src.agents.signal_validation.get_settings")
-def test_signal_validation_node_falls_back_to_secondary_model_on_rate_limit(
+def test_signal_validation_node_fails_closed_on_qwen_rate_limit(
     mock_settings, mock_llm_cls
 ):
-    """Same regression guard as strategy_selection's version, for signal_validation_node."""
+    """A Qwen failure must not introduce another provider or approve a trade."""
     mock_settings.return_value.groq_api_key.get_secret_value.return_value = "token"
 
     mock_agent_ok = MagicMock()
@@ -361,10 +380,9 @@ def test_signal_validation_node_falls_back_to_secondary_model_on_rate_limit(
 
     result = signal_validation_node(state)
 
-    assert mock_llm_cls.call_count == 2
-    assert len(result["validated_signals"]) == 1
-    # Confirms it took the real LLM path, not _fallback_signal_validation.
-    assert result["validated_signals"][0]["signal_id"] == "1"
+    assert mock_llm_cls.call_count == 1
+    assert result["validated_signals"] == []
+    assert len(result["rejected_signals"]) == 1
 
 
 @patch("src.agents.llm_factory.create_chat_model")
@@ -466,6 +484,7 @@ def test_strategy_selection_node_threads_data_namespace_from_state(
     mock_get_tracker.return_value = mock_tracker
 
     state = create_initial_state(data_namespace="mock_simulated")
+    state["signals"] = [_eligible_signal("breakout")]
     strategy_selection_node(state)
 
     mock_get_tracker.assert_called_once_with("mock_simulated")
@@ -486,8 +505,8 @@ def test_parse_strategy_response():
 def test_parse_strategy_response_accepts_ema_strategies():
     """The three Traderversity-derived strategies (ema_heiken_ashi_rsi, ema_psar,
     ema_cci) must pass the same allowlist as the original four -- the LLM can select
-    them, but (like every strategy) they still need a current VALIDATED registry entry
-    to actually trade, enforced downstream by strategy_selection_node's H-8 gate."""
+    them, but (like every strategy) they still need an environment-appropriate eligibility
+    decision to trade, enforced downstream of candidate generation."""
     content = (
         '{"active_strategies": ["ema_heiken_ashi_rsi", "ema_psar", "ema_cci"], '
         '"reasoning": "trending market"}'
@@ -498,19 +517,10 @@ def test_parse_strategy_response_accepts_ema_strategies():
 
 @patch("src.agents.llm_factory.create_chat_model")
 @patch("src.agents.strategy_selection.get_settings")
-def test_strategy_selection_node_falls_back_to_secondary_model_on_rate_limit(
+def test_strategy_selection_node_fails_closed_on_qwen_rate_limit(
     mock_settings, mock_llm_cls, tmp_path
 ):
-    """Regression guard: strategy_selection_node (and signal_validation_node, tested
-    separately below) used to call ONLY the primary model -- discarding
-    primary_and_fallback_models()'s second element entirely -- so once Groq's daily
-    token quota on the primary model was exhausted, every call failed straight to the
-    crude rule-based fallback for the rest of the day, even though the secondary model
-    (a different model = a different Groq daily-quota bucket) was still working fine
-    for market_regime and news_analyst. Both nodes now go through
-    llm_factory.invoke_with_fallback, the same retry-on-429 path market_regime always
-    had -- this proves a primary-model 429 no longer skips straight to the fallback
-    rule-based validation."""
+    """A Qwen rate limit uses the deterministic fail-closed path, not another LLM."""
     _register_validated_strategy(tmp_path, "breakout")
     mock_settings.return_value.groq_api_key.get_secret_value.return_value = "token"
     mock_settings.return_value.strategy_registry_dir = str(tmp_path)
@@ -527,19 +537,18 @@ def test_strategy_selection_node_falls_back_to_secondary_model_on_rate_limit(
     ]
 
     state = create_initial_state()
+    state["signals"] = [_eligible_signal("breakout")]
     result = strategy_selection_node(state)
 
-    assert mock_llm_cls.call_count == 2
-    assert result["active_strategies"] == ["breakout"]
-    # Confirms it took the real LLM path, not _fallback_strategy_selection.
-    assert result["strategy_reasoning"] == "vol"
+    assert mock_llm_cls.call_count == 1
+    assert result["active_strategies"] == []
+    assert "backup rule" in result["strategy_reasoning"].lower()
 
 
 @patch("src.agents.llm_factory.create_chat_model")
 @patch("src.agents.strategy_selection.get_settings")
 def test_strategy_selection_node(mock_settings, mock_llm_cls, tmp_path):
-    # H-8: strategy_selection_node now gates its output through the strategy admission
-    # registry (fail closed) -- seed a current VALIDATED "breakout" version so it survives.
+    # Strategy selection can only retain an already-eligible candidate strategy.
     _register_validated_strategy(tmp_path, "breakout")
     mock_settings.return_value.groq_api_key.get_secret_value.return_value = "token"
     mock_settings.return_value.strategy_registry_dir = str(tmp_path)
@@ -548,6 +557,7 @@ def test_strategy_selection_node(mock_settings, mock_llm_cls, tmp_path):
     mock_llm_cls.return_value = mock_llm
 
     state = create_initial_state()
+    state["signals"] = [_eligible_signal("breakout")]
     result = strategy_selection_node(state)
 
     assert result["active_strategies"] == ["breakout"]
@@ -562,6 +572,10 @@ def test_strategy_selection_node_skips_llm_when_disabled(mock_settings, mock_llm
     mock_settings.return_value.strategy_registry_dir = str(tmp_path)
     state = create_initial_state()
     state["regime"] = "trending_up"
+    state["signals"] = [
+        _eligible_signal("momentum"),
+        _eligible_signal("trend_following"),
+    ]
 
     result = strategy_selection_node(state)
 
@@ -573,10 +587,8 @@ def test_strategy_selection_node_skips_llm_when_disabled(mock_settings, mock_llm
     assert "Error:" not in result["strategy_reasoning"]
 
 
-def test_strategy_selection_node_strips_strategies_with_no_registry_entry(tmp_path):
-    # H-8 fail-closed: with an empty (freshly created) registry directory, nothing is
-    # admitted -- no strategy trades without a current VALIDATED artifact, not even the
-    # regime-default fallback.
+def test_strategy_selection_node_skips_qwen_without_candidates(tmp_path):
+    # No technical candidate means there is nothing to select or send to Qwen.
     with patch("src.agents.strategy_selection.get_settings") as mock_settings:
         mock_settings.return_value.enable_llm_agents = False
         mock_settings.return_value.strategy_registry_dir = str(tmp_path)
@@ -588,13 +600,9 @@ def test_strategy_selection_node_strips_strategies_with_no_registry_entry(tmp_pa
     assert result["active_strategies"] == []
 
 
-def test_strategy_selection_node_is_horizon_aware(tmp_path):
-    """A strategy validated only on SWING must not be admitted for a SCALP-horizon
-    cycle, and a SCALP-horizon-validated strategy must not leak into a SWING cycle --
-    proven through the actual node, not just the registry unit.
-    """
-    _register_validated_strategy(tmp_path, "momentum")  # SWING (default)
-    _register_validated_strategy(tmp_path, "breakout", timeframe="5m", trade_horizon="SCALP")
+def test_strategy_selection_does_not_use_horizon_as_eligibility_identity(tmp_path):
+    """Horizon metadata no longer selects a separate strategy-admission record."""
+    _register_validated_strategy(tmp_path, "momentum")
 
     with patch("src.agents.strategy_selection.get_settings") as mock_settings:
         mock_settings.return_value.enable_llm_agents = False
@@ -602,12 +610,13 @@ def test_strategy_selection_node_is_horizon_aware(tmp_path):
 
         swing_state = create_initial_state(trade_horizon="SWING")
         swing_state["regime"] = "trending_up"
+        swing_state["signals"] = [_eligible_signal("momentum")]
         swing_result = strategy_selection_node(swing_state)
 
         scalp_state = create_initial_state(trade_horizon="SCALP")
-        scalp_state["regime"] = "volatile"  # -> fallback default is ["breakout"]
+        scalp_state["regime"] = "trending_up"
+        scalp_state["signals"] = [_eligible_signal("momentum")]
         scalp_result = strategy_selection_node(scalp_state)
 
     assert "momentum" in swing_result["active_strategies"]
-    assert "breakout" not in swing_result["active_strategies"]  # SCALP-only artifact
-    assert scalp_result["active_strategies"] == ["breakout"]  # admitted under SCALP
+    assert scalp_result["active_strategies"] == ["momentum"]

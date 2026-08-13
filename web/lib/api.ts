@@ -17,7 +17,21 @@ export function apiBaseUrl(): string {
 // browser silently drops the cookie and every request 401s even right after a
 // successful login.
 export function apiFetch(path: string, init: RequestInit = {}): Promise<Response> {
-  return fetch(`${apiBaseUrl()}${path}`, { ...init, credentials: "include" });
+  // A browser/network edge can leave fetch pending for a long time (for example
+  // during a proxy reload).  Authentication uses this helper before rendering
+  // anything, so an unbounded request would strand the whole UI on "Checking
+  // session…".  Callers can provide their own signal for a different policy.
+  if (init.signal) {
+    return fetch(`${apiBaseUrl()}${path}`, { ...init, credentials: "include" });
+  }
+
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), 10_000);
+  return fetch(`${apiBaseUrl()}${path}`, {
+    ...init,
+    credentials: "include",
+    signal: controller.signal,
+  }).finally(() => window.clearTimeout(timeout));
 }
 
 export async function checkAuthenticated(): Promise<boolean> {

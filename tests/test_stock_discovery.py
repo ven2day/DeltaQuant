@@ -1,8 +1,8 @@
-"""Tests for the CSV-overridable stock universe in src/market/stock_discovery.py."""
+"""Tests for the CSV-overridable stock universe in src/markets/nse/universe/discovery.py."""
 
 from unittest.mock import patch
 
-from src.market.stock_discovery import (
+from src.markets.nse.universe.discovery import (
     MIDCAP_STOCKS,
     NIFTY50_STOCKS,
     StockDiscovery,
@@ -50,7 +50,7 @@ def test_stock_discovery_uses_csv_universe_when_configured(tmp_path):
     csv_path = tmp_path / "symbols.csv"
     csv_path.write_text("symbol\nZOMATO\nPAYTM\n", encoding="utf-8")
 
-    with patch("src.market.stock_discovery.get_settings") as mock_get_settings:
+    with patch("src.markets.nse.universe.discovery.get_settings") as mock_get_settings:
         mock_get_settings.return_value.stock_universe_csv_path = str(csv_path)
         discovery = StockDiscovery(max_stocks=10)
 
@@ -58,7 +58,7 @@ def test_stock_discovery_uses_csv_universe_when_configured(tmp_path):
 
 
 def test_stock_discovery_falls_back_to_builtin_list_when_csv_unset():
-    with patch("src.market.stock_discovery.get_settings") as mock_get_settings:
+    with patch("src.markets.nse.universe.discovery.get_settings") as mock_get_settings:
         mock_get_settings.return_value.stock_universe_csv_path = None
         discovery = StockDiscovery(max_stocks=10)
 
@@ -66,7 +66,7 @@ def test_stock_discovery_falls_back_to_builtin_list_when_csv_unset():
 
 
 def test_stock_discovery_falls_back_to_builtin_list_when_csv_missing():
-    with patch("src.market.stock_discovery.get_settings") as mock_get_settings:
+    with patch("src.markets.nse.universe.discovery.get_settings") as mock_get_settings:
         mock_get_settings.return_value.stock_universe_csv_path = "Z:/does/not/exist.csv"
         discovery = StockDiscovery(max_stocks=10)
 

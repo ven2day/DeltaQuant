@@ -3,6 +3,10 @@ import type { TradingStats } from "@/lib/types";
 import { Badge } from "./ui/Badge";
 import { Card } from "./ui/Card";
 
+function _fmt(value: number | undefined): string {
+  return value ? `Rs.${value.toFixed(2)}` : "—";
+}
+
 export function OpenPositionsPanel({ stats }: { stats: TradingStats }) {
   const positions = stats.open_positions ?? [];
 
@@ -11,36 +15,37 @@ export function OpenPositionsPanel({ stats }: { stats: TradingStats }) {
       {positions.length === 0 ? (
         <div className="italic text-ink-muted">No open positions</div>
       ) : (
-        <table className="w-full">
-          <thead>
-            <tr className="text-left text-xs text-ink-muted">
-              <th className="pb-2 font-medium">Symbol</th>
-              <th className="pb-2 font-medium">Side</th>
-              <th className="pb-2 text-right font-medium">Qty</th>
-              <th className="pb-2 text-right font-medium">Entry</th>
-              <th className="pb-2 text-right font-medium">P&amp;L</th>
-            </tr>
-          </thead>
-          <tbody className="divide-y divide-border">
-            {positions.slice(0, 5).map((pos, i) => (
-              <tr key={`${pos.symbol}-${i}`}>
-                <td className="py-1.5 font-medium text-ink-primary">{pos.symbol}</td>
-                <td className="py-1.5">
-                  <Badge label={pos.side} tone={pos.side === "BUY" ? "good" : "critical"} />
-                </td>
-                <td className="tabular py-1.5 text-right">{pos.qty}</td>
-                <td className="tabular py-1.5 text-right">Rs.{pos.entry.toFixed(2)}</td>
-                <td
-                  className={`tabular py-1.5 text-right font-medium ${
-                    pos.pnl >= 0 ? "text-status-good" : "text-status-critical"
-                  }`}
-                >
-                  {pos.pnl >= 0 ? "+" : ""}Rs.{pos.pnl.toFixed(2)}
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+        <div className="divide-y divide-border">
+          {positions.slice(0, 5).map((pos, i) => {
+            const invested = pos.qty * pos.entry;
+            return (
+              <div key={`${pos.symbol}-${i}`} className="py-2 first:pt-0 last:pb-0">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-1.5">
+                    <span className="font-medium text-ink-primary">{pos.symbol}</span>
+                    <Badge label={pos.side} tone={pos.side === "BUY" ? "good" : "critical"} />
+                    {pos.timeframe ? (
+                      <span className="text-xs text-ink-muted">{pos.timeframe}</span>
+                    ) : null}
+                  </div>
+                  <span
+                    className={`tabular font-medium ${
+                      pos.pnl >= 0 ? "text-status-good" : "text-status-critical"
+                    }`}
+                  >
+                    {pos.pnl >= 0 ? "+" : ""}Rs.{pos.pnl.toFixed(2)}
+                  </span>
+                </div>
+                <div className="tabular mt-0.5 text-xs text-ink-muted">
+                  Qty {pos.qty} @ {_fmt(pos.entry)} · Invested Rs.{invested.toFixed(2)}
+                </div>
+                <div className="tabular mt-0.5 text-xs text-ink-muted">
+                  SL {_fmt(pos.stop)} · TP {_fmt(pos.target)}
+                </div>
+              </div>
+            );
+          })}
+        </div>
       )}
     </Card>
   );

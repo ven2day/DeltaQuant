@@ -5,14 +5,18 @@ Tests for the runtime/usability fixes:
 - HistoryManager never substitutes synthetic prices for failed DhanHQ data in live mode.
 """
 
-from src.market.history_manager import HistoryManager
-from src.market.indicators import Timeframe, calculate_indicators
-from src.market.manager import MarketDataManager
-from src.market.signals import SignalEngine
+from src.core.candidates import SignalEngine
+from src.core.indicators import Timeframe, calculate_indicators
+from src.markets.nse.execution.runtime_mode import RuntimeExecutionMode
+from src.markets.nse.market_data.history_manager import HistoryManager
+from src.markets.nse.market_data.manager import MarketDataManager
 
 
 def test_manager_refresh_advances_simulated():
-    manager = MarketDataManager(symbols=["RELIANCE", "TCS", "SBIN"])
+    manager = MarketDataManager(
+        symbols=["RELIANCE", "TCS", "SBIN"],
+        execution_mode=RuntimeExecutionMode.MOCK,
+    )
     manager.is_live = False
     manager.data_source = "simulated"
     manager._load_simulated_quotes()

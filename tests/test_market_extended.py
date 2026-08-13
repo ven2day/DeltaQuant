@@ -1,20 +1,22 @@
-from datetime import datetime, time
+from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from src.market.live_data import LiveMarketData, LiveQuote
-from src.market.manager import MarketDataManager, MarketQuote, is_market_open
-from src.market.simulated_data import SimulatedMarketData, SimulatedQuote
-from src.market.stock_discovery import StockDiscovery
-from src.market.websocket_feed import DhanWebSocketFeed, QuoteData
+from src.markets.nse.broker.dhan.live_data import LiveMarketData, LiveQuote
+from src.markets.nse.broker.dhan.websocket import DhanWebSocketFeed, QuoteData
+from src.markets.nse.execution.runtime_mode import RuntimeExecutionMode
+from src.markets.nse.market_data.manager import MarketDataManager, MarketQuote, is_market_open
+from src.markets.nse.market_data.simulated import SimulatedMarketData, SimulatedQuote
+from src.markets.nse.sessions.market_time import IST
+from src.markets.nse.universe.discovery import StockDiscovery
 
 # --- MarketDataManager Tests ---
 
 
 @pytest.fixture
 def mock_settings():
-    with patch("src.market.manager.get_settings") as mock:
+    with patch("src.markets.nse.market_data.manager.get_settings") as mock:
         mock.return_value.market_data_source = "simulated"
         mock.return_value.dhan_client_id = "test_id"
         mock.return_value.dhan_access_token.get_secret_value.return_value = "test_token"
@@ -22,31 +24,21 @@ def mock_settings():
 
 
 def test_is_market_open():
-    # is_market_open() now evaluates in IST via utils.market_time.now_ist(),
-    # so the clock seam to patch is now_ist (not manager.datetime).
-    with patch("src.utils.market_time.now_ist") as mock_now:
-        clock = MagicMock()
-        mock_now.return_value = clock
-
-        # Weekday 10:00 AM IST - Open
-        clock.weekday.return_value = 0  # Monday
-        clock.time.return_value = time(10, 0)
+    with patch("src.markets.nse.sessions.market_time.now_ist") as mock_now:
+        mock_now.return_value = datetime(2026, 8, 10, 10, 0, tzinfo=IST)
         assert is_market_open() is True
 
-        # Weekend - Closed
-        clock.weekday.return_value = 5  # Saturday
+        mock_now.return_value = datetime(2026, 8, 15, 10, 0, tzinfo=IST)
         assert is_market_open() is False
 
-        # Weekday 8:00 AM IST - Closed (before open)
-        clock.weekday.return_value = 0
-        clock.time.return_value = time(8, 0)
+        mock_now.return_value = datetime(2026, 8, 10, 8, 0, tzinfo=IST)
         assert is_market_open() is False
 
 
 @pytest.mark.asyncio
 async def test_manager_start_simulated(mock_settings):
     mock_settings.return_value.market_data_source = "simulated"
-    manager = MarketDataManager(symbols=["RELIANCE"])
+    manager = MarketDataManager(symbols=["RELIANCE"], execution_mode=RuntimeExecutionMode.MOCK)
 
     # Mock simulated data loading
     with patch.object(manager.simulated_data, "get_quotes") as mock_get_quotes:
@@ -66,10 +58,10 @@ async def test_manager_start_simulated(mock_settings):
 async def test_manager_start_dhan(mock_settings):
     mock_settings.return_value.market_data_source = "dhan"
 
-    with patch("src.market.manager.is_market_open", return_value=True):
+    with patch("src.markets.nse.market_data.manager.is_market_open", return_value=True):
         manager = MarketDataManager(symbols=["RELIANCE"])
 
-        with patch("src.market.manager.DhanWebSocketFeed") as MockWS:
+        with patch("src.markets.nse.market_data.manager.DhanWebSocketFeed") as MockWS:
             mock_ws = MockWS.return_value
             mock_ws.connect = AsyncMock(return_value=True)
             mock_ws.subscribe_nse_stocks = AsyncMock()
@@ -82,7 +74,7 @@ async def test_manager_start_dhan(mock_settings):
 
 
 @pytest.mark.asyncio
-async def test_manager_falls_back_to_simulated_when_market_is_closed(mock_settings):
+async def test_market_paper_fails_closed_when_market_is_closed(mock_settings):
     # Real quotes are only meaningful while NSE is actually open -- outside market
     # hours the live-quote pipeline runs on simulated data instead (a separate
     # concern from historical charts/backtests, which stay real always). See
@@ -91,16 +83,16 @@ async def test_manager_falls_back_to_simulated_when_market_is_closed(mock_settin
     mock_settings.return_value.enable_dhan_quotes = True
 
     with (
-        patch("src.market.manager.is_market_open", return_value=False),
-        patch("src.market.manager.QuotesFeed") as mock_feed_cls,
+        patch("src.markets.nse.market_data.manager.is_market_open", return_value=False),
+        patch("src.markets.nse.market_data.manager.QuotesFeed") as mock_feed_cls,
     ):
         manager = MarketDataManager(symbols=["RELIANCE"])
 
         assert await manager.start() is False
 
     mock_feed_cls.return_value.fetch_quotes.assert_not_called()
-    assert manager.data_source == "simulated"
-    assert manager.quotes["RELIANCE"].is_live is False
+    assert manager.data_source == "market_closed"
+    assert manager.quotes == {}
 
 
 @pytest.mark.asyncio
@@ -113,8 +105,8 @@ async def test_manager_uses_rest_quotes_when_market_is_open(mock_settings):
     mock_settings.return_value.dhan_access_token = None
 
     with (
-        patch("src.market.manager.is_market_open", return_value=True),
-        patch("src.market.manager.QuotesFeed") as mock_feed_cls,
+        patch("src.markets.nse.market_data.manager.is_market_open", return_value=True),
+        patch("src.markets.nse.market_data.manager.QuotesFeed") as mock_feed_cls,
     ):
         quote = MagicMock(
             symbol="RELIANCE",
@@ -140,7 +132,7 @@ async def test_manager_uses_rest_quotes_when_market_is_open(mock_settings):
 
 
 @pytest.mark.asyncio
-async def test_manager_refresh_switches_to_simulated_when_market_closes(mock_settings):
+async def test_manager_refresh_fails_closed_when_market_closes(mock_settings):
     """A long-running process must transition on its own as the day rolls on --
     no restart required. See manager.py's refresh() docstring for the bug this
     covers: REST mode used to be reported as "live" and never got refreshed."""
@@ -149,8 +141,8 @@ async def test_manager_refresh_switches_to_simulated_when_market_closes(mock_set
     mock_settings.return_value.dhan_access_token = None
 
     with (
-        patch("src.market.manager.is_market_open", return_value=True),
-        patch("src.market.manager.QuotesFeed") as mock_feed_cls,
+        patch("src.markets.nse.market_data.manager.is_market_open", return_value=True),
+        patch("src.markets.nse.market_data.manager.QuotesFeed") as mock_feed_cls,
     ):
         quote = MagicMock(
             symbol="RELIANCE",
@@ -170,11 +162,11 @@ async def test_manager_refresh_switches_to_simulated_when_market_closes(mock_set
 
     # Market closes mid-session; the next refresh() call (not another start()) must
     # notice and switch over, since the process is never restarted for this.
-    with patch("src.market.manager.is_market_open", return_value=False):
+    with patch("src.markets.nse.market_data.manager.is_market_open", return_value=False):
         manager.refresh()
 
-    assert manager.data_source == "simulated"
-    assert manager.quotes["RELIANCE"].is_live is False
+    assert manager.data_source == "market_closed"
+    assert manager.quotes == {}
 
 
 def test_manager_refresh_repolls_dhan_rest_every_call(mock_settings):
@@ -184,7 +176,7 @@ def test_manager_refresh_repolls_dhan_rest_every_call(mock_settings):
     mock_settings.return_value.market_data_source = "dhan"
     mock_settings.return_value.enable_dhan_quotes = True
 
-    with patch("src.market.manager.is_market_open", return_value=True):
+    with patch("src.markets.nse.market_data.manager.is_market_open", return_value=True):
         manager = MarketDataManager(symbols=["RELIANCE"])
         manager.data_source = "dhan_rest"
 
@@ -224,7 +216,7 @@ def test_manager_get_trading_candidates(mock_settings):
 
 
 def test_manager_get_real_quotes_unaffected_by_switch_to_simulated(mock_settings):
-    manager = MarketDataManager(symbols=["RELIANCE"])
+    manager = MarketDataManager(symbols=["RELIANCE"], execution_mode=RuntimeExecutionMode.MOCK)
     real_quote = MarketQuote("RELIANCE", 1330, 1330, 1330, 1330, 1330, 0, 0, 1000, True)
     manager._last_real_quotes["RELIANCE"] = real_quote
 
@@ -278,8 +270,8 @@ def test_manager_real_and_simulated_quotes_stay_independent(mock_settings):
 @pytest.fixture
 def live_market():
     with (
-        patch("src.market.live_data.get_settings") as mock_settings,
-        patch("src.market.live_data.get_valid_access_token", return_value="token"),
+        patch("src.markets.nse.broker.dhan.live_data.get_settings") as mock_settings,
+        patch("src.markets.nse.broker.dhan.live_data.get_valid_access_token", return_value="token"),
     ):
         mock_settings.return_value.dhan_base_url = "http://test"
         mock_settings.return_value.dhan_client_id = "id"
@@ -287,7 +279,7 @@ def live_market():
 
 
 def test_live_get_quotes(live_market):
-    with patch("src.market.live_data.requests.post") as mock_post:
+    with patch("src.markets.nse.broker.dhan.live_data.requests.post") as mock_post:
         mock_post.return_value.json.return_value = {
             "status": "success",
             "data": {
@@ -365,7 +357,7 @@ def test_simulated_get_trading_candidates():
 
 @pytest.fixture
 def discovery():
-    with patch("src.market.stock_discovery.get_settings") as mock_get_settings:
+    with patch("src.markets.nse.universe.discovery.get_settings") as mock_get_settings:
         mock_get_settings.return_value.stock_universe_csv_path = None
         return StockDiscovery(max_stocks=10)
 
@@ -379,7 +371,7 @@ def test_extract_stock_mentions(discovery):
 
 
 def test_discover_from_news(discovery):
-    with patch("src.market.stock_discovery.feedparser.parse") as mock_parse:
+    with patch("src.markets.nse.universe.discovery.feedparser.parse") as mock_parse:
         mock_parse.return_value.entries = [
             {"title": "Reliance surges", "summary": "Reliance hits new high"},
             {"title": "Market down", "summary": "Nothing happening"},
@@ -392,9 +384,9 @@ def test_discover_from_news(discovery):
 
 
 def test_discover_market_movers(discovery):
-    from src.market.dhan_quotes_feed import Quote
+    from src.markets.nse.broker.dhan.quotes import Quote
 
-    with patch("src.market.stock_discovery.QuotesFeed") as mock_quotes_feed_cls:
+    with patch("src.markets.nse.universe.discovery.QuotesFeed") as mock_quotes_feed_cls:
         mock_quotes_feed_cls.return_value.fetch_quotes.return_value = {
             s: Quote(
                 symbol=s,
@@ -433,9 +425,9 @@ async def test_discover(discovery):
 @pytest.mark.asyncio
 async def test_websocket_feed_connect():
     with (
-        patch("src.market.websocket_feed.websockets.connect", new_callable=AsyncMock),
-        patch("src.market.websocket_feed.get_settings") as mock_settings,
-        patch("src.market.websocket_feed.get_valid_access_token", return_value="token"),
+        patch("src.markets.nse.broker.dhan.websocket.websockets.connect", new_callable=AsyncMock),
+        patch("src.markets.nse.broker.dhan.websocket.get_settings") as mock_settings,
+        patch("src.markets.nse.broker.dhan.websocket.get_valid_access_token", return_value="token"),
     ):
         mock_settings.return_value.dhan_client_id = "id"
         mock_settings.return_value.dhan_feed_url = "wss://api-feed.dhan.co"
@@ -449,9 +441,9 @@ async def test_websocket_feed_connect():
 @pytest.mark.asyncio
 async def test_websocket_feed_subscribe():
     with (
-        patch("src.market.websocket_feed.websockets.connect", new_callable=AsyncMock),
-        patch("src.market.websocket_feed.get_settings") as mock_settings,
-        patch("src.market.websocket_feed.get_valid_access_token", return_value="token"),
+        patch("src.markets.nse.broker.dhan.websocket.websockets.connect", new_callable=AsyncMock),
+        patch("src.markets.nse.broker.dhan.websocket.get_settings") as mock_settings,
+        patch("src.markets.nse.broker.dhan.websocket.get_valid_access_token", return_value="token"),
     ):
         mock_settings.return_value.dhan_client_id = "id"
         mock_settings.return_value.dhan_feed_url = "wss://api-feed.dhan.co"

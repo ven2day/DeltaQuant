@@ -20,8 +20,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from src.execution.costs import CostModel
-from src.market.historical_feed import HistoricalDataFeed
+from src.markets.nse.market_data.historical_feed import HistoricalDataFeed
+from src.markets.nse.risk.costs import CostModel
 
 # NSE cash-market session length (09:15-15:30 IST) in minutes -- the basis for
 # converting an intraday interval into "bars per trading day" for Sharpe

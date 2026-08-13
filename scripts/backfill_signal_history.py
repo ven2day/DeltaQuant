@@ -19,13 +19,13 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.config import get_settings
-from src.execution.signal_log import SignalLogger, SignalRecord
-from src.market.historical_feed import HistoricalDataFeed
-from src.market.history_manager import fetch_timeframe_history
-from src.market.indicators import Timeframe, calculate_indicators
-from src.market.signals import SignalEngine
-from src.market.stock_discovery import StockDiscovery
-from src.utils.market_time import now_ist
+from src.core.candidates import SignalEngine
+from src.core.indicators import Timeframe, calculate_indicators
+from src.markets.nse.execution.signal_log import SignalLogger, SignalRecord
+from src.markets.nse.market_data.historical_feed import HistoricalDataFeed
+from src.markets.nse.market_data.history_manager import fetch_timeframe_history
+from src.markets.nse.sessions.market_time import now_ist
+from src.markets.nse.universe.discovery import StockDiscovery
 
 logger = logging.getLogger(__name__)
 

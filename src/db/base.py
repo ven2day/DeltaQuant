@@ -21,11 +21,34 @@ logger = logging.getLogger(__name__)
 # COLUMN here. Best-effort: the column may already exist (fresh DB, or already migrated)
 # or the DB role may lack ALTER privileges, and neither should block startup.
 _COLUMN_MIGRATIONS = (
+    ("paper_wallet", "namespace", "namespace VARCHAR(40) DEFAULT 'paper_market_data'"),
+    ("paper_positions", "namespace", "namespace VARCHAR(40) DEFAULT 'paper_market_data'"),
+    ("paper_orders", "namespace", "namespace VARCHAR(40) DEFAULT 'paper_market_data'"),
+    (
+        "daily_risk_state",
+        "namespace",
+        "namespace VARCHAR(40) DEFAULT 'paper_market_data'",
+    ),
+    ("signal_history", "namespace", "namespace VARCHAR(40) DEFAULT 'paper_market_data'"),
+    ("idempotency_keys", "namespace", "namespace VARCHAR(40) DEFAULT 'paper_market_data'"),
+    ("trade_journal", "namespace", "namespace VARCHAR(40) DEFAULT 'paper_market_data'"),
+    ("decision_logs", "namespace", "namespace VARCHAR(40) DEFAULT 'paper_market_data'"),
+    ("agent_memory", "namespace", "namespace VARCHAR(40) DEFAULT 'paper_market_data'"),
     ("paper_orders", "reason", "reason VARCHAR(20)"),
     ("paper_orders", "trade_id", "trade_id VARCHAR(60)"),
     ("paper_orders", "position_id", "position_id VARCHAR(60)"),
     ("paper_orders", "idempotency_key", "idempotency_key VARCHAR(200)"),
     ("paper_orders", "realized_pnl", "realized_pnl DOUBLE PRECISION DEFAULT 0"),
+    ("paper_positions", "market", "market VARCHAR(16) DEFAULT 'NSE'"),
+    ("paper_positions", "provider", "provider VARCHAR(24) DEFAULT 'DHAN'"),
+    (
+        "paper_positions",
+        "broker_account_ref",
+        "broker_account_ref VARCHAR(128) DEFAULT ''",
+    ),
+    ("paper_orders", "market", "market VARCHAR(16) DEFAULT 'NSE'"),
+    ("paper_orders", "provider", "provider VARCHAR(24) DEFAULT 'DHAN'"),
+    ("paper_orders", "broker_account_ref", "broker_account_ref VARCHAR(128) DEFAULT ''"),
     ("daily_risk_state", "exits_count", "exits_count INTEGER DEFAULT 0"),
     (
         "strategy_performance_records",
@@ -36,11 +59,13 @@ _COLUMN_MIGRATIONS = (
     ("paper_trade_lifecycles", "finalized_at", "finalized_at TIMESTAMP WITH TIME ZONE"),
     ("paper_trade_lifecycles", "mae", "mae DOUBLE PRECISION DEFAULT 0"),
     ("paper_trade_lifecycles", "mfe", "mfe DOUBLE PRECISION DEFAULT 0"),
+    ("signal_history", "decision_chain", "decision_chain TEXT DEFAULT '{}'"),
     (
         "paper_positions",
         "entry_data_source",
         "entry_data_source VARCHAR(20) DEFAULT 'real'",
     ),
+    ("paper_positions", "current_price", "current_price DOUBLE PRECISION"),
 )
 
 
@@ -65,6 +90,60 @@ def _apply_column_migrations(engine: Engine) -> None:
                 table_name,
                 column_name,
             )
+
+    # Namespace constraints need more than ADD COLUMN. Existing installations used a
+    # singleton wallet and one daily-risk row per date; migrate those constraints after
+    # backfilling the legacy rows into MARKET_PAPER. Best-effort keeps lightweight test
+    # databases portable, while a Postgres failure is logged loudly for operators.
+    try:
+        table_names = set(inspect(engine).get_table_names())
+        with engine.begin() as conn:
+            for table_name in (
+                "paper_wallet",
+                "paper_positions",
+                "paper_orders",
+                "daily_risk_state",
+                "signal_history",
+                "idempotency_keys",
+                "trade_journal",
+                "decision_logs",
+                "strategy_performance_records",
+                "agent_memory",
+                "paper_trade_lifecycles",
+                "paper_trade_events",
+            ):
+                if table_name in table_names:
+                    conn.execute(
+                        text(
+                            f"UPDATE {table_name} SET namespace='paper_market_data' "
+                            "WHERE namespace IS NULL OR namespace=''"
+                        )
+                    )
+
+            if engine.dialect.name == "postgresql" and "daily_risk_state" in table_names:
+                conn.execute(
+                    text(
+                        "ALTER TABLE daily_risk_state "
+                        "DROP CONSTRAINT IF EXISTS uq_daily_risk_state_date"
+                    )
+                )
+            if "paper_wallet" in table_names:
+                conn.execute(
+                    text(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS uq_paper_wallet_namespace "
+                        "ON paper_wallet(namespace)"
+                    )
+                )
+            if "daily_risk_state" in table_names:
+                conn.execute(
+                    text(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS uq_daily_risk_state_namespace_date "
+                        "ON daily_risk_state(namespace, trade_date)"
+                    )
+                )
+    except Exception:
+        logger.exception("Failed to enforce execution-mode namespace migrations")
+
 
 Base = declarative_base()
 
