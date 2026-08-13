@@ -26,6 +26,52 @@ _TABLES = {
     "ml_predictions",
 }
 
+# DDL for the trading tables this repository owns, derived directly from the
+# INSERT/SELECT statements below (column names, JSONB payloads, and each
+# ON CONFLICT target's uniqueness). ``market_candles`` is created by CandleStore
+# and ``model_registry`` by ModelRegistry — both already self-create their own
+# schema objects; the trading repository must do the same so a *fresh* database
+# is writable without a manual step (this repo ships no migration tooling). Every
+# statement is idempotent, so an already-provisioned database is left untouched.
+_TRADING_TABLE_DDL: tuple[tuple[str, str], ...] = (
+    (
+        "signals",
+        "signal_id TEXT PRIMARY KEY, symbol TEXT NOT NULL, timeframe TEXT NOT NULL, "
+        "side TEXT NOT NULL, strategy TEXT NOT NULL, payload JSONB NOT NULL, "
+        "created_at TIMESTAMPTZ NOT NULL",
+    ),
+    (
+        "decisions",
+        "decision_id TEXT PRIMARY KEY, signal_id TEXT, symbol TEXT NOT NULL, "
+        "final_action TEXT NOT NULL, rejection_reason TEXT, payload JSONB NOT NULL, "
+        "created_at TIMESTAMPTZ NOT NULL",
+    ),
+    (
+        "positions",
+        "position_id TEXT PRIMARY KEY, symbol TEXT NOT NULL, side TEXT NOT NULL, "
+        "quantity DOUBLE PRECISION NOT NULL, payload JSONB NOT NULL, "
+        "updated_at TIMESTAMPTZ NOT NULL",
+    ),
+    (
+        # persist_order/persist_paper_fill upsert ON CONFLICT (intent_id), so
+        # intent_id — not order_id — carries the uniqueness constraint.
+        "orders",
+        "intent_id TEXT PRIMARY KEY, order_id TEXT NOT NULL, symbol TEXT NOT NULL, "
+        "side TEXT NOT NULL, status TEXT NOT NULL, payload JSONB NOT NULL, "
+        "created_at TIMESTAMPTZ NOT NULL",
+    ),
+    (
+        "strategy_registry",
+        "identity TEXT PRIMARY KEY, payload JSONB NOT NULL, updated_at TIMESTAMPTZ NOT NULL",
+    ),
+    (
+        "ml_predictions",
+        "prediction_id TEXT PRIMARY KEY, symbol TEXT NOT NULL, timeframe TEXT NOT NULL, "
+        "settled_candle_timestamp TIMESTAMPTZ NOT NULL, model_version TEXT NOT NULL, "
+        "payload JSONB NOT NULL, created_at TIMESTAMPTZ NOT NULL",
+    ),
+)
+
 
 class MarketRepositoryBoundaryError(ValueError):
     """Raised when code attempts to cross a market-owned persistence boundary."""
@@ -155,6 +201,24 @@ class SchemaBoundTradingRepository:
         self.boundary = MarketRepositoryBoundary(market)
         self.market = normalize_market(market).value
         self.provider = provider.strip().upper()
+        self._ensure_schema()
+
+    def _ensure_schema(self) -> None:
+        """Create this market's schema and trading tables if they are absent.
+
+        A fresh database has no migration tool to lean on, and the eligibility
+        seed on the very first cycle writes to ``<schema>.strategy_registry``
+        before any other code touches it — so without this the worker crashes on
+        an UndefinedTable. All DDL is ``IF NOT EXISTS`` and runs once at
+        construction, leaving an already-provisioned database unchanged.
+        """
+        schema = self.boundary.schema
+        with self.engine.begin() as connection:
+            connection.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{schema}"'))
+            for table, columns in _TRADING_TABLE_DDL:
+                connection.execute(
+                    text(f'CREATE TABLE IF NOT EXISTS "{schema}"."{table}" ({columns})')
+                )
 
     @staticmethod
     def _json(payload: dict[str, Any]) -> str:
